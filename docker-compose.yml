@@ -1,40 +1,42 @@
-version: "3.9"
-
 services:
-  # ── Vector Database ──
+  # Vector database
   qdrant:
-    image: qdrant/qdrant:latest
+    image: qdrant/qdrant:v1.18.2@sha256:75eab8c4ba42096724fdcfde8b4de0b5713d529dde32f285a1f86fdcb2c9e50c
     container_name: aic2026-qdrant
     restart: unless-stopped
     ports:
-      - "6333:6333"   # REST API
-      - "6334:6334"   # gRPC
+      - "127.0.0.1:6333:6333" # REST API
+      - "127.0.0.1:6334:6334" # gRPC
     volumes:
       - ./docker_data/qdrant/storage:/qdrant/storage
       - ./docker_data/qdrant/snapshots:/qdrant/snapshots
     environment:
-      QDRANT__SERVICE__GRPC_PORT: 6334
+      QDRANT__SERVICE__GRPC_PORT: "6334"
+      QDRANT__SERVICE__API_KEY: "${QDRANT_API_KEY:?Set QDRANT_API_KEY in .env}"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:6333/healthz"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
+      # The Qdrant image does not guarantee curl/wget; use Bash TCP readiness.
+      test: ["CMD-SHELL", "bash -ec ': > /dev/tcp/127.0.0.1/6333'"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
 
-  # ── Full-Text Search ──
+  # Full-text search
   meilisearch:
-    image: getmeili/meilisearch:latest
+    image: getmeili/meilisearch:v1.45.0@sha256:7fde2b22e9a7ccfe7551613a521fc1b3abdbec20fedbd9aa0fb8ff133cd83c5d
     container_name: aic2026-meilisearch
     restart: unless-stopped
     ports:
-      - "7700:7700"
+      - "127.0.0.1:7700:7700"
     volumes:
       - ./docker_data/meilisearch/data:/meili_data
     environment:
       MEILI_ENV: development
-      MEILI_MASTER_KEY: ${MEILISEARCH_MASTER_KEY:-aic2026_dev_key}
+      MEILI_MASTER_KEY: "${MEILISEARCH_MASTER_KEY:?Set MEILISEARCH_MASTER_KEY in .env}"
       MEILI_NO_ANALYTICS: "true"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:7700/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
+      test: ["CMD-SHELL", "curl --fail --silent --show-error http://127.0.0.1:7700/health > /dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s

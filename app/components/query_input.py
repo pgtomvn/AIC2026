@@ -7,8 +7,6 @@ and query history tracking.
 
 from __future__ import annotations
 
-import streamlit as st
-
 
 def render_query_input(
     query_type: str = "Textual KIS",

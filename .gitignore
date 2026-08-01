@@ -1,53 +1,58 @@
-# ═══════════════════════════════════════════════
-# AIC 2026 — .gitignore
-# ═══════════════════════════════════════════════
+# Local secrets
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
 
-# ── Data (large files) ──
-data/
-docker_data/
+# Project-local tools, environments, and caches
+.tools/
+.venv/
+.cache/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Python build and bytecode artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg
+*.egg-info/
+build/
+dist/
+
+# Immutable archives and generated datasets
 *.zip
-*.tar.gz
 *.tar
+*.tar.gz
 *.rar
+*.crdownload
+data/
 
-# ── Model caches ──
+# Models, indexes, service state, and outputs
+models/
+docker_data/
+outputs/
+logs/
 *.pt
 *.pth
 *.onnx
 *.bin
 *.safetensors
-models/
+*.log
 
-# ── Outputs ──
-outputs/
-logs/
-
-# ── Python ──
-__pycache__/
-*.py[cod]
-*$py.class
-*.egg-info/
-dist/
-build/
-*.egg
-
-# ── Environments ──
-.env
-.venv/
-venv/
-env/
-
-# ── IDE ──
-.vscode/
+# Editors and operating systems
 .idea/
+.vscode/
 *.swp
 *.swo
 *~
 .DS_Store
 Thumbs.db
 
-# ── Jupyter ──
+# Notebooks
 .ipynb_checkpoints/
-
-# ── Misc ──
-*.log

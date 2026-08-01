@@ -7,10 +7,6 @@ in the competition submission format.
 
 from __future__ import annotations
 
-from pathlib import Path
-
-import streamlit as st
-
 
 def render_export_panel(
     results: list[dict],

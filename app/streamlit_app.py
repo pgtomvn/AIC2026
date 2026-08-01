@@ -9,18 +9,16 @@ Run with:
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import streamlit as st
 
-# Add project root to path for imports
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(PROJECT_ROOT))
+from src.utils.io_helpers import load_config
+from src.utils.logger import setup_logger_from_config
 
 
 def main() -> None:
     """Main Streamlit application."""
+
+    setup_logger_from_config(load_config())
 
     # ── Page Config ──
     st.set_page_config(

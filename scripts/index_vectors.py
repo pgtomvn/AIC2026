@@ -16,12 +16,13 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.utils.io_helpers import load_config
-from src.utils.logger import logger
+from src.utils.logger import logger, setup_logger_from_config
 
 
 def main() -> None:
     """Push embeddings to Qdrant."""
     config = load_config()
+    setup_logger_from_config(config)
 
     logger.info("Loading embeddings from disk...")
 

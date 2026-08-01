@@ -17,7 +17,8 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.utils.logger import logger
+from src.utils.io_helpers import load_config
+from src.utils.logger import logger, setup_logger_from_config
 
 
 def compute_r_at_k(predictions: list, ground_truth: dict, k: int) -> float:
@@ -58,6 +59,7 @@ def compute_final_score(
 
 def main() -> None:
     """Run evaluation."""
+    setup_logger_from_config(load_config())
     parser = argparse.ArgumentParser(description="AIC 2026 Evaluation")
     parser.add_argument("--ground-truth", type=str, required=True, help="Path to ground truth JSON")
     parser.add_argument("--predictions", type=str, required=True, help="Path to predictions CSV")

@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aic2026-video-retrieval"
+version = "0.1.0"
+description = "Multimodal video search and retrieval scaffold for AIC 2026"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+  "loguru>=0.7.3,<0.8",
+  "meilisearch>=0.31,<1",
+  "numpy>=1.26,<3",
+  "opencv-python-headless>=4.10,<5",
+  "pillow>=10,<13",
+  "python-dotenv>=1,<2",
+  "pyyaml>=6,<7",
+  "qdrant-client>=1.12,<2",
+  "requests>=2.32,<3",
+  "streamlit>=1.40,<2",
+  "tqdm>=4.66,<5",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3,<10",
+  "pytest-cov>=6,<8",
+  "ruff>=0.11,<1",
+]
+
+[tool.setuptools.packages.find]
+include = ["src*"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers"
+testpaths = ["tests"]
+markers = [
+  "integration: requires local services, external data, models, or hardware",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["src"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+extend-exclude = ["data", "docker_data", "models", "outputs"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F401", "F821", "F822", "F823", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/*.py" = ["E402"]
+"tests/*.py" = ["F401"]

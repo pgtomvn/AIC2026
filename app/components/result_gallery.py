@@ -7,8 +7,6 @@ with keyframe thumbnails, metadata, and selection controls.
 
 from __future__ import annotations
 
-import streamlit as st
-
 
 def render_result_gallery(
     results: list[dict],

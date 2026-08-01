@@ -9,8 +9,6 @@ Output format: (video_id, frame_id)
 
 from __future__ import annotations
 
-from typing import Optional
-
 
 class TextualKISPipeline:
     """Textual Known Item Search pipeline.

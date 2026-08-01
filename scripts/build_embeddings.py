@@ -12,18 +12,17 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-import numpy as np
-
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.utils.io_helpers import load_config, ensure_dirs
-from src.utils.logger import logger
+from src.utils.io_helpers import ensure_dirs, load_config
+from src.utils.logger import logger, setup_logger_from_config
 
 
 def main() -> None:
     """Batch embedding generation pipeline."""
     config = load_config()
+    setup_logger_from_config(config)
     clip_config = config["models"]["clip"]
 
     keyframes_dir = PROJECT_ROOT / config["data"]["raw_keyframes"]

@@ -1,0 +1,24 @@
+* text=auto
+
+*.py text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.json text eol=lf
+*.sha256 text eol=lf
+*.ps1 text eol=crlf
+
+*.zip binary
+*.tar binary
+*.gz binary
+*.rar binary
+*.jpg binary
+*.jpeg binary
+*.png binary
+*.mp4 binary
+*.pt binary
+*.pth binary
+*.onnx binary
+*.bin binary
+*.safetensors binary

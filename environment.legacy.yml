@@ -1,4 +1,10 @@
-name: aic2026
+# LEGACY REFERENCE ONLY.
+#
+# The supported lightweight environment is pyproject.toml + uv.lock on Python 3.11.
+# This original mixed Conda/pip proposal is intentionally not used by bootstrap.ps1.
+# Several packages below require platform-, CUDA-, and hardware-specific decisions.
+
+name: aic2026-legacy
 channels:
   - pytorch
   - nvidia
@@ -8,13 +14,13 @@ dependencies:
   - python=3.10
   - pip
 
-  # ── Core ML (CUDA 12.1) ──
+  # Core ML (CUDA 12.1)
   - pytorch::pytorch>=2.3
   - pytorch::torchvision>=0.18
   - pytorch::torchaudio>=2.3
   - pytorch::pytorch-cuda=12.1
 
-  # ── Data & Image Processing ──
+  # Data and image processing
   - numpy>=1.24
   - pandas>=2.0
   - scipy>=1.11
@@ -22,48 +28,29 @@ dependencies:
   - conda-forge::opencv>=4.8
   - pillow>=10.0
 
-  # ── Utilities ──
+  # Utilities
   - pyyaml>=6.0
   - tqdm>=4.66
   - requests>=2.31
 
-  # ── Testing ──
+  # Testing
   - pytest>=7.4
   - pytest-cov>=4.1
 
-  # ── Pip-only packages ──
+  # Original pip-only model and service proposal
   - pip:
-      # Embeddings & Transformers
       - open-clip-torch>=2.24
       - transformers>=4.40
       - sentence-transformers>=3.0
       - accelerate>=0.30
       - safetensors>=0.4
-
-      # Object Detection
       - ultralytics>=8.2
-
-      # OCR
       - paddlepaddle-gpu>=2.6
       - paddleocr>=2.7
-
-      # ASR
       - faster-whisper>=1.0
-
-      # VLM
       - vllm>=0.4
-
-      # Vector Database
       - qdrant-client>=1.9
-
-      # Text Search
       - meilisearch>=0.31
-
-      # GUI
       - streamlit>=1.35
-
-      # Config & Environment
       - python-dotenv>=1.0
-
-      # Logging
       - loguru>=0.7

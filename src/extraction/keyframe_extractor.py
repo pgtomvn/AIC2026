@@ -14,9 +14,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-import cv2
-import numpy as np
-
 
 class KeyframeExtractor:
     """Extract keyframes from video files.
@@ -44,7 +41,6 @@ class KeyframeExtractor:
         self.min_scene_change = min_scene_change
         self.resize_max_dim = resize_max_dim
         self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
 
     def extract(self, video_path: str | Path) -> list[dict]:
         """Extract keyframes from a single video.

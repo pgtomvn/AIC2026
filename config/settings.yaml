@@ -46,16 +46,19 @@ models:
 # ── Services ──
 services:
   qdrant:
-    url: "http://localhost:6333"
+    url: "http://127.0.0.1:6333"
+    url_env: "QDRANT_URL"
+    api_key_env: "QDRANT_API_KEY"
     grpc_port: 6334
     collection_name: "aic2026_keyframes"
     vector_size: 1024            # Must match clip.embedding_dim
     distance: "Cosine"
 
   meilisearch:
-    url: "http://localhost:7700"
+    url: "http://127.0.0.1:7700"
+    url_env: "MEILISEARCH_URL"
+    api_key_env: "MEILISEARCH_MASTER_KEY"
     index_name: "aic2026_text"
-    # Master key loaded from .env
 
 # ── Retrieval ──
 retrieval:

@@ -13,10 +13,11 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import Any
 
 from loguru import logger as _loguru_logger
 
-from src.utils.io_helpers import load_config
+from src import PROJECT_ROOT
 
 
 def setup_logger(
@@ -56,7 +57,10 @@ def setup_logger(
             level=level,
             rotation=rotation,
             retention="30 days",
-            format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} | {message}",
+            format=(
+                "{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | "
+                "{name}:{function}:{line} | {message}"
+            ),
         )
 
 
@@ -69,18 +73,22 @@ def get_logger():
     return _loguru_logger
 
 
-# Auto-configure on import using settings if available
-try:
-    _config = load_config()
-    _log_config = _config.get("logging", {})
+def setup_logger_from_config(config: dict[str, Any]) -> None:
+    """Apply the logging section after an application explicitly starts."""
+    logging_config = config.get("logging", {})
+    log_file = logging_config.get("log_file", "logs/aic2026.log")
+    if log_file:
+        log_path = Path(log_file)
+        if not log_path.is_absolute():
+            log_path = PROJECT_ROOT / log_path
+        log_file = str(log_path)
     setup_logger(
-        level=_log_config.get("level", "INFO"),
-        log_file=_log_config.get("log_file", "logs/aic2026.log"),
-        rotation=_log_config.get("rotation", "10 MB"),
+        level=logging_config.get("level", "INFO"),
+        log_file=log_file,
+        rotation=logging_config.get("rotation", "10 MB"),
     )
-except Exception:
-    # Fallback: basic console logging if config not available
-    setup_logger()
 
-# Convenience export
+
+# Importing this module must not create log directories or files. Applications
+# that want project file logging call ``setup_logger_from_config`` at startup.
 logger = get_logger()
