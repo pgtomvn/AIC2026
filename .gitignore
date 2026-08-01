@@ -1,0 +1,53 @@
+# ═══════════════════════════════════════════════
+# AIC 2026 — .gitignore
+# ═══════════════════════════════════════════════
+
+# ── Data (large files) ──
+data/
+docker_data/
+*.zip
+*.tar.gz
+*.tar
+*.rar
+
+# ── Model caches ──
+*.pt
+*.pth
+*.onnx
+*.bin
+*.safetensors
+models/
+
+# ── Outputs ──
+outputs/
+logs/
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ── Environments ──
+.env
+.venv/
+venv/
+env/
+
+# ── IDE ──
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Jupyter ──
+.ipynb_checkpoints/
+
+# ── Misc ──
+*.log

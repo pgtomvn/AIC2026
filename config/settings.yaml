@@ -1,0 +1,84 @@
+# ═══════════════════════════════════════════════════════════════
+# AIC 2026 — Centralized Configuration
+# ═══════════════════════════════════════════════════════════════
+
+# ── Data Paths ──
+data:
+  root: "data"
+  raw_videos: "data/raw/videos"
+  raw_keyframes: "data/raw/keyframes"
+  embeddings: "data/embeddings"
+  metadata: "data/metadata"
+  ocr: "data/ocr"
+  asr: "data/asr"
+
+# ── Models ──
+models:
+  clip:
+    name: "ViT-H-14"
+    pretrained: "laion2b_s32b_b79k"
+    embedding_dim: 1024
+    batch_size: 64
+    device: "cuda"
+
+  yolo:
+    name: "yolov8x.pt"
+    confidence_threshold: 0.3
+    iou_threshold: 0.5
+
+  whisper:
+    model_size: "large-v3-turbo"
+    language: "vi"              # Vietnamese default; set null for auto-detect
+    device: "cuda"
+
+  ocr:
+    engine: "paddleocr"
+    languages: ["vi", "en"]
+    use_gpu: true
+
+  vlm:
+    model_name: "Qwen/Qwen2-VL-7B-Instruct"
+    max_new_tokens: 256
+    device: "cuda"
+    # Fallback to Gemini API if local VLM is too slow
+    gemini_model: "gemini-1.5-flash"
+
+# ── Services ──
+services:
+  qdrant:
+    url: "http://localhost:6333"
+    grpc_port: 6334
+    collection_name: "aic2026_keyframes"
+    vector_size: 1024            # Must match clip.embedding_dim
+    distance: "Cosine"
+
+  meilisearch:
+    url: "http://localhost:7700"
+    index_name: "aic2026_text"
+    # Master key loaded from .env
+
+# ── Retrieval ──
+retrieval:
+  top_k: 100                    # Max submissions per query
+  rerank_top_k: 20              # Rerank this many candidates
+  similarity_threshold: 0.15    # Min cosine sim to include result
+  bm25_weight: 0.3              # Fusion weight for text search
+  vector_weight: 0.7            # Fusion weight for vector search
+
+# ── Keyframe Extraction ──
+extraction:
+  fps_sample: 2                 # Extract N frames per second
+  min_scene_change: 30.0        # Threshold for scene-change detection
+  resize_max_dim: 1024          # Resize longest edge (null = no resize)
+
+# ── Submission ──
+submission:
+  format: "csv"
+  max_answers_per_query: 100
+  output_dir: "outputs/submissions"
+
+# ── Logging ──
+logging:
+  level: "INFO"
+  log_file: "logs/aic2026.log"
+  rotation: "10 MB"

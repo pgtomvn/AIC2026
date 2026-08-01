@@ -1,0 +1,69 @@
+name: aic2026
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+
+  # ── Core ML (CUDA 12.1) ──
+  - pytorch::pytorch>=2.3
+  - pytorch::torchvision>=0.18
+  - pytorch::torchaudio>=2.3
+  - pytorch::pytorch-cuda=12.1
+
+  # ── Data & Image Processing ──
+  - numpy>=1.24
+  - pandas>=2.0
+  - scipy>=1.11
+  - scikit-learn>=1.3
+  - conda-forge::opencv>=4.8
+  - pillow>=10.0
+
+  # ── Utilities ──
+  - pyyaml>=6.0
+  - tqdm>=4.66
+  - requests>=2.31
+
+  # ── Testing ──
+  - pytest>=7.4
+  - pytest-cov>=4.1
+
+  # ── Pip-only packages ──
+  - pip:
+      # Embeddings & Transformers
+      - open-clip-torch>=2.24
+      - transformers>=4.40
+      - sentence-transformers>=3.0
+      - accelerate>=0.30
+      - safetensors>=0.4
+
+      # Object Detection
+      - ultralytics>=8.2
+
+      # OCR
+      - paddlepaddle-gpu>=2.6
+      - paddleocr>=2.7
+
+      # ASR
+      - faster-whisper>=1.0
+
+      # VLM
+      - vllm>=0.4
+
+      # Vector Database
+      - qdrant-client>=1.9
+
+      # Text Search
+      - meilisearch>=0.31
+
+      # GUI
+      - streamlit>=1.35
+
+      # Config & Environment
+      - python-dotenv>=1.0
+
+      # Logging
+      - loguru>=0.7
