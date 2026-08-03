@@ -68,3 +68,6 @@ Thumbs.db
 
 # Notebooks
 .ipynb_checkpoints/
+
+# Local remediation notes
+BUG_FIX_PLAN.md
