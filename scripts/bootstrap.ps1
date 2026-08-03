@@ -137,7 +137,11 @@ try {
         throw "uv.lock is missing. Maintainers must run bootstrap.ps1 -GenerateLock once."
     }
 
-    Invoke-NativeChecked $UvExe sync --frozen
+    # PaddleOCR's optional competition stack installs opencv-contrib-python,
+    # which shares the cv2 package directory with the locked base headless
+    # wheel. Removing that group can remove shared files, so always reinstall
+    # the base wheel atomically during a normal-environment sync.
+    Invoke-NativeChecked $UvExe sync --frozen --reinstall-package opencv-python-headless
 }
 finally {
     Pop-Location
@@ -154,7 +158,7 @@ QDRANT_API_KEY=$qdrantKey
 MEILISEARCH_MASTER_KEY=$meilisearchKey
 QDRANT_URL=http://127.0.0.1:6333
 MEILISEARCH_URL=http://127.0.0.1:7700
-# Reserved for future model backends; current stubs do not consume these.
+# Optional server-side Visual Q&A provider credential.
 GEMINI_API_KEY=
 CUDA_VISIBLE_DEVICES=0
 "@

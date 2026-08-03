@@ -3,7 +3,10 @@ param(
     [switch]$IncludeCompose,
     [switch]$IncludeServices,
     [switch]$IncludeStreamlit,
-    [switch]$IncludeArchives
+    [switch]$IncludeStreamlitRuntime,
+    [switch]$IncludeArchives,
+    [switch]$IncludeGemini,
+    [switch]$IncludeQwen
 )
 
 Set-StrictMode -Version Latest
@@ -48,10 +51,28 @@ function Get-DotEnvValue {
 
 Push-Location $ProjectRoot
 try {
+    # A unique base avoids collisions when a cancelled verification process is
+    # still releasing Windows file handles from a prior run.
+    $pytestRunId = [guid]::NewGuid().ToString("N")
+    $pytestBaseTemp = Join-Path $ProjectRoot ".cache/pytest-run-$pytestRunId"
+    $pytestCache = Join-Path $ProjectRoot ".cache/pytest-cache-$pytestRunId"
+    New-Item -ItemType Directory -Force -Path (Split-Path $pytestBaseTemp -Parent) | Out-Null
     Invoke-Checked $UvExe run --frozen ruff check .
-    Invoke-Checked $UvExe run --frozen pytest -q
+    Invoke-Checked $UvExe run --frozen pytest -q `
+        --basetemp $pytestBaseTemp "--override-ini=cache_dir=$pytestCache"
     if ($IncludeArchives) {
         Invoke-Checked $UvExe run --frozen python scripts/extract_data.py --verify
+    }
+
+    if ($IncludeGemini) {
+        # This is the sole normal verification path that intentionally uses an
+        # external provider. It requires a rotated key in untracked .env.
+        Invoke-Checked $UvExe run --frozen python scripts/check_gemini.py
+    }
+
+    if ($IncludeQwen) {
+        # Explicit accelerated-profile GPU integration; never part of normal checks.
+        Invoke-Checked $UvExe run --frozen --group competition python scripts/check_qwen.py
     }
 
     if ($IncludeCompose -or $IncludeServices) {
@@ -81,15 +102,83 @@ try {
     }
 
     if ($IncludeStreamlit) {
+        # AppTest executes the application script itself and catches import/render
+        # exceptions that Streamlit's liveness endpoint cannot detect.
+        Invoke-Checked $UvExe run --frozen python scripts/check_streamlit.py
+    }
+
+    if ($IncludeStreamlitRuntime) {
+        if ($IsWindowsHost) {
+            # Some managed shells supply both Path and PATH in the process
+            # block. Windows PowerShell 5.1 cannot copy that block in
+            # Start-Process, so normalize it locally before spawning the smoke
+            # server. This does not alter the user or machine environment.
+            $processPath = [System.Environment]::GetEnvironmentVariable("Path", "Process")
+            [System.Environment]::SetEnvironmentVariable("PATH", $null, "Process")
+            [System.Environment]::SetEnvironmentVariable("Path", $processPath, "Process")
+        }
+        $runtimeEnvironment = Join-Path $ProjectRoot ".venv-runtime"
         $python = if ($IsWindowsHost) {
-            Join-Path $ProjectRoot ".venv/Scripts/python.exe"
+            Join-Path $runtimeEnvironment "Scripts/python.exe"
         }
         else {
-            Join-Path $ProjectRoot ".venv/bin/python"
+            Join-Path $runtimeEnvironment "bin/python"
         }
         if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
-            throw "The project virtual environment is missing. Run scripts/bootstrap.ps1 first."
+            throw "The competition runtime is missing. Run scripts/bootstrap_runtime.ps1 first."
         }
+        $stampPath = Join-Path $runtimeEnvironment ".aic-runtime-stamp.json"
+        if (-not (Test-Path -LiteralPath $stampPath -PathType Leaf)) {
+            throw "The competition runtime stamp is missing. Run scripts/bootstrap_runtime.ps1."
+        }
+        $stamp = Get-Content -Raw -LiteralPath $stampPath -Encoding UTF8 | ConvertFrom-Json
+        $lockHash = (Get-FileHash -LiteralPath (Join-Path $ProjectRoot "uv.lock") -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($stamp.schema_version -ne 1 -or $stamp.uv_lock_sha256 -ne $lockHash) {
+            throw "The competition runtime stamp is stale. Run scripts/bootstrap_runtime.ps1."
+        }
+        $env:AIC_PROFILE = $stamp.profile
+        $env:PADDLE_PDX_CACHE_HOME = Join-Path $ProjectRoot ".cache/paddlex"
+        $env:PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK = "True"
+        Invoke-Checked $python scripts/check_streamlit.py
+
+        # Exercise the canonical launcher from outside the repository while an
+        # exclusive listener owns the requested port. It must fail before the
+        # readiness doctor or Streamlit starts, and it must never stop the owner.
+        $occupiedListener = [System.Net.Sockets.TcpListener]::new(
+            [System.Net.IPAddress]::Loopback,
+            0
+        )
+        $occupiedListener.Server.ExclusiveAddressUse = $true
+        $occupiedListener.Start()
+        $occupiedPort = ([System.Net.IPEndPoint]$occupiedListener.LocalEndpoint).Port
+        $launcherGuarded = $false
+        try {
+            Push-Location ([IO.Path]::GetTempPath())
+            try {
+                & (Join-Path $ProjectRoot "scripts/run_app.ps1") `
+                    -Profile $stamp.profile -BatchId "aic25-b1-reference" -Port $occupiedPort
+            }
+            catch {
+                if ($_.Exception.Message -match "already owned|already in use") {
+                    $launcherGuarded = $true
+                }
+                else { throw }
+            }
+            finally { Pop-Location }
+        }
+        finally { $occupiedListener.Stop() }
+        if (-not $launcherGuarded) {
+            throw "The canonical launcher did not refuse an occupied port."
+        }
+        Write-Host "Competition launcher occupied-port and root-directory checks passed."
+
+        $portListener = [System.Net.Sockets.TcpListener]::new(
+            [System.Net.IPAddress]::Loopback,
+            0
+        )
+        $portListener.Start()
+        $streamlitPort = ([System.Net.IPEndPoint]$portListener.LocalEndpoint).Port
+        $portListener.Stop()
         $checkCache = Join-Path $ProjectRoot ".cache/check"
         New-Item -ItemType Directory -Force -Path $checkCache | Out-Null
         $stdoutPath = Join-Path $checkCache "streamlit.out.log"
@@ -99,7 +188,7 @@ try {
             ArgumentList = @(
                 "-m", "streamlit", "run", "app/streamlit_app.py",
                 "--server.headless", "true", "--server.address", "127.0.0.1",
-                "--server.port", "8501", "--browser.gatherUsageStats", "false"
+                "--server.port", "$streamlitPort", "--browser.gatherUsageStats", "false"
             )
             WorkingDirectory = $ProjectRoot
             PassThru = $true
@@ -114,18 +203,35 @@ try {
                 if ($streamlit.HasExited) { break }
                 try {
                     $response = Invoke-WebRequest -UseBasicParsing `
-                        -Uri "http://127.0.0.1:8501/_stcore/health" -TimeoutSec 2
+                        -Uri "http://127.0.0.1:$streamlitPort/_stcore/health" -TimeoutSec 2
                     if ($response.StatusCode -eq 200) { $healthy = $true; break }
                 }
                 catch { }
                 Start-Sleep -Seconds 1
             }
             if (-not $healthy) { throw "Streamlit did not become healthy within 20 seconds." }
-            Write-Host "Streamlit headless smoke check passed."
+            Write-Host "Competition Streamlit runtime smoke check passed on ephemeral port $streamlitPort."
         }
         finally {
             if (-not $streamlit.HasExited) { Stop-Process -Id $streamlit.Id -Force }
+            $streamlit.WaitForExit(10000) | Out-Null
         }
+        $runtimeLog = @(
+            Get-Content -Raw -LiteralPath $stdoutPath -ErrorAction SilentlyContinue
+            Get-Content -Raw -LiteralPath $stderrPath -ErrorAction SilentlyContinue
+        ) -join "`n"
+        $forbiddenRuntimeLogPatterns = @(
+            "(?im)^Traceback \(most recent call last\):",
+            "(?i)Uncaught app execution",
+            "(?i)use_container_width",
+            "(?i)Api key is used with an insecure connection\."
+        )
+        foreach ($pattern in $forbiddenRuntimeLogPatterns) {
+            if ($runtimeLog -match $pattern) {
+                throw "Competition Streamlit runtime log contains a forbidden warning or traceback."
+            }
+        }
+        Write-Host "Competition Streamlit runtime logs contain no forbidden warnings or tracebacks."
     }
 }
 finally {

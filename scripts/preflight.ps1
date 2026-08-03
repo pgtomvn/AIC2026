@@ -83,6 +83,9 @@ $manifestPath = Join-Path $ProjectRoot "checksums/archives.sha256"
 if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
     throw "Archive checksum manifest is missing: $manifestPath"
 }
+$projectPrefix = [IO.Path]::GetFullPath($ProjectRoot).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+$canonicalArchiveRoot = [IO.Path]::GetFullPath((Join-Path $ProjectRoot "data/archives")).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+$protectedArchiveNames = @("Keyframes_L21.zip", "Videos_L21_a.zip")
 
 foreach ($line in Get-Content -LiteralPath $manifestPath -Encoding UTF8) {
     if ($line -match "^\s*#" -or [string]::IsNullOrWhiteSpace($line)) { continue }
@@ -91,10 +94,22 @@ foreach ($line in Get-Content -LiteralPath $manifestPath -Encoding UTF8) {
     }
     $expected = $Matches[1].ToLowerInvariant()
     $archiveName = $Matches[2].Trim().TrimStart("*")
-    if ([IO.Path]::GetFileName($archiveName) -ne $archiveName) {
-        throw "Archive manifest entries must be root filenames: $archiveName"
+    $normalizedName = $archiveName.Replace("/", [IO.Path]::DirectorySeparatorChar)
+    if ([IO.Path]::IsPathRooted($normalizedName)) {
+        throw "Archive manifest entries must be relative paths: $archiveName"
     }
-    $archivePath = Join-Path $ProjectRoot $archiveName
+    $archivePath = [IO.Path]::GetFullPath((Join-Path $ProjectRoot $normalizedName))
+    if (-not $archivePath.StartsWith($projectPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Archive manifest entry escapes the project: $archiveName"
+    }
+    $isRootFilename = [IO.Path]::GetFileName($normalizedName) -eq $normalizedName
+    $isCanonicalArchive = $archivePath.StartsWith($canonicalArchiveRoot, [StringComparison]::OrdinalIgnoreCase)
+    if (-not $isRootFilename -and -not $isCanonicalArchive) {
+        throw "Archive manifest paths must be root files or below data/archives: $archiveName"
+    }
+    if ($protectedArchiveNames -contains [IO.Path]::GetFileName($archivePath) -and -not $isRootFilename) {
+        throw "Protected archive manifest entries must remain at the project root: $archiveName"
+    }
     if (-not (Test-Path -LiteralPath $archivePath -PathType Leaf)) {
         Write-Warning "Archive is absent: $archiveName"
         continue
@@ -103,7 +118,7 @@ foreach ($line in Get-Content -LiteralPath $manifestPath -Encoding UTF8) {
         Write-Host "Archive present (hash skipped): $archiveName"
         continue
     }
-    Write-Host "Hashing immutable archive: $archiveName"
+    Write-Host "Hashing cataloged archive: $archiveName"
     $actual = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($actual -ne $expected) { throw "Archive checksum mismatch: $archiveName" }
     Write-Host "Archive checksum OK: $archiveName"

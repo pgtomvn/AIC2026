@@ -1,16 +1,21 @@
-# Local secrets
+# Secrets & credentials
 .env
 .env.*
 !.env.example
+*.key
+*.pem
 .streamlit/secrets.toml
 
 # Project-local tools, environments, and caches
 .tools/
+venv/
 .venv/
+.venv-runtime/
 .cache/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.continue/
 .coverage
 .coverage.*
 coverage.xml
@@ -18,6 +23,8 @@ htmlcov/
 
 # Python build and bytecode artifacts
 __pycache__/
+**pycache**/
+*.pyc
 *.py[cod]
 *$py.class
 *.egg
@@ -26,7 +33,10 @@ build/
 dist/
 
 # Immutable archives and generated datasets
+*.mp4
 *.zip
+*.npy
+*.pkl
 *.tar
 *.tar.gz
 *.rar
@@ -36,6 +46,8 @@ data/
 # Models, indexes, service state, and outputs
 models/
 docker_data/
+qdrant_storage/
+meili_data/
 outputs/
 logs/
 *.pt

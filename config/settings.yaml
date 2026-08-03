@@ -1,87 +1,316 @@
-# ═══════════════════════════════════════════════════════════════
-# AIC 2026 — Centralized Configuration
-# ═══════════════════════════════════════════════════════════════
+# AIC 2026 Textual KIS, Visual Q&A, and TRAKE defaults. Paths are project-relative and generated
+# state remains outside Git.  The laptop profile is the guaranteed baseline.
 
-# ── Data Paths ──
+profile: laptop
+
+runtime:
+  default_batch_id: aic25-b1-reference
+
+warmup:
+  enabled: true
+  include_raw_refiner: true
+  warm_query: một người đang đi bộ trong thành phố
+  startup_budget_seconds: 90
+  retry_after_seconds: 2
+
+readiness:
+  cache_seconds: 10
+  accelerated_min_usable_vram_gib: 11.5
+  default_batch_kind: native
+  batches:
+    aic25-b1-reference:
+      kind: reference
+      expected_frames: 176707
+      expected_videos: 873
+      workflows:
+        kis: [organizer_clip, metadata]
+        qa: [organizer_clip, metadata, canonical_images, gemini]
+        trake: [organizer_clip]
+      channels:
+        organizer_clip: required
+        metadata: required
+        canonical_images: required
+        gemini: required
+        visual: optional
+        semantic_text: optional
+        ocr: optional
+        asr: optional
+        accelerated_visual: optional
+        qwen: optional
+  native_defaults:
+    workflows:
+      kis: [visual]
+      qa: [visual, canonical_images, gemini]
+      trake: [visual]
+    channels:
+      visual: required
+      canonical_images: required
+      gemini: required
+      metadata: optional
+      semantic_text: optional
+      ocr: optional
+      asr: optional
+      organizer_clip: not_applicable
+      accelerated_visual: optional
+      qwen: optional
+
+tools:
+  ffmpeg:
+    # Created by scripts/install_ffmpeg.py from a user-supplied, checksum-pinned ZIP.
+    manifest: .tools/ffmpeg/active.json
+
 data:
-  root: "data"
-  raw_videos: "data/raw/videos"
-  raw_keyframes: "data/raw/keyframes"
-  embeddings: "data/embeddings"
-  metadata: "data/metadata"
-  ocr: "data/ocr"
-  asr: "data/asr"
+  root: data
+  archives: data/archives
+  raw_videos: data/raw/videos
+  raw_keyframes: data/keyframes/native
+  embeddings: data/embeddings
+  metadata: data/metadata
+  ocr: data/ocr
+  asr: data/asr
+  scratch: data/cache/scratch
+  refined_frames: data/cache/refined-frames
+  trake_trajectory_cache: data/cache/trake-trajectories
+  catalog_db: data/state/jobs.sqlite3
+  artifact_db: data/state/artifacts.sqlite3
+  qa_state_db: data/state/visual_qa.sqlite3
+  scratch_limit_gib: 12
+  free_space_reserve_gib: 30
+  thumbnail_max_dim: 512
+  thumbnail_format: webp
 
-# ── Models ──
+ingestion:
+  stable_archive_seconds: 120
+  worker_profiles:
+    laptop:
+      cpu_workers: 2
+      queue_size: 4
+    accelerated:
+      cpu_workers: 8
+      queue_size: 8
+  scene_threshold: 0.30
+  scene_threshold_grid: [0.25, 0.30, 0.35, 0.40]
+  max_gap_seconds: 2
+  max_gap_grid_seconds: [2, 3, 4]
+  min_separation_seconds: 0.5
+  calibration_min_coverage: 0.95
+  calibration_tolerance_ms: 1000
+  # Optional atomic report produced by scripts/calibrate_extraction.py.
+  calibration_record: outputs/calibration/extraction-selection.json
+  visual_queue_size: 64
+  index_batch_size: 256
+  projection_sample_videos: 10
+  core_projection_stages: [probe, frames, visual]
+  # May be set per competition via GET /v1/ingest/status query parameter.
+  preload_window_seconds: null
+  preload_deadline_fraction: 0.80
+  stages: [probe, frames, visual, activate, ocr, asr, text]
+
 models:
-  clip:
-    name: "ViT-H-14"
-    pretrained: "laion2b_s32b_b79k"
-    embedding_dim: 1024
-    batch_size: 64
-    device: "cuda"
-
-  yolo:
-    name: "yolov8x.pt"
-    confidence_threshold: 0.3
-    iou_threshold: 0.5
-
-  whisper:
-    model_size: "large-v3-turbo"
-    language: "vi"              # Vietnamese default; set null for auto-detect
-    device: "cuda"
-
+  visual:
+    backend: siglip2
+    model_name: google/siglip2-base-patch16-224
+    revision: 75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2
+    embedding_dim: 768
+    device: cuda
+    dtype: float16
+    batch_size: 8
+    max_batch_size: 32
+    cache_dir: models/huggingface
+    local_files_only: true
+  organizer_clip:
+    enabled: true
+    model_name: ViT-B-32-quickgelu
+    pretrained: openai
+    embedding_dim: 512
+    # Organizer search is intentionally CPU-only on the laptop profile so it
+    # cannot contend with SigLIP2/raw refinement for the 4 GiB GPU.
+    query_device: cpu
+    verification_device: cuda
+    verification_record: data/state/organizer-clip-verification.json
+    verification_sample_size: 16
+    verification_median_cosine: 0.999
+    cache_dir: models/open_clip
+    local_files_only: true
+  accelerated_visual:
+    enabled: true
+    enabled_profiles: [accelerated]
+    model_name: ViT-L-14-quickgelu
+    pretrained: dfn2b
+    embedding_dim: 768
+    device: cuda
+    batch_size: 8
+    cache_dir: models/open_clip
+    local_files_only: true
+  text:
+    model_name: dangvantuan/vietnamese-embedding
+    revision: 4ab46e46ba5902328ba0742e489e75f787932f2b
+    embedding_dim: 768
+    device: cpu
+    batch_size: 16
+    cache_dir: models/huggingface
+    local_files_only: true
   ocr:
-    engine: "paddleocr"
-    languages: ["vi", "en"]
-    use_gpu: true
+    engine: paddleocr
+    recognition_model: latin_PP-OCRv5_mobile_rec
+    detection_model: PP-OCRv5_mobile_det
+    cache_dir: models/paddleocr
+    local_files_only: true
+    languages: [vi, en]
+    use_gpu: false
+  whisper:
+    model_size: large-v3-turbo
+    hub_model_id: dropbox-dash/faster-whisper-large-v3-turbo
+    revision: 0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf
+    local_path: models/whisper/large-v3-turbo
+    language: vi
+    device: cuda
+    compute_type: int8_float16
+    batch_size: 1
+    beam_size: 1
+    retry_beam_size: 5
+    vad_filter: true
+    cache_dir: models/whisper
+    local_files_only: true
+    extract_audio_16khz: true
+  qwen_vl:
+    # Accelerated-profile fallback only.  The 4 GiB laptop never loads this model.
+    enabled: true
+    enabled_profiles: [accelerated]
+    model_name: Qwen/Qwen3-VL-4B-Instruct
+    revision: ebb281ec70b05090aa6165b016eac8ec08e71b17
+    device: cuda
+    dtype: float16
+    cache_dir: models/huggingface
+    local_files_only: true
+    max_pixels: 589824
+    max_new_tokens: 32
 
-  vlm:
-    model_name: "Qwen/Qwen2-VL-7B-Instruct"
-    max_new_tokens: 256
-    device: "cuda"
-    # Fallback to Gemini API if local VLM is too slow
-    gemini_model: "gemini-1.5-flash"
-
-# ── Services ──
 services:
+  gemini:
+    api_key_env: GEMINI_API_KEY
+    model: gemini-3.6-flash
+    max_concurrency: 1
+    requests_per_minute: 13
+    min_request_interval_seconds: 4.5
+    timeout_seconds: 30
+    max_retries: 4
+    retry_base_seconds: 5
+    retry_max_seconds: 60
+    rate_limit_cooldown_seconds: 60
+    cooldown_max_seconds: 300
   qdrant:
-    url: "http://127.0.0.1:6333"
-    url_env: "QDRANT_URL"
-    api_key_env: "QDRANT_API_KEY"
+    url: http://127.0.0.1:6333
+    url_env: QDRANT_URL
+    api_key_env: QDRANT_API_KEY
     grpc_port: 6334
-    collection_name: "aic2026_keyframes"
-    vector_size: 1024            # Must match clip.embedding_dim
-    distance: "Cosine"
-
+    prefer_grpc: true
+    collections:
+      native_frames: aic_native_{batch}_siglip2_b16_224_r75de2d55_768d_v1
+      organizer_frames: aic25_b1_openclip_b32_quickgelu_openai_512d_v1
+      accelerated_frames: aic_native_{batch}_openclip_l14_quickgelu_dfn2b_fp5cac988a_768d_v1
+      text_segments: aic_text_{batch}_vietnamese_embedding_r4ab46e46_meanpool_normalized_768d_v1
+    distance: Cosine
   meilisearch:
-    url: "http://127.0.0.1:7700"
-    url_env: "MEILISEARCH_URL"
-    api_key_env: "MEILISEARCH_MASTER_KEY"
-    index_name: "aic2026_text"
+    url: http://127.0.0.1:7700
+    url_env: MEILISEARCH_URL
+    api_key_env: MEILISEARCH_MASTER_KEY
+    indexes:
+      ocr: aic_ocr_v1
+      asr: aic_asr_v1
+      metadata: aic_metadata_v1
 
-# ── Retrieval ──
 retrieval:
-  top_k: 100                    # Max submissions per query
-  rerank_top_k: 20              # Rerank this many candidates
-  similarity_threshold: 0.15    # Min cosine sim to include result
-  bm25_weight: 0.3              # Fusion weight for text search
-  vector_weight: 0.7            # Fusion weight for vector search
+  top_k: 100
+  rrf_k: 60
+  text_query:
+    max_chunks: 4
+    overlap_tokens: 8
+  candidate_depths:
+    visual: 300
+    organizer_clip: 300
+    accelerated_visual: 300
+    ocr: 200
+    asr: 200
+    semantic_text: 200
+    metadata: 100
+  channel_weights:
+    visual: 1.0
+    organizer_clip: 0.8
+    accelerated_visual: 0.9
+    ocr: 0.8
+    asr: 0.7
+    semantic_text: 0.7
+    metadata: 0.4
+  tune_rrf_k: [20, 40, 60, 80]
+  # A labeled report at this path overrides only k/depths/weights; a no-label
+  # defaults report is intentionally ignored by the runtime.
+  tuning_record: outputs/evaluation/retrieval-tuning.json
+  temporal_windows_ms: [4000, 8000]
+  raw_refinement:
+    enabled: true
+    top_windows: 20
+    radius_seconds: 4
+    fps: 6
+    persistence_max_entries: 20000
+    persistence_max_bytes: 2147483648
+    persistence_max_image_bytes: 2097152
+    webp_quality: 85
+  diversity:
+    min_separation_ms: 3000
+    early_cutoff: 20
+    early_per_video: 2
+    late_per_video: 5
+  rocchio:
+    alpha: 1.0
+    beta: 0.75
+    gamma: 0.25
+  trake:
+    top_k: 100
+    candidate_depth: 300
+    max_candidate_videos: 200
+    # Positive query gates only; failed readiness probes are never cached.
+    readiness_cache_seconds: 300
+    seed_frames_per_prompt: 4
+    grouped_search_workers: 8
+    vector_scroll_batch_size: 4096
+    persist_trajectory_cache: true
+    trajectory_snapshot_schema_version: 1
+    trajectory_snapshot_lock_timeout_seconds: 600
+    global_weight: 0.25
+    min_stages: 2
+    max_stages: 20
+    raw_refinement_enabled: false
+  visual_qa:
+    initial_clusters: 5
+    expansion_step: 5
+    max_clusters: 20
+    candidate_pool: 100
+    window_radius_ms: 4000
+    frames_per_window: 5
+    min_frames_per_window: 3
+    min_cluster_separation_ms: 3000
+    session_ttl_seconds: 86400
+    reasoning_cache_ttl_seconds: 2592000
+    image_max_source_bytes: 16777216
+    image_max_request_bytes: 20971520
+    image_max_dimension: 768
+    default_answer_spec_id: aic-2024-visual-qa-numeric-v1
 
-# ── Keyframe Extraction ──
-extraction:
-  fps_sample: 2                 # Extract N frames per second
-  min_scene_change: 30.0        # Threshold for scene-change detection
-  resize_max_dim: 1024          # Resize longest edge (null = no resize)
+competition:
+  spec_id: aic-2025-textual-kis
+  output_columns: [video_name, frame_idx]
+  max_results: 100
+  cutoffs: [1, 5, 20, 50, 100]
+  include_header: false
+  output_dir: outputs/submissions
 
-# ── Submission ──
-submission:
-  format: "csv"
-  max_answers_per_query: 100
-  output_dir: "outputs/submissions"
+api:
+  host: 127.0.0.1
+  port: 8080
 
-# ── Logging ──
 logging:
-  level: "INFO"
-  log_file: "logs/aic2026.log"
-  rotation: "10 MB"
+  level: INFO
+  log_file: logs/aic2026.log
+  app_error_file: outputs/logs/app_error.log
+  rotation: 10 MB

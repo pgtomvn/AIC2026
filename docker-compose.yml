@@ -8,8 +8,11 @@ services:
       - "127.0.0.1:6333:6333" # REST API
       - "127.0.0.1:6334:6334" # gRPC
     volumes:
-      - ./docker_data/qdrant/storage:/qdrant/storage
-      - ./docker_data/qdrant/snapshots:/qdrant/snapshots
+      # Docker-managed Linux volumes avoid Qdrant segment-rename failures on
+      # Windows/NTFS bind mounts. The legacy docker_data/qdrant tree is retained
+      # as a migration rollback copy and is never removed automatically.
+      - qdrant_storage:/qdrant/storage
+      - qdrant_snapshots:/qdrant/snapshots
     environment:
       QDRANT__SERVICE__GRPC_PORT: "6334"
       QDRANT__SERVICE__API_KEY: "${QDRANT_API_KEY:?Set QDRANT_API_KEY in .env}"
@@ -40,3 +43,9 @@ services:
       timeout: 5s
       retries: 5
       start_period: 15s
+
+volumes:
+  qdrant_storage:
+    name: aic2026-qdrant-storage
+  qdrant_snapshots:
+    name: aic2026-qdrant-snapshots

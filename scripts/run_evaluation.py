@@ -1,76 +1,85 @@
-"""
-Run Evaluation Script
-=====================
-Offline evaluation harness to measure retrieval quality using
-the competition's R-Score metric.
-
-Usage:
-    python scripts/run_evaluation.py --ground-truth gt.json --predictions pred.csv
-"""
+"""Evaluate ranked Textual KIS predictions against source-frame intervals."""
 
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.utils.io_helpers import load_config
-from src.utils.logger import logger, setup_logger_from_config
+from src.contracts import CompetitionSpec
+from src.evaluation.textual_kis import evaluate_queries, load_ground_truth, load_predictions
 
 
 def compute_r_at_k(predictions: list, ground_truth: dict, k: int) -> float:
-    """Compute R@k metric.
+    """Backward-compatible single-query interval recall helper."""
+    from src.evaluation.textual_kis import _ground_truth_rows, first_relevant_rank, recall_at_k
 
-    R@k = max over ranks 1..k of R-Score(prediction_i)
-
-    Args:
-        predictions: Ordered list of predicted (video_id, frame_id) tuples.
-        ground_truth: Dict with ground-truth video_id and frame_id.
-        k: Cutoff rank.
-
-    Returns:
-        R@k score (0.0 to 1.0).
-    """
-    # TODO: Implement R-Score calculation per the competition spec
-    raise NotImplementedError("compute_r_at_k")
+    row = {"query_id": "default", **ground_truth}
+    if "frame_id" in row and not any(
+        name in row for name in ("source_frame_idx", "frame_idx", "start_frame_idx")
+    ):
+        row["source_frame_idx"] = row.pop("frame_id")
+    query = _ground_truth_rows([row])[0]
+    return recall_at_k(first_relevant_rank(predictions, query), k)
 
 
-def compute_final_score(
-    predictions: list, ground_truth: dict
-) -> float:
-    """Compute the competition Final Score.
-
-    Final Score = (R@1 + R@5 + R@20 + R@50 + R@100) / 5
-
-    Args:
-        predictions: Ordered list of predictions.
-        ground_truth: Ground truth for the query.
-
-    Returns:
-        Final Score (0.0 to 1.0).
-    """
-    ks = [1, 5, 20, 50, 100]
-    r_scores = [compute_r_at_k(predictions, ground_truth, k) for k in ks]
-    return sum(r_scores) / len(ks)
+def compute_final_score(predictions: list, ground_truth: dict) -> float:
+    """Backward-compatible mean historical score across standard cutoffs."""
+    spec = CompetitionSpec.historical_2025()
+    return sum(compute_r_at_k(predictions, ground_truth, k) for k in spec.cutoffs) / len(
+        spec.cutoffs
+    )
 
 
-def main() -> None:
-    """Run evaluation."""
-    setup_logger_from_config(load_config())
-    parser = argparse.ArgumentParser(description="AIC 2026 Evaluation")
-    parser.add_argument("--ground-truth", type=str, required=True, help="Path to ground truth JSON")
-    parser.add_argument("--predictions", type=str, required=True, help="Path to predictions CSV")
-    args = parser.parse_args()
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Evaluate AIC Textual KIS source-frame predictions"
+    )
+    parser.add_argument("--ground-truth", type=Path, required=True, help="CSV or JSON intervals")
+    parser.add_argument("--predictions", type=Path, required=True, help="CSV or JSON rankings")
+    parser.add_argument("--spec", type=Path, help="Optional CompetitionSpec JSON")
+    parser.add_argument("--latencies", type=Path, help="Optional JSON query_id-to-ms mapping")
+    parser.add_argument("--output", type=Path, help="Optional report JSON destination")
+    parser.add_argument(
+        "--compact", action="store_true", help="Omit per-query metrics from displayed JSON"
+    )
+    return parser
 
-    logger.info(f"Ground truth: {args.ground_truth}")
-    logger.info(f"Predictions: {args.predictions}")
 
-    # TODO: Load data, compute metrics, display results
-    logger.warning("run_evaluation.py is a stub — implement the evaluation logic.")
+def main(argv: list[str] | None = None) -> int:
+    """Load files, evaluate them, and emit deterministic JSON."""
+    args = _parser().parse_args(argv)
+    spec = CompetitionSpec.historical_2025()
+    if args.spec:
+        with args.spec.open("r", encoding="utf-8-sig") as handle:
+            spec = CompetitionSpec.from_dict(json.load(handle))
+    latencies = None
+    if args.latencies:
+        with args.latencies.open("r", encoding="utf-8-sig") as handle:
+            raw_latencies = json.load(handle)
+        if not isinstance(raw_latencies, dict):
+            raise ValueError("latencies JSON must map query IDs to milliseconds")
+        latencies = {str(key): float(value) for key, value in raw_latencies.items()}
+
+    ground_truth = load_ground_truth(args.ground_truth)
+    predictions = load_predictions(args.predictions)
+    if set(predictions) == {"default"} and len(ground_truth) == 1:
+        predictions = {ground_truth[0].query_id: predictions["default"]}
+    report = evaluate_queries(predictions, ground_truth, spec=spec, latencies_ms=latencies)
+    payload = report.to_dict()
+    if args.compact:
+        payload.pop("per_query", None)
+    rendered = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+    print(rendered)
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(rendered + "\n", encoding="utf-8")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
