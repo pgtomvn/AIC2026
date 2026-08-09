@@ -1,3 +1,5 @@
+![AIC 2026 Multimodal Video Retrieval cyberpunk HUD banner](docs/assets/aic2026-cyberpunk-banner.png)
+
 # AIC 2026 multimodal video retrieval
 
 This repository implements the Textual Known Item Search (Textual KIS) foundation, a Phase 2
