@@ -210,8 +210,8 @@ class _MetadataFailingReasoner(_Reasoner):
             self.calls += 1
         raise QAProviderRequestError(
             "safe provider request failure",
-            provider="gemini",
-            model="gemini-test",
+            provider="ollama-qwen",
+            model="qwen2.5vl:test",
             attempts=2,
             category="rate_limited",
             status_code=429,
@@ -859,8 +859,8 @@ def test_provider_failure_outcome_keeps_only_safe_execution_metadata(
     outcome = pipeline.get_search("provider-metadata")["window_outcomes"][0]
     assert outcome["failure_code"] == "provider_request_failed"
     assert outcome["failure_stage"] == "provider"
-    assert outcome["provider"] == "gemini"
-    assert outcome["model_name"] == "gemini-test"
+    assert outcome["provider"] == "ollama-qwen"
+    assert outcome["model_name"] == "qwen2.5vl:test"
     assert outcome["attempts"] == 2
     assert outcome["provider_error_category"] == "rate_limited"
     assert outcome["provider_status_code"] == 429

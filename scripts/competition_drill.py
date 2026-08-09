@@ -218,11 +218,6 @@ def main(argv: list[str] | None = None) -> int:
                 not enabled_profiles or str(config.get("profile")) in enabled_profiles
             ):
                 required_assets.add(_path(model.get("cache_dir", "models/open_clip")))
-        qwen = models.get("qwen_vl", {})
-        if qwen.get("enabled", False) and str(config.get("profile")) in tuple(
-            str(value) for value in qwen.get("enabled_profiles", ())
-        ):
-            required_assets.add(_path(qwen.get("cache_dir", "models/huggingface")))
         checked, asset_errors = verify_asset_manifest(
             PROJECT_ROOT / "checksums/runtime-assets.sha256",
             root=PROJECT_ROOT,

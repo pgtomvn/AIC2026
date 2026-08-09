@@ -81,9 +81,9 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
-        "--live-gemini",
+        "--live-local-vlm",
         action="store_true",
-        help="explicitly send one tiny synthetic request to the configured Gemini provider",
+        help="explicitly run the local synthetic Ollama vision check",
     )
     parser.add_argument(
         "--allow-degraded",
@@ -103,8 +103,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--wait-seconds must be between 0 and 300")
     if not 0.1 <= args.poll_seconds <= 10:
         parser.error("--poll-seconds must be between 0.1 and 10")
-    if args.startup_only and args.live_gemini:
-        parser.error("--startup-only cannot be combined with --live-gemini")
+    if args.startup_only and args.live_local_vlm:
+        parser.error("--startup-only cannot be combined with --live-local-vlm")
 
     config = load_config()
     catalog_value = config.get("data", {}).get("catalog_db")
@@ -149,18 +149,16 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
-    live_verified = False
     live_status = "not_requested"
-    if args.live_gemini:
-        # Keep the doctor output valid JSON and never include provider exception text.
+    if args.live_local_vlm:
         try:
-            from scripts.check_gemini import check_five_image_once
+            from scripts.check_vlm_offline import main as check_local_vlm
 
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
                 io.StringIO()
             ):
-                live_verified = check_five_image_once() == 0
-            live_status = "passed" if live_verified else "failed"
+                passed = check_local_vlm([]) == 0
+            live_status = "passed" if passed else "failed"
         except Exception:
             live_status = "failed"
 
@@ -173,7 +171,6 @@ def main(argv: list[str] | None = None) -> int:
         report = service.check(
             args.batch_id,
             mode=args.mode,
-            gemini_live_verified=live_verified,
             force=True,
         )
         preliminary_exit = _readiness_exit_code(
@@ -184,7 +181,7 @@ def main(argv: list[str] | None = None) -> int:
             break
         time.sleep(min(args.poll_seconds, remaining))
     payload = report.to_dict()
-    payload["live_gemini"] = live_status
+    payload["live_local_vlm"] = live_status
     payload["wait"] = {
         "requested_seconds": args.wait_seconds,
         "attempts": attempts,
@@ -227,7 +224,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
 
-    if args.live_gemini and not live_verified:
+    if args.live_local_vlm and live_status != "passed":
         return 1
     if warmup_failed:
         return 1

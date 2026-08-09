@@ -5,8 +5,9 @@ param(
     [switch]$IncludeStreamlit,
     [switch]$IncludeStreamlitRuntime,
     [switch]$IncludeArchives,
+    [switch]$IncludeLocalVLM,
     [switch]$IncludeGemini,
-    [switch]$IncludeQwen
+    [switch]$AllowExternalFrameTransfer
 )
 
 Set-StrictMode -Version Latest
@@ -64,15 +65,17 @@ try {
         Invoke-Checked $UvExe run --frozen python scripts/extract_data.py --verify
     }
 
-    if ($IncludeGemini) {
-        # This is the sole normal verification path that intentionally uses an
-        # external provider. It requires a rotated key in untracked .env.
-        Invoke-Checked $UvExe run --frozen python scripts/check_gemini.py
+    if ($IncludeLocalVLM) {
+        # Explicit local model integration; never downloads or contacts a cloud provider.
+        Invoke-Checked $UvExe run --frozen python scripts/check_vlm_offline.py
     }
 
-    if ($IncludeQwen) {
-        # Explicit accelerated-profile GPU integration; never part of normal checks.
-        Invoke-Checked $UvExe run --frozen --group competition python scripts/check_qwen.py
+    if ($IncludeGemini) {
+        if (-not $AllowExternalFrameTransfer) {
+            throw "-IncludeGemini requires -AllowExternalFrameTransfer."
+        }
+        Invoke-Checked $UvExe run --frozen python `
+            scripts/test_gemini_single_frame_qa.py --allow-external-frame-transfer
     }
 
     if ($IncludeCompose -or $IncludeServices) {
@@ -176,13 +179,50 @@ try {
             [System.Net.IPAddress]::Loopback,
             0
         )
+        $apiPortListener = [System.Net.Sockets.TcpListener]::new(
+            [System.Net.IPAddress]::Loopback,
+            0
+        )
         $portListener.Start()
+        $apiPortListener.Start()
         $streamlitPort = ([System.Net.IPEndPoint]$portListener.LocalEndpoint).Port
+        $apiPort = ([System.Net.IPEndPoint]$apiPortListener.LocalEndpoint).Port
         $portListener.Stop()
+        $apiPortListener.Stop()
+        $env:AIC_API_URL = "http://127.0.0.1:$apiPort"
         $checkCache = Join-Path $ProjectRoot ".cache/check"
         New-Item -ItemType Directory -Force -Path $checkCache | Out-Null
         $stdoutPath = Join-Path $checkCache "streamlit.out.log"
         $stderrPath = Join-Path $checkCache "streamlit.err.log"
+        $apiStdoutPath = Join-Path $checkCache "fastapi.out.log"
+        $apiStderrPath = Join-Path $checkCache "fastapi.err.log"
+        $apiParameters = @{
+            FilePath = $python
+            ArgumentList = @(
+                "scripts/serve.py", "--host", "127.0.0.1", "--port", "$apiPort"
+            )
+            WorkingDirectory = $ProjectRoot
+            PassThru = $true
+            RedirectStandardOutput = $apiStdoutPath
+            RedirectStandardError = $apiStderrPath
+        }
+        if ($IsWindowsHost) { $apiParameters["WindowStyle"] = "Hidden" }
+        $api = Start-Process @apiParameters
+        $apiHealthy = $false
+        foreach ($attempt in 1..30) {
+            if ($api.HasExited) { break }
+            try {
+                $response = Invoke-WebRequest -UseBasicParsing `
+                    -Uri "http://127.0.0.1:$apiPort/healthz" -TimeoutSec 2
+                if ($response.StatusCode -eq 200) { $apiHealthy = $true; break }
+            }
+            catch { }
+            Start-Sleep -Seconds 1
+        }
+        if (-not $apiHealthy) {
+            if (-not $api.HasExited) { Stop-Process -Id $api.Id -Force }
+            throw "FastAPI did not become healthy within 30 seconds."
+        }
         $startParameters = @{
             FilePath = $python
             ArgumentList = @(
@@ -196,8 +236,9 @@ try {
             RedirectStandardError = $stderrPath
         }
         if ($IsWindowsHost) { $startParameters["WindowStyle"] = "Hidden" }
-        $streamlit = Start-Process @startParameters
+        $streamlit = $null
         try {
+            $streamlit = Start-Process @startParameters
             $healthy = $false
             foreach ($attempt in 1..20) {
                 if ($streamlit.HasExited) { break }
@@ -213,12 +254,18 @@ try {
             Write-Host "Competition Streamlit runtime smoke check passed on ephemeral port $streamlitPort."
         }
         finally {
-            if (-not $streamlit.HasExited) { Stop-Process -Id $streamlit.Id -Force }
-            $streamlit.WaitForExit(10000) | Out-Null
+            if ($null -ne $streamlit -and -not $streamlit.HasExited) {
+                Stop-Process -Id $streamlit.Id -Force
+            }
+            if ($null -ne $streamlit) { $streamlit.WaitForExit(10000) | Out-Null }
+            if (-not $api.HasExited) { Stop-Process -Id $api.Id -Force }
+            $api.WaitForExit(10000) | Out-Null
         }
         $runtimeLog = @(
             Get-Content -Raw -LiteralPath $stdoutPath -ErrorAction SilentlyContinue
             Get-Content -Raw -LiteralPath $stderrPath -ErrorAction SilentlyContinue
+            Get-Content -Raw -LiteralPath $apiStdoutPath -ErrorAction SilentlyContinue
+            Get-Content -Raw -LiteralPath $apiStderrPath -ErrorAction SilentlyContinue
         ) -join "`n"
         $forbiddenRuntimeLogPatterns = @(
             "(?im)^Traceback \(most recent call last\):",

@@ -148,11 +148,6 @@ def _drill_config(tmp_path: Path) -> dict[str, Any]:
                 "enabled": True,
                 "cache_dir": "models/accelerated-openclip",
             },
-            "qwen_vl": {
-                "enabled": True,
-                "enabled_profiles": ["accelerated"],
-                "cache_dir": "models/qwen",
-            },
         },
         "data": {"free_space_reserve_gib": 0},
     }
@@ -187,7 +182,6 @@ def test_competition_drill_checks_ffmpeg_and_accelerated_assets(
     report = json.loads(capsys.readouterr().out)
 
     assert tmp_path / "models/accelerated-openclip" in captured["required"]
-    assert tmp_path / "models/qwen" in captured["required"]
     assert captured["ffmpeg"] == tmp_path / ".tools/ffmpeg/active.json"
     assert report["checks"]["ffmpeg"] == "pinned-v1"
 
@@ -274,38 +268,3 @@ def test_prepare_models_supports_accelerated_openclip(
             "local_files_only": False,
         }
     ]
-
-
-def test_prepare_models_supports_pinned_qwen_snapshot(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    downloads: list[dict[str, Any]] = []
-    frozen: dict[str, Any] = {}
-    hub = ModuleType("huggingface_hub")
-    hub.snapshot_download = lambda **kwargs: downloads.append(kwargs)
-    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
-    monkeypatch.setattr(prepare_module, "PROJECT_ROOT", tmp_path)
-    monkeypatch.setattr(
-        prepare_module,
-        "load_config",
-        lambda: {
-            "models": {
-                "qwen_vl": {
-                    "model_name": "Qwen/Qwen3-VL-4B-Instruct",
-                    "revision": "pinned-revision",
-                    "cache_dir": "models/qwen",
-                }
-            }
-        },
-    )
-    monkeypatch.setattr(
-        prepare_module,
-        "freeze_assets",
-        lambda paths, **kwargs: frozen.update(paths=set(paths), **kwargs) or 9,
-    )
-
-    assert prepare_module.main(["--only", "qwen"]) == 0
-    assert downloads[0]["repo_id"] == "Qwen/Qwen3-VL-4B-Instruct"
-    assert downloads[0]["revision"] == "pinned-revision"
-    assert downloads[0]["cache_dir"] == tmp_path / "models/qwen"
-    assert frozen["paths"] == {tmp_path / "models/qwen"}

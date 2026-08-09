@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -17,6 +19,14 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 import streamlit as st  # noqa: E402
 
+from app.components.cyberpunk_theme import (  # noqa: E402
+    hud_container_key,
+    inject_cyberpunk_theme,
+    render_hud_header,
+    render_hud_readout,
+    render_hud_status_panel,
+    render_hud_timeline_strip,
+)
 from app.components.export_panel import render_export_panel  # noqa: E402
 from app.components.query_input import (  # noqa: E402
     render_query_input,
@@ -27,17 +37,20 @@ from app.components.result_gallery import (  # noqa: E402
     render_result_gallery,
     result_identity,
 )
+from app.http_backend import BackendError, build_http_runtime  # noqa: E402
 from src import PROJECT_ROOT  # noqa: E402
 from src.contracts import (  # noqa: E402
     CompetitionSpec,
+    QACandidateRequest,
     QACompetitionSpec,
     QAQueryRequest,
+    QASingleFrameAnswerRequest,
     QueryRequest,
     TRAKEQueryRequest,
     TRAKEStage,
 )
 from src.qa_submission import serialize_qa_submission  # noqa: E402
-from src.runtime import RuntimeContext, build_runtime  # noqa: E402
+from src.runtime import RuntimeContext  # noqa: E402
 from src.submission import FrameIndexEvidence  # noqa: E402
 from src.trake_submission import (  # noqa: E402
     TRAKEFrameIndexEvidence,
@@ -68,13 +81,18 @@ _QA_PROVIDER_ERROR_CATEGORIES = frozenset(
         "client_unavailable",
         "invalid_request",
         "model_unavailable",
+        "model_missing",
         "network_unreachable",
         "not_configured",
+        "ollama_context_exceeded",
+        "ollama_timeout",
+        "ollama_response_invalid",
         "provider_chain_exhausted",
         "provider_request_failed",
         "rate_limited",
         "request_rejected",
         "response_invalid",
+        "resource_exhausted",
         "server_unavailable",
     }
 )
@@ -104,6 +122,10 @@ _VI_STATUS_LABELS = {
     "incomplete": "chưa hoàn tất",
     "media_failed": "lỗi dữ liệu hình ảnh",
     "provider_failed": "lỗi nhà cung cấp",
+    "ollama_context_exceeded": "ngữ cảnh Ollama quá dài",
+    "ollama_timeout": "Ollama quá thời gian chờ",
+    "ollama_response_invalid": "Ollama trả về kết quả không đúng định dạng",
+    "resource_exhausted": "không đủ tài nguyên cho Ollama",
     "internal_failed": "lỗi nội bộ",
     "auth_or_permission": "khóa hoặc quyền truy cập không hợp lệ",
     "network_unreachable": "không kết nối được mạng",
@@ -125,6 +147,29 @@ def _vi_status(value: Any) -> str:
 
     normalized = str(value or "").strip()
     return _VI_STATUS_LABELS.get(normalized, normalized.replace("_", " "))
+
+
+def _render_query_processing(value: Any) -> None:
+    """Show sanitized bilingual routing diagnostics without touching query state."""
+
+    if not isinstance(value, dict) or not value:
+        return
+    language = str(value.get("detected_language") or "unknown")
+    english = value.get("english_text")
+    if value.get("translation_applied") and isinstance(english, str) and english:
+        source = str(value.get("translation_source") or "offline")
+        latency = value.get("translation_latency_ms")
+        suffix = (
+            f" · {float(latency):.1f} ms"
+            if isinstance(latency, (int, float)) and not isinstance(latency, bool)
+            else ""
+        )
+        st.info(f'🌐 Auto-translated ({source}{suffix}): “{english}”')
+    elif language == "vi" and value.get("failure_code"):
+        st.warning(
+            "Bộ dịch Việt–Anh chưa sẵn sàng; các kênh OpenCLIP tiếng Anh được bỏ qua "
+            "an toàn, còn kênh tiếng Việt vẫn tiếp tục hoạt động."
+        )
 
 
 def _active_workflow() -> str:
@@ -168,9 +213,7 @@ class _WindowsProactorConnectionResetFilter(logging.Filter):
         if record.name != "asyncio" or not record.exc_info:
             return True
         exception = record.exc_info[1]
-        error_code = getattr(exception, "winerror", None) or getattr(
-            exception, "errno", None
-        )
+        error_code = getattr(exception, "winerror", None) or getattr(exception, "errno", None)
         return not (
             isinstance(exception, ConnectionResetError)
             and error_code == 10054
@@ -186,27 +229,14 @@ def _install_windows_asyncio_log_filter() -> None:
     if sys.platform != "win32":
         return
     logger = logging.getLogger("asyncio")
-    if any(
-        isinstance(value, _WindowsProactorConnectionResetFilter)
-        for value in logger.filters
-    ):
+    if any(isinstance(value, _WindowsProactorConnectionResetFilter) for value in logger.filters):
         return
     logger.addFilter(_WindowsProactorConnectionResetFilter())
 
 
 @st.cache_resource
-def _runtime() -> RuntimeContext:
-    context = build_runtime()
-    context.ledger.initialize()
-    if context.artifact_repository is not None:
-        context.artifact_repository.initialize()
-    if context.qa_session_store is not None:
-        context.qa_session_store.initialize()
-    warmup = getattr(context, "warmup", None)
-    start = getattr(warmup, "start", None)
-    if callable(start):
-        start()
-    return context
+def _runtime() -> Any:
+    return build_http_runtime(os.environ.get("AIC_API_URL", "http://127.0.0.1:8080"))
 
 
 def _project_path(value: str) -> Path:
@@ -260,15 +290,37 @@ def _initialize_state() -> None:
         "kis_last_request": None,
         "kis_pin_widget_keys": [],
         "kis_export_cache": None,
+        "kis_query_language": "auto",
+        "kis_translation_edit": False,
+        "kis_english_override": "",
         "qa_predictions": [],
         "qa_pinned": [],
         "qa_edits": [],
         "qa_search_id": None,
         "qa_request": None,
         "qa_snapshot": None,
+        "qa_candidate_windows": [],
+        "qa_candidates": [],
+        "qa_answers": [],
+        "qa_result": None,
+        "qa_last_failure": None,
         "qa_export_cache": None,
         "qa_selected_window_id": None,
+        "qa_selected_candidate_id": None,
         "qa_batch_filters_seeded": False,
+        "qa_engine": "gemini",
+        "qa_answer_spec": QACompetitionSpec.conservative_general_text().spec_id,
+        "qa_answer_engine": "vlm",
+        "qa_reasoning_policy": "gemini_then_local",
+        "qa_use_florence": False,
+        "qa_florence_task": "ocr",
+        "qa_florence_target_label": "person",
+        "qa_allow_cloud_fallback": False,
+        "qa_external_transfer_consent": False,
+        "qa_diagnostic_result": None,
+        "qa_query_language": "auto",
+        "qa_translation_edit": False,
+        "qa_event_description_en": "",
         "trake_results": [],
         "trake_response": None,
         "trake_query_id": None,
@@ -278,6 +330,9 @@ def _initialize_state() -> None:
         "trake_stage_1": "",
         "trake_stage_2": "",
         "trake_export_cache": None,
+        "trake_query_language": "auto",
+        "trake_translation_edit": False,
+        "trake_global_description_en": "",
     }
     for name, value in defaults.items():
         st.session_state.setdefault(name, value)
@@ -382,9 +437,7 @@ def _submission_identities(rows: list[dict[str, Any]]) -> list[tuple[str, int]]:
         matches = row.get("stage_matches")
         if isinstance(matches, (list, tuple)):
             values.extend(
-                match.get("source_frame_idx")
-                for match in matches
-                if isinstance(match, dict)
+                match.get("source_frame_idx") for match in matches if isinstance(match, dict)
             )
         frame_ids = row.get("frame_ids", row.get("source_frame_indices"))
         if isinstance(frame_ids, (list, tuple)):
@@ -484,10 +537,7 @@ def _render_launch_identity(context: RuntimeContext) -> None:
     config = getattr(context, "config", {})
     config = config if isinstance(config, dict) else {}
     selected = str(identity.get("batch_id") or _selected_batch_id(context) or "chưa chọn")
-    profile = str(
-        identity.get("profile")
-        or config.get("profile", "không rõ")
-    )
+    profile = str(identity.get("profile") or config.get("profile", "không rõ"))
     contract = str(identity.get("contract") or "direct-streamlit")
     launch_id = str(identity.get("launch_id") or "chưa ghi nhận")
     port = identity.get("port")
@@ -507,12 +557,10 @@ def _render_launch_identity(context: RuntimeContext) -> None:
         return
     recommended_port = port if isinstance(port, int) and 1 <= port <= 65_535 else 8501
     launcher = (
-        f".\\scripts\\run_app.ps1 -Profile {profile} "
-        f"-BatchId {selected} -Port {recommended_port}"
+        f".\\scripts\\run_app.ps1 -Profile {profile} -BatchId {selected} -Port {recommended_port}"
     )
     st.warning(
-        details
-        + "\n\nPhát hiện phiên Streamlit được chạy trực tiếp hoặc chưa xác minh. "
+        details + "\n\nPhát hiện phiên Streamlit được chạy trực tiếp hoặc chưa xác minh. "
         f"Hãy khởi động lại bằng `{launcher}` để kiểm tra runtime, batch, cổng và trạng thái sẵn sàng."
     )
 
@@ -543,9 +591,7 @@ def _readiness_rows(report: dict[str, Any]) -> list[dict[str, Any]]:
     if not isinstance(channels, (list, tuple)):
         return []
     return [
-        {name: item.get(name) for name in allowed}
-        for item in channels
-        if isinstance(item, dict)
+        {name: item.get(name) for name in allowed} for item in channels if isinstance(item, dict)
     ]
 
 
@@ -606,9 +652,7 @@ def _render_readiness(context: RuntimeContext) -> None:
     trake = report.get("trake", {})
     kis_state = str(kis.get("state", "blocked")) if isinstance(kis, dict) else "blocked"
     qa_state = str(qa.get("state", "blocked")) if isinstance(qa, dict) else "blocked"
-    trake_state = (
-        str(trake.get("state", "blocked")) if isinstance(trake, dict) else "blocked"
-    )
+    trake_state = str(trake.get("state", "blocked")) if isinstance(trake, dict) else "blocked"
     message = (
         f"Trạng thái hệ thống · {batch_id} · KIS {_vi_status(kis_state)} · "
         f"Hỏi đáp hình ảnh {_vi_status(qa_state)} · TRAKE {_vi_status(trake_state)}"
@@ -692,6 +736,108 @@ def _warmup_workflow_usable(context: RuntimeContext, workflow: str) -> bool:
     return bool(_warmup_workflow_snapshot(_warmup_snapshot(context), workflow)["usable"])
 
 
+def _hud_state(value: object) -> str:
+    """Map sanitized readiness states to the compact operator HUD vocabulary."""
+
+    state = str(value or "").strip().lower()
+    if state in {"ready", "online", "configured", "configured_unverified"}:
+        return "READY"
+    if state in {"idle", "warming", "evicted", "loading", "not_provisioned", "skipped"}:
+        return "STANDBY"
+    if state in {"degraded", "partial", "incompatible_index"}:
+        return "DEGRADED"
+    if state in {
+        "failed",
+        "offline",
+        "blocked",
+        "blocked_asset",
+        "service_unavailable",
+        "unavailable",
+    }:
+        return "OFFLINE"
+    return "UNKNOWN"
+
+
+def _aggregate_hud_channels(
+    channels: list[dict[str, Any]],
+    names: set[str],
+) -> str:
+    selected = [
+        _hud_state(item.get("state"))
+        for item in channels
+        if str(item.get("name", "")) in names
+    ]
+    if not selected:
+        return "UNKNOWN"
+    if "READY" in selected:
+        return "READY"
+    if "DEGRADED" in selected:
+        return "DEGRADED"
+    if "STANDBY" in selected:
+        return "STANDBY"
+    if all(value == "OFFLINE" for value in selected):
+        return "OFFLINE"
+    return "UNKNOWN"
+
+
+def _hud_service_statuses(
+    context: RuntimeContext,
+    snapshot: dict[str, Any],
+) -> tuple[tuple[str, str, str | None], ...]:
+    """Project existing snapshots into service badges without issuing new probes."""
+
+    raw_channels = snapshot.get("channels", ())
+    channels = [dict(item) for item in raw_channels if isinstance(item, dict)]
+    capabilities = getattr(context, "capabilities", {})
+    capabilities = capabilities if isinstance(capabilities, dict) else {}
+    qa_capabilities = capabilities.get("qa", {})
+    qa_capabilities = qa_capabilities if isinstance(qa_capabilities, dict) else {}
+    local = qa_capabilities.get("local", {})
+    local = local if isinstance(local, dict) else {}
+    cloud = qa_capabilities.get("cloud", {})
+    cloud = cloud if isinstance(cloud, dict) else {}
+    ollama_status = local.get("status", {})
+    ollama_status = ollama_status if isinstance(ollama_status, dict) else {}
+    gemini_status = cloud.get("status", {})
+    gemini_status = gemini_status if isinstance(gemini_status, dict) else {}
+    translation = capabilities.get("query_translation", {})
+    translation = translation if isinstance(translation, dict) else {}
+    model = str(local.get("model") or "Qwen2.5-VL")
+    fastapi_state = "ONLINE" if bool(getattr(context, "is_remote", False)) else "STANDBY"
+    fastapi_detail = (
+        "runtime API đang phục vụ giao diện"
+        if fastapi_state == "ONLINE"
+        else "runtime kiểm thử được inject"
+    )
+    return (
+        ("FastAPI", fastapi_state, fastapi_detail),
+        (
+            "Qdrant",
+            _aggregate_hud_channels(
+                channels,
+                {"visual", "organizer_clip", "accelerated_visual", "semantic_text"},
+            ),
+            "vector retrieval",
+        ),
+        (
+            "Meilisearch",
+            _aggregate_hud_channels(channels, {"ocr", "asr", "metadata"}),
+            "lexical retrieval",
+        ),
+        ("Ollama", _hud_state(ollama_status.get("state")), model),
+        (
+            "Gemini Flash",
+            _hud_state(gemini_status.get("state")),
+            str(cloud.get("model") or "gemini-3.6-flash"),
+        ),
+        (
+            "VI→EN NMT",
+            _hud_state(translation.get("state")),
+            str(translation.get("model") or "offline translator"),
+        ),
+    )
+
+
 @st.fragment(run_every="1s")
 def _render_warmup_sidebar(context: RuntimeContext) -> None:
     snapshot = _warmup_snapshot(context)
@@ -714,6 +860,13 @@ def _render_warmup_sidebar(context: RuntimeContext) -> None:
         st.rerun(scope="app")
     label = _WARMUP_VI.get(state, "Không xác định")
     with st.sidebar:
+        st.markdown(
+            render_hud_status_panel(
+                "SYSTEM LINK STATUS",
+                _hud_service_statuses(context, snapshot),
+            ),
+            unsafe_allow_html=True,
+        )
         st.subheader("Bộ máy truy xuất")
         if state == "ready":
             st.success(label)
@@ -746,12 +899,36 @@ def _render_kis(context: RuntimeContext) -> None:
     with results_col:
         top_k = st.slider("Số kết quả KIS", 1, 100, 20, key="kis_top_k")
     with refinement_col:
-        refine_raw = st.checkbox(
-            "Tinh chỉnh cục bộ từ video gốc", value=True, key="kis_refine_raw"
-        )
+        refine_raw = st.checkbox("Tinh chỉnh cục bộ từ video gốc", value=True, key="kis_refine_raw")
 
     runtime_ready = _warmup_search_usable(context)
     values = render_query_input(disabled=not runtime_ready)
+    language_col, override_col = st.columns((1, 2))
+    with language_col:
+        query_language = st.selectbox(
+            "Ngôn ngữ truy vấn",
+            ("auto", "vi", "en"),
+            format_func=lambda value: {
+                "auto": "Tự động",
+                "vi": "Tiếng Việt",
+                "en": "English",
+            }[value],
+            key="kis_query_language",
+        )
+    with override_col:
+        edit_translation = st.checkbox(
+            "Chỉnh bản dịch tiếng Anh",
+            key="kis_translation_edit",
+        )
+        english_override = (
+            st.text_input(
+                "Bản dịch tiếng Anh cho dense OpenCLIP",
+                key="kis_english_override",
+                placeholder="Để trống để dùng bộ dịch offline",
+            )
+            if edit_translation
+            else ""
+        )
     if not runtime_ready:
         st.info("Bộ máy truy xuất đang được làm nóng; bạn vẫn có thể soạn truy vấn.")
     if values["submitted"]:
@@ -776,6 +953,8 @@ def _render_kis(context: RuntimeContext) -> None:
                     objects=values["objects"],
                     actions=values["actions"],
                     attributes=values["attributes"],
+                    query_language=query_language,
+                    english_text_override=english_override or None,
                 )
                 with st.spinner("Đang tìm trên các kênh vector và từ khóa..."):
                     st.session_state.kis_results = context.pipeline.search(
@@ -788,7 +967,9 @@ def _render_kis(context: RuntimeContext) -> None:
                     error,
                     workflow="kis",
                     stage="search",
-                    batch_id=(batch_filters[0] if "batch_filters" in locals() and batch_filters else None),
+                    batch_id=(
+                        batch_filters[0] if "batch_filters" in locals() and batch_filters else None
+                    ),
                     query_or_session_id=(request.query_id if request is not None else None),
                     started_at=search_started,
                 )
@@ -807,6 +988,9 @@ def _render_kis(context: RuntimeContext) -> None:
         with st.expander("Trạng thái các kênh KIS"):
             st.dataframe(rows, width="stretch", hide_index=True)
         render_text_encoding_diagnostics(channel_statuses)
+    _render_query_processing(
+        getattr(context.pipeline, "last_query_processing", {})
+    )
 
     if st.session_state.kis_last_request is None:
         st.caption("Nhập mô tả và chọn Tìm kiếm để truy xuất các khung hình đã lập chỉ mục.")
@@ -827,9 +1011,7 @@ def _render_kis(context: RuntimeContext) -> None:
                     if item.get("batch_id")
                 }
                 if neighbor_choices:
-                    label = st.selectbox(
-                        "Ứng viên", list(neighbor_choices), key="kis_neighbor"
-                    )
+                    label = st.selectbox("Ứng viên", list(neighbor_choices), key="kis_neighbor")
                     candidate = neighbor_choices[label]
                     neighbors = context.artifact_repository.neighbors(
                         candidate["batch_id"],
@@ -859,12 +1041,8 @@ def _render_kis(context: RuntimeContext) -> None:
                 )
                 for item in st.session_state.kis_results[:20]
             }
-            positive = st.multiselect(
-                "Liên quan", list(choices), key="kis_positive_hits"
-            )
-            negative = st.multiselect(
-                "Không liên quan", list(choices), key="kis_negative_hits"
-            )
+            positive = st.multiselect("Liên quan", list(choices), key="kis_positive_hits")
+            negative = st.multiselect("Không liên quan", list(choices), key="kis_negative_hits")
             if set(positive) & set(negative):
                 st.warning("Một khung hình không thể vừa liên quan vừa không liên quan.")
             elif st.button(
@@ -911,9 +1089,7 @@ def _render_kis(context: RuntimeContext) -> None:
         hide_index=True,
     )
     batch_ids = {
-        str(item["batch_id"])
-        for item in st.session_state.kis_pinned
-        if item.get("batch_id")
+        str(item["batch_id"]) for item in st.session_state.kis_pinned if item.get("batch_id")
     }
     if len(batch_ids) != 1 or context.artifact_repository is None:
         st.error(
@@ -923,9 +1099,7 @@ def _render_kis(context: RuntimeContext) -> None:
     else:
         batch_id = next(iter(batch_ids))
         snapshot = _kis_export_snapshot(st.session_state.kis_pinned)
-        canonical_check, evidence, _ = _submission_validation_context(
-            context, batch_id, snapshot
-        )
+        canonical_check, evidence, _ = _submission_validation_context(context, batch_id, snapshot)
         render_export_panel(
             snapshot,
             output_dir=context.config["competition"]["output_dir"],
@@ -1020,7 +1194,7 @@ def _qa_outcomes(snapshot: dict[str, Any] | None) -> list[dict[str, Any]]:
     state = state if isinstance(state, dict) else {}
     predictions = [
         dict(item)
-        for item in state.get("predictions", ())
+        for item in state.get("predictions", snapshot.get("predictions", ()))
         if isinstance(item, dict)
     ]
     predictions_by_window: dict[str, list[dict[str, Any]]] = {}
@@ -1028,11 +1202,7 @@ def _qa_outcomes(snapshot: dict[str, Any] | None) -> list[dict[str, Any]]:
         predictions_by_window.setdefault(str(prediction.get("window_id", "")), []).append(
             prediction
         )
-    targets = [
-        dict(item)
-        for item in snapshot.get("targets", ())
-        if isinstance(item, dict)
-    ]
+    targets = [dict(item) for item in snapshot.get("targets", ()) if isinstance(item, dict)]
     targets_by_window = {
         str(
             item.get("window_id")
@@ -1132,9 +1302,7 @@ def _qa_outcomes(snapshot: dict[str, Any] | None) -> list[dict[str, Any]]:
                 **target,
                 "frames": _qa_anchor_frame(target),
                 "raw_answer": reasoning.get("raw_answer"),
-                "normalized_answer": reasoning.get(
-                    "normalized_answer", reasoning.get("answer")
-                ),
+                "normalized_answer": reasoning.get("normalized_answer", reasoning.get("answer")),
                 "answerable": answerable,
                 "evidence_frame_indices": reasoning.get("evidence_frame_indices", ()),
                 "provider": reasoning.get("provider"),
@@ -1147,9 +1315,7 @@ def _qa_outcomes(snapshot: dict[str, Any] | None) -> list[dict[str, Any]]:
     if isinstance(failures, dict):
         for window_id, failure_code in failures.items():
             target = targets_by_window.get(str(window_id), {})
-            status, code, stage = _qa_failure_metadata(
-                {"failure_code": failure_code}
-            )
+            status, code, stage = _qa_failure_metadata({"failure_code": failure_code})
             outcomes.setdefault(
                 str(window_id),
                 {
@@ -1208,17 +1374,38 @@ def _apply_qa_snapshot(snapshot: dict[str, Any] | None) -> dict[str, Any] | None
     st.session_state.qa_snapshot = snapshot
     if snapshot is None:
         st.session_state.qa_predictions = []
+        st.session_state.qa_candidate_windows = []
+        st.session_state.qa_candidates = []
+        st.session_state.qa_answers = []
+        st.session_state.qa_result = None
         return None
+    st.session_state.qa_search_id = str(
+        snapshot.get("search_id") or snapshot.get("session_id") or ""
+    ) or None
+    candidate_values = snapshot.get("candidates", snapshot.get("candidate_windows", ()))
+    st.session_state.qa_candidate_windows = [
+        dict(item)
+        for item in candidate_values
+        if isinstance(item, dict)
+    ]
+    st.session_state.qa_candidates = list(st.session_state.qa_candidate_windows)
+    st.session_state.qa_answers = [
+        dict(item) for item in snapshot.get("answers", ()) if isinstance(item, dict)
+    ]
+    selected_candidate = snapshot.get("selected_candidate_id")
+    if (
+        isinstance(selected_candidate, str)
+        and selected_candidate
+        and st.session_state.get("qa_selected_candidate_id") != selected_candidate
+    ):
+        st.session_state.qa_selected_candidate_id = selected_candidate
     state = snapshot.get("state", {})
     state = state if isinstance(state, dict) else {}
     persisted_edits = snapshot.get("operator_edits", ())
     if isinstance(persisted_edits, list):
         st.session_state.qa_edits = [dict(item) for item in persisted_edits]
-    predictions = [
-        dict(item)
-        for item in state.get("predictions", ())
-        if isinstance(item, dict)
-    ]
+    raw_predictions = snapshot.get("predictions", state.get("predictions", ()))
+    predictions = [dict(item) for item in raw_predictions if isinstance(item, dict)]
     latest_edits = {
         str(edit["window_id"]): edit
         for edit in st.session_state.qa_edits
@@ -1234,6 +1421,7 @@ def _apply_qa_snapshot(snapshot: dict[str, Any] | None) -> dict[str, Any] | None
         item["answer_source"] = "operator"
         item["evidence"] = evidence
     st.session_state.qa_predictions = predictions
+    st.session_state.qa_result = predictions[0] if predictions else None
     return snapshot
 
 
@@ -1251,16 +1439,12 @@ def _apply_qa_edit(context: RuntimeContext, window_id: str, edited: str) -> None
     normalized = spec.normalize_answer(edited, request.question)
     predictions = [dict(item) for item in st.session_state.qa_predictions]
     original_answers = {
-        str(item["answer"])
-        for item in predictions
-        if item.get("window_id") == window_id
+        str(item["answer"]) for item in predictions if item.get("window_id") == window_id
     }
     if not original_answers:
         raise ValueError("the selected QA window is unavailable")
     edited_at = time.time()
-    original_item = next(
-        item for item in predictions if item.get("window_id") == window_id
-    )
+    original_item = next(item for item in predictions if item.get("window_id") == window_id)
     audit = {
         "previous_normalized_answers": sorted(original_answers),
         "original_raw_answer": original_item.get("raw_answer"),
@@ -1289,9 +1473,7 @@ def _apply_qa_edit(context: RuntimeContext, window_id: str, edited: str) -> None
             item["answer"] = normalized
             item["answer_source"] = "operator"
             item["evidence"] = next(
-                value["evidence"]
-                for value in predictions
-                if value.get("window_id") == window_id
+                value["evidence"] for value in predictions if value.get("window_id") == window_id
             )
     st.session_state.qa_edits.append(persisted_edit)
     st.session_state.qa_export_cache = None
@@ -1300,8 +1482,7 @@ def _apply_qa_edit(context: RuntimeContext, window_id: str, edited: str) -> None
 def _pin_qa_prediction(prediction: dict) -> None:
     identity = (prediction["video_id"], prediction["source_frame_idx"])
     pinned = {
-        (item["video_id"], item["source_frame_idx"]): item
-        for item in st.session_state.qa_pinned
+        (item["video_id"], item["source_frame_idx"]): item for item in st.session_state.qa_pinned
     }
     pinned[identity] = dict(prediction)
     st.session_state.qa_pinned = list(pinned.values())[:100]
@@ -1348,6 +1529,57 @@ def _qa_window_frames(outcome: dict[str, Any], predictions: list[dict]) -> list[
     return resolved or _qa_anchor_frame(outcome)
 
 
+def _render_qa_evidence_summary(
+    context: RuntimeContext,
+    outcomes: list[dict[str, Any]],
+    predictions: list[dict],
+) -> None:
+    """Highlight only provider-selected evidence frames, never inferred boxes."""
+
+    answered = next((item for item in outcomes if item.get("status") == "answered"), None)
+    if answered is None:
+        return
+    window_id = str(answered.get("window_id", ""))
+    window_predictions = [
+        item for item in predictions if str(item.get("window_id", "")) == window_id
+    ]
+    frames = _qa_window_frames(answered, window_predictions)
+    positions = {
+        int(value)
+        for value in answered.get("evidence_frame_indices", ())
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 1
+    }
+    evidence_frames = [
+        frame for frame in frames if int(frame.get("position", 0)) in positions
+    ]
+    if not evidence_frames:
+        return
+    answer = window_predictions[0].get("answer") if window_predictions else answered.get("answer")
+    st.markdown("#### Bằng chứng chính")
+    st.success(f"Câu trả lời: `{answer or ''}`")
+    columns = st.columns(len(evidence_frames))
+    for column, frame_info in zip(columns, evidence_frames, strict=True):
+        with column:
+            batch_id = frame_info.get("batch_id") or answered.get("batch_id")
+            video_id = frame_info.get("video_id") or answered.get("video_id")
+            source_frame_idx = int(frame_info["source_frame_idx"])
+            timestamp_ms = int(frame_info.get("timestamp_ms", 0))
+            try:
+                getter = getattr(context.artifact_repository, "get_source_frame", None)
+                if not callable(getter):
+                    getter = context.artifact_repository.get_frame
+                frame = getter(batch_id, video_id, source_frame_idx)
+                if frame is None:
+                    raise ValueError("missing evidence frame")
+                image = context.qa_image_resolver.resolve(frame)
+                st.image(image.data, width="stretch")
+            except Exception:
+                st.warning("Không thể xem trước bằng chứng")
+            st.caption(
+                f"{video_id} · {timestamp_ms / 1000:.2f}s · source frame {source_frame_idx}"
+            )
+
+
 def _render_qa_window(
     context: RuntimeContext,
     outcomes: list[dict[str, Any]],
@@ -1356,9 +1588,7 @@ def _render_qa_window(
     windows: dict[str, list[dict]] = {}
     for prediction in predictions:
         windows.setdefault(str(prediction["window_id"]), []).append(prediction)
-    outcome_by_id = {
-        str(item["window_id"]): item for item in outcomes if item.get("window_id")
-    }
+    outcome_by_id = {str(item["window_id"]): item for item in outcomes if item.get("window_id")}
     if not outcome_by_id:
         return
     window_ids = list(outcome_by_id)
@@ -1412,8 +1642,10 @@ def _render_qa_window(
             position = int(frame_info.get("position", 0))
             marker = "Bằng chứng" if position in selected_positions else "Ngữ cảnh"
             st.caption(f"{marker} · khung hình {source_frame_idx}")
-            if outcome.get("status") == "answered" and prediction is not None and st.button(
-                "Ghim", key=f"qa_pin_{window_id}_{source_frame_idx}"
+            if (
+                outcome.get("status") == "answered"
+                and prediction is not None
+                and st.button("Ghim", key=f"qa_pin_{window_id}_{source_frame_idx}")
             ):
                 _pin_qa_prediction(prediction)
                 st.rerun()
@@ -1430,9 +1662,7 @@ def _render_qa_window(
         stage = outcome.get("failure_stage", "internal")
         category = outcome.get("provider_error_category")
         detail = f" · nguyên nhân: {_vi_status(category)}" if category else ""
-        st.warning(
-            f"Xử lý cửa sổ thất bại an toàn tại bước {stage}: `{code}`{detail}."
-        )
+        st.warning(f"Xử lý cửa sổ thất bại an toàn tại bước {stage}: `{code}`{detail}.")
         return
     if status == "pending":
         st.info("Cửa sổ ứng viên này đang chờ suy luận hình ảnh.")
@@ -1535,9 +1765,7 @@ def _qa_operator_edit_rows(edits: list[dict[str, Any]]) -> list[dict[str, Any]]:
         "created_at",
     )
     return [
-        {field: item.get(field) for field in allowed}
-        for item in edits
-        if isinstance(item, dict)
+        {field: item.get(field) for field in allowed} for item in edits if isinstance(item, dict)
     ]
 
 
@@ -1559,21 +1787,16 @@ def _qa_channel_status_rows(
     )
     return [
         {"channel": str(name), **{field: status.get(field) for field in allowed}}
-        for name, status in sorted(
-            channel_statuses.items(), key=lambda item: str(item[0])
-        )
+        for name, status in sorted(channel_statuses.items(), key=lambda item: str(item[0]))
         if isinstance(status, dict)
     ]
 
 
-def _qa_exportable_pins(
-    pinned: list[dict], answered_window_ids: set[str] | None
-) -> list[dict]:
+def _qa_exportable_pins(pinned: list[dict], answered_window_ids: set[str] | None) -> list[dict]:
     return [
         item
         for item in pinned
-        if answered_window_ids is None
-        or str(item.get("window_id")) in answered_window_ids
+        if answered_window_ids is None or str(item.get("window_id")) in answered_window_ids
     ]
 
 
@@ -1604,9 +1827,7 @@ def _render_qa_export(
     )
     batch_ids = {str(item["batch_id"]) for item in rows if item.get("batch_id")}
     if len(batch_ids) != 1 or context.artifact_repository is None:
-        st.error(
-            "Các dự đoán đã ghim phải thuộc cùng một batch đang hoạt động và đã lập chỉ mục."
-        )
+        st.error("Các dự đoán đã ghim phải thuộc cùng một batch đang hoạt động và đã lập chỉ mục.")
         st.session_state.qa_export_cache = None
     else:
         batch_id = next(iter(batch_ids))
@@ -1685,21 +1906,113 @@ def _render_qa_export(
         st.rerun()
 
 
-def _render_qa(context: RuntimeContext) -> None:
+def _render_qa_legacy(context: RuntimeContext) -> None:
     st.subheader("Hỏi đáp dựa trên hình ảnh")
     if context.qa_pipeline is None:
         st.error("Hỏi đáp hình ảnh không khả dụng vì dữ liệu chuẩn chưa được cấu hình.")
         return
+    capabilities = getattr(context, "capabilities", {})
+    refresh_capabilities = getattr(context, "refresh_capabilities", None)
+    if callable(refresh_capabilities):
+        try:
+            capabilities = refresh_capabilities()
+        except Exception:
+            pass
+    qa_capabilities = capabilities.get("qa", {}) if isinstance(capabilities, dict) else {}
+    local_status = qa_capabilities.get("local", {}).get("status", {})
+    cloud_status = qa_capabilities.get("cloud", {}).get("status", {})
+    engine = st.selectbox(
+        "Bộ máy suy luận",
+        ("gemini", "local"),
+        format_func=lambda value: (
+            "Gemini Flash API (Cloud — consent required)"
+            if value == "gemini"
+            else "Local Qwen2.5-VL (Ollama — 100% Offline)"
+        ),
+        key="qa_engine",
+    )
+    local_state = str(local_status.get("state", "ready"))
+    cloud_state = str(cloud_status.get("state", "blocked_asset"))
+    engine_state = local_state if engine == "local" else cloud_state
+    engine_ready = engine_state in {"ready", "configured_unverified"}
+    if engine_state in {"ready", "configured_unverified"}:
+        st.success(
+            "🟢 Engine: Gemini Flash"
+            if engine == "gemini"
+            else "🟢 Engine: Local Qwen2.5-VL (Offline)"
+        )
+    elif engine_state in {"warming", "idle", "evicted"}:
+        st.warning("🟡 Engine Visual Q&A đang khởi động; giao diện sẽ tự cập nhật.")
+    elif engine_state == "service_unavailable":
+        st.warning("🟡 Ollama chưa chạy hoặc chưa phản hồi trên loopback.")
+    else:
+        st.error("🔴 Bộ máy Visual Q&A đã chọn chưa sẵn sàng.")
+    cloud_requested = engine == "gemini"
+    consent = False
+    if cloud_requested:
+        consent = st.checkbox(
+            "Tôi đồng ý gửi đúng một frame đã chọn tới Gemini trong phiên này",
+            key="qa_external_transfer_consent",
+        )
+        st.warning("Chế độ này có thể truyền ảnh ra dịch vụ cloud bên ngoài.")
+    reasoning_policy = "gemini_then_local" if engine == "gemini" else "local_only"
     st.caption(
-        "Gemini chỉ được gọi sau khi truy xuất sự kiện đã chọn các cửa sổ khung hình chuẩn. "
-        "GEMINI_API_KEY mới phải được cấu hình cục bộ."
+        "Qwen2.5-VL chỉ nhận các cửa sổ frame canonical sau bước truy xuất; "
+        "câu trả lời được chuẩn hóa ngắn gọn và giữ provenance frame."
     )
-    event_description = st.text_area(
-        "Mô tả sự kiện dùng để truy xuất", key="qa_event_description"
-    )
-    question = st.text_input(
-        "Câu hỏi cần trả lời từ các khung hình đã chọn", key="qa_question"
-    )
+    event_description = st.text_area("Mô tả sự kiện dùng để truy xuất", key="qa_event_description")
+    question = st.text_input("Câu hỏi cần trả lời từ các khung hình đã chọn", key="qa_question")
+    with st.expander("Chẩn đoán nhanh bằng một ảnh (không dùng để export)"):
+        uploaded = st.file_uploader(
+            "Ảnh PNG, JPEG hoặc WebP",
+            type=("png", "jpg", "jpeg", "webp"),
+            key="qa_diagnostic_image",
+        )
+        diagnostic_question = st.text_input(
+            "Câu hỏi cho ảnh chẩn đoán",
+            value="Có bao nhiêu hình tròn màu đỏ?",
+            key="qa_diagnostic_question",
+        )
+        diagnostic_call = getattr(context, "diagnostic_image", None)
+        diagnostic_clicked = st.button(
+            "Phân tích ảnh chẩn đoán",
+            key="qa_diagnostic_submit",
+            disabled=(
+                uploaded is None
+                or not diagnostic_question.strip()
+                or not callable(diagnostic_call)
+                or not engine_ready
+                or (cloud_requested and not consent)
+            ),
+        )
+        if diagnostic_clicked and uploaded is not None and callable(diagnostic_call):
+            raw = uploaded.getvalue()
+            mime_type = uploaded.type
+            try:
+                st.session_state.qa_diagnostic_result = diagnostic_call(
+                    {
+                        "image_base64": base64.b64encode(raw).decode("ascii"),
+                        "mime_type": mime_type,
+                        "question": diagnostic_question,
+                        "reasoning_policy": reasoning_policy,
+                        "allow_external_frame_transfer": consent,
+                    }
+                )
+            except Exception as error:
+                st.session_state.qa_diagnostic_result = None
+                _report_ui_error(
+                    error,
+                    workflow="qa",
+                    stage="diagnostic_image",
+                    batch_id=_selected_batch_id(context),
+                )
+        diagnostic_result = st.session_state.get("qa_diagnostic_result")
+        if isinstance(diagnostic_result, dict):
+            st.success(f"Kết quả: {diagnostic_result.get('answer', '')}")
+            st.caption(
+                f"Provider: {diagnostic_result.get('actual_provider', 'unknown')} · "
+                f"Latency: {float(diagnostic_result.get('latency_ms', 0)):.0f} ms"
+            )
     if not st.session_state.qa_batch_filters_seeded:
         if not str(st.session_state.get("qa_batch_filters", "")).strip():
             selected_batch = _selected_batch_id(context)
@@ -1719,8 +2032,8 @@ def _render_qa(context: RuntimeContext) -> None:
         answer_spec_id = st.selectbox(
             "Đặc tả câu trả lời",
             (
-                QACompetitionSpec.historical_numeric().spec_id,
                 QACompetitionSpec.conservative_general_text().spec_id,
+                QACompetitionSpec.historical_numeric().spec_id,
             ),
             format_func=lambda value: (
                 "Khớp chính xác dạng số theo thể lệ cũ"
@@ -1730,17 +2043,33 @@ def _render_qa(context: RuntimeContext) -> None:
             key="qa_answer_spec",
         )
     with controls[2]:
-        batch_text = st.text_input(
-            "Bộ lọc batch (phân cách bằng dấu phẩy)", key="qa_batch_filters"
+        batch_text = st.text_input("Bộ lọc batch (phân cách bằng dấu phẩy)", key="qa_batch_filters")
+    if (
+        answer_spec_id == QACompetitionSpec.historical_numeric().spec_id
+        and question.strip()
+        and not any(
+            marker in question.casefold()
+            for marker in ("how many", "how much", "number", "bao nhiêu", "mấy", "số lượng")
+        )
+    ):
+        st.warning(
+            "Câu hỏi này không có dấu hiệu hỏi số lượng. Hãy dùng đặc tả văn bản tổng quát "
+            "cho câu trả lời có/không, màu sắc hoặc tên vật thể."
         )
 
     action_col, restore_col = st.columns((1, 2))
     with action_col:
+        policy_ready = engine_ready and (not cloud_requested or consent)
+        qa_retrieval_warmup = _warmup_workflow_snapshot(_warmup_snapshot(context), "kis")
+        qa_retrieval_state = str(qa_retrieval_warmup.get("state", "ready"))
+        retrieval_actionable = bool(qa_retrieval_warmup.get("usable", False)) or (
+            qa_retrieval_state in {"idle", "evicted"}
+        )
         search_clicked = st.button(
             "Truy xuất và trả lời",
             type="primary",
             key="qa_search",
-            disabled=not _warmup_workflow_usable(context, "qa"),
+            disabled=not (retrieval_actionable and policy_ready),
         )
     with restore_col:
         restore_id = st.text_input("Khôi phục theo mã tìm kiếm", key="qa_restore_id")
@@ -1763,6 +2092,8 @@ def _render_qa(context: RuntimeContext) -> None:
                     answer_spec_id=answer_spec_id,
                     batch_filters=batch_filters,
                     limit=100,
+                    reasoning_policy=reasoning_policy,
+                    allow_external_frame_transfer=consent,
                 )
             except (TypeError, ValueError):
                 st.error(
@@ -1770,52 +2101,60 @@ def _render_qa(context: RuntimeContext) -> None:
                     "chiếu đã cấu hình hoặc batch gốc đã đăng ký."
                 )
             else:
-                search_id = uuid4().hex
                 search_started = time.monotonic()
                 st.session_state.qa_edits = []
                 st.session_state.qa_pinned = []
                 st.session_state.qa_export_cache = None
-                st.session_state.qa_search_id = search_id
+                st.session_state.qa_search_id = None
                 st.session_state.qa_request = request
                 st.session_state.qa_snapshot = None
+                st.session_state.qa_candidate_windows = []
                 st.session_state.qa_predictions = []
+                st.session_state.qa_result = None
+                st.session_state.qa_last_failure = None
                 st.session_state.qa_selected_window_id = None
                 with st.spinner(
-                    "Đang truy xuất năm cửa sổ và chạy suy luận hình ảnh có giới hạn..."
+                    "Đang truy xuất cửa sổ tốt nhất và suy luận trên ba khung hình..."
                 ):
-                    execution_failed = False
                     try:
-                        try:
-                            context.qa_pipeline.search(request, session_id=search_id)
-                        except RuntimeError:
-                            execution_failed = True
-                        if mode == "automatic":
-                            for target in (10, 15, 20):
-                                try:
-                                    context.qa_pipeline.expand(search_id, target)
-                                except RuntimeError:
-                                    execution_failed = True
-                                    continue
-                        snapshot = _load_qa_snapshot(context, search_id)
+                        context.qa_pipeline.search(request)
+                        snapshot = getattr(context.qa_pipeline, "last_snapshot", None)
                         if snapshot is None:
-                            raise RuntimeError("search state was not persisted")
-                        if execution_failed and _qa_summary(snapshot)["status"] == "failed":
-                            st.error(
-                                "Nhà cung cấp hỏi đáp hình ảnh gặp lỗi, nhưng trạng thái tìm "
-                                "kiếm đã được làm sạch và lưu lại để khôi phục bằng mã này."
+                            snapshot = context.qa_pipeline.get_search(request.query_id)
+                        if snapshot is None:
+                            raise BackendError("backend_response_invalid")
+                        _apply_qa_snapshot(snapshot)
+                    except BackendError as error:
+                        snapshot = error.snapshot
+                        if snapshot is not None:
+                            _apply_qa_snapshot(snapshot)
+                            st.session_state.qa_last_failure = {
+                                "code": error.code,
+                                "search_id": st.session_state.qa_search_id,
+                                "recoverable": True,
+                            }
+                        elif error.code in {"runtime_warming", "runtime_not_ready"}:
+                            st.session_state.qa_last_failure = {
+                                "code": error.code,
+                                "search_id": None,
+                                "recoverable": True,
+                            }
+                        else:
+                            _report_ui_error(
+                                error,
+                                workflow="qa",
+                                stage="search",
+                                batch_id=batch_filters[0] if batch_filters else None,
+                                query_or_session_id=request.query_id,
+                                started_at=search_started,
                             )
                     except Exception as error:
-                        # Keep the preassigned ID visible even when persistence itself failed.
-                        try:
-                            _load_qa_snapshot(context, search_id)
-                        except Exception:
-                            pass
                         _report_ui_error(
                             error,
                             workflow="qa",
                             stage="search",
                             batch_id=batch_filters[0] if batch_filters else None,
-                            query_or_session_id=search_id,
+                            query_or_session_id=request.query_id,
                             started_at=search_started,
                         )
 
@@ -1829,6 +2168,7 @@ def _render_qa(context: RuntimeContext) -> None:
             st.session_state.qa_pinned = []
             st.session_state.qa_export_cache = None
             st.session_state.qa_selected_window_id = None
+            st.session_state.qa_last_failure = None
             _apply_qa_snapshot(snapshot)
         except Exception as error:
             _report_ui_error(
@@ -1839,11 +2179,28 @@ def _render_qa(context: RuntimeContext) -> None:
                 query_or_session_id=restore_id,
             )
 
+    failure = st.session_state.get("qa_last_failure")
+    if isinstance(failure, dict):
+        if failure.get("search_id"):
+            st.warning(
+                "Ollama chưa tạo được câu trả lời hợp lệ, nhưng phiên đã được lưu an toàn. "
+                f"Mã lỗi `{failure.get('code', 'qa_reasoning_unavailable')}` · "
+                f"mã tìm kiếm `{failure['search_id']}`."
+            )
+        elif failure.get("code") == "runtime_warming":
+            st.info(
+                "Bộ truy xuất đang được làm nóng lại sau khi nhường GPU cho Qwen. "
+                "Nút truy xuất sẽ tự mở khóa khi sẵn sàng."
+            )
+        else:
+            st.warning(
+                "Visual Q&A tạm thời chưa sẵn sàng. "
+                f"Mã lỗi `{failure.get('code', 'runtime_not_ready')}`."
+            )
+
     snapshot = st.session_state.qa_snapshot
     if snapshot is None and st.session_state.qa_search_id:
-        st.info(
-            f"Mã tìm kiếm: {st.session_state.qa_search_id} · trạng thái đã lưu không khả dụng."
-        )
+        st.info(f"Mã tìm kiếm: {st.session_state.qa_search_id} · trạng thái đã lưu không khả dụng.")
     if snapshot is not None:
         requested_target = int(
             snapshot.get("requested_target_clusters", snapshot.get("target_count", 0))
@@ -1864,20 +2221,46 @@ def _render_qa(context: RuntimeContext) -> None:
             and not bool(snapshot.get("retrieval_exhausted", False))
         )
         if can_expand:
-            target = min(20, requested_target + 5)
-            if st.button(f"Mở rộng lên {target} cụm", key=f"qa_expand_{target}"):
-                with st.spinner("Đang suy luận trên năm cửa sổ ứng viên bổ sung..."):
+            target = min(20, requested_target + 1)
+            if st.button(
+                "Thử nhanh cửa sổ kế tiếp",
+                key=f"qa_fast_retry_{target}",
+            ):
+                with st.spinner("Đang suy luận trên cửa sổ thay thế tiếp theo..."):
                     try:
                         context.qa_pipeline.expand(snapshot["session_id"], target)
-                        refreshed = _load_qa_snapshot(context, snapshot["session_id"])
+                        refreshed = getattr(context.qa_pipeline, "last_snapshot", None)
+                        if refreshed is None:
+                            refreshed = _load_qa_snapshot(context, snapshot["session_id"])
                         if refreshed is None:
                             raise RuntimeError("expanded search state is unavailable")
+                        _apply_qa_snapshot(refreshed)
+                        st.session_state.qa_last_failure = None
                         st.rerun()
-                    except Exception as error:
+                    except BackendError as error:
                         try:
-                            _load_qa_snapshot(context, snapshot["session_id"])
-                        except Exception:
-                            pass
+                            recovered = _load_qa_snapshot(context, snapshot["session_id"])
+                        except BackendError:
+                            recovered = None
+                        if recovered is not None:
+                            st.session_state.qa_last_failure = {
+                                "code": error.code,
+                                "search_id": snapshot["session_id"],
+                                "recoverable": True,
+                            }
+                        else:
+                            _report_ui_error(
+                                error,
+                                workflow="qa",
+                                stage="expand",
+                                batch_id=(
+                                    request.batch_filters[0]
+                                    if request is not None and request.batch_filters
+                                    else None
+                                ),
+                                query_or_session_id=snapshot["session_id"],
+                            )
+                    except Exception as error:
                         _report_ui_error(
                             error,
                             workflow="qa",
@@ -1895,9 +2278,7 @@ def _render_qa(context: RuntimeContext) -> None:
         if isinstance(retrieval_errors, dict) and retrieval_errors:
             st.caption(
                 "Các kênh truy xuất không khả dụng: "
-                + ", ".join(
-                    f"{name} ({code})" for name, code in sorted(retrieval_errors.items())
-                )
+                + ", ".join(f"{name} ({code})" for name, code in sorted(retrieval_errors.items()))
             )
         elif isinstance(retrieval_errors, (list, tuple)) and retrieval_errors:
             st.caption(
@@ -1916,6 +2297,7 @@ def _render_qa(context: RuntimeContext) -> None:
     predictions = st.session_state.qa_predictions
     outcomes = _qa_outcomes(snapshot)
     if outcomes:
+        _render_qa_evidence_summary(context, outcomes, predictions)
         _render_qa_window(context, outcomes, predictions)
         with st.expander("Nhật ký chạy VLM (chỉ siêu dữ liệu an toàn)"):
             st.caption(
@@ -1925,9 +2307,7 @@ def _render_qa(context: RuntimeContext) -> None:
             st.dataframe(_qa_trace_rows(outcomes), width="stretch", hide_index=True)
             if predictions:
                 st.caption("Dự đoán xếp hạng có bằng chứng")
-                st.dataframe(
-                    _qa_prediction_rows(predictions), width="stretch", hide_index=True
-                )
+                st.dataframe(_qa_prediction_rows(predictions), width="stretch", hide_index=True)
     if st.session_state.qa_edits:
         with st.expander("Nhật ký chỉnh sửa câu trả lời của người vận hành"):
             st.dataframe(
@@ -1944,6 +2324,383 @@ def _render_qa(context: RuntimeContext) -> None:
     _render_qa_export(context, answered_window_ids=answered_window_ids)
 
 
+def _render_qa(context: RuntimeContext) -> None:
+    """Render the decoupled retrieval then single-frame reasoning workflow."""
+
+    st.subheader("Hỏi đáp hình ảnh · Hai bước độc lập")
+    if context.qa_pipeline is None:
+        st.error("Visual Q&A chưa khả dụng trong runtime hiện tại.")
+        return
+
+    event_description = st.text_area(
+        "Mô tả sự kiện dùng cho KIS Retrieval",
+        key="qa_event_description",
+        placeholder="Ví dụ: A man is broadcasting TV news.",
+    )
+    qa_language_col, qa_override_col = st.columns((1, 2))
+    with qa_language_col:
+        qa_query_language = st.selectbox(
+            "Ngôn ngữ mô tả sự kiện",
+            ("auto", "vi", "en"),
+            format_func=lambda value: {
+                "auto": "Tự động",
+                "vi": "Tiếng Việt",
+                "en": "English",
+            }[value],
+            key="qa_query_language",
+        )
+    with qa_override_col:
+        qa_edit_translation = st.checkbox(
+            "Chỉnh bản dịch sự kiện",
+            key="qa_translation_edit",
+        )
+        qa_event_description_en = (
+            st.text_input(
+                "Mô tả sự kiện bằng tiếng Anh",
+                key="qa_event_description_en",
+                placeholder="Để trống để dùng bộ dịch offline",
+            )
+            if qa_edit_translation
+            else ""
+        )
+    question = st.text_input(
+        "Câu hỏi cho khung hình đã chọn",
+        key="qa_question",
+        placeholder="Ví dụ: Does the man wear glasses?",
+    )
+    batch_id = _selected_batch_id(context)
+    st.caption(f"Batch hiện hành: `{batch_id or 'chưa chọn'}`")
+
+    retrieve_clicked = st.button(
+        "1. Truy xuất khung hình – KIS Search",
+        type="primary",
+        key="qa_retrieve_candidates",
+        disabled=not bool(event_description.strip() and batch_id),
+    )
+    if retrieve_clicked:
+        request = QACandidateRequest(
+            query_id=str(uuid4()),
+            event_description=event_description,
+            batch_filters=(batch_id,),
+            top_k=5,
+            query_language=qa_query_language,
+            event_description_en=qa_event_description_en or None,
+        )
+        st.session_state.qa_search_id = None
+        st.session_state.qa_request = request
+        st.session_state.qa_candidates = []
+        st.session_state.qa_answers = []
+        st.session_state.qa_predictions = []
+        st.session_state.qa_result = None
+        st.session_state.qa_selected_candidate_id = None
+        st.session_state.qa_pinned = []
+        st.session_state.qa_export_cache = None
+        with st.spinner("Đang truy xuất Top-5 khung hình bằng KIS..."):
+            try:
+                context.qa_pipeline.retrieve(request)
+                snapshot = getattr(context.qa_pipeline, "last_snapshot", None)
+                if snapshot is None:
+                    raise BackendError("backend_response_invalid")
+                _apply_qa_snapshot(snapshot)
+            except BackendError as error:
+                _report_ui_error(
+                    error,
+                    workflow="qa",
+                    stage="retrieve",
+                    batch_id=batch_id,
+                    query_or_session_id=request.query_id,
+                )
+            except Exception as error:
+                _report_ui_error(
+                    error,
+                    workflow="qa",
+                    stage="retrieve",
+                    batch_id=batch_id,
+                    query_or_session_id=request.query_id,
+                )
+
+    candidates = [
+        dict(value)
+        for value in st.session_state.get("qa_candidates", ())
+        if isinstance(value, dict)
+    ]
+    _render_query_processing(
+        dict(st.session_state.get("qa_snapshot") or {}).get("query_processing", {})
+    )
+    if candidates:
+        candidate_ids = tuple(str(value["candidate_id"]) for value in candidates)
+        selected = st.session_state.get("qa_selected_candidate_id")
+        if selected not in candidate_ids:
+            selected = candidate_ids[0]
+            st.session_state.qa_selected_candidate_id = selected
+        retrieval_ms = float(
+            dict(st.session_state.qa_snapshot or {})
+            .get("stage_timings", {})
+            .get("candidate_retrieval_ms", 0.0)
+        )
+        st.success(
+            f"Đã truy xuất {len(candidates)} candidate trong {retrieval_ms:.0f} ms; chưa gọi VLM."
+        )
+        for offset in range(0, len(candidates), 3):
+            columns = st.columns(min(3, len(candidates) - offset))
+            for column, candidate in zip(columns, candidates[offset : offset + 3], strict=True):
+                with column:
+                    with st.container(
+                        key=hud_container_key("qa-card", candidate["candidate_id"]),
+                        border=True,
+                    ):
+                        image = _source_frame_image(
+                            context,
+                            str(candidate["batch_id"]),
+                            str(candidate["video_id"]),
+                            int(candidate["source_frame_idx"]),
+                        )
+                        if image is not None:
+                            st.image(image, width="stretch")
+                        is_selected = str(candidate["candidate_id"]) == str(selected)
+                        st.markdown(
+                            render_hud_readout(
+                                (
+                                    "SELECTED TARGET"
+                                    if is_selected
+                                    else f"CANDIDATE {int(candidate['retrieval_rank']):02d}"
+                                ),
+                                candidate["video_id"],
+                                tone="green" if is_selected else "cyan",
+                            ),
+                            unsafe_allow_html=True,
+                        )
+                        st.caption(
+                            f"Frame {candidate['source_frame_idx']} · "
+                            f"{int(candidate['timestamp_ms']) / 1000:.2f}s"
+                        )
+                        if st.button(
+                            "Chọn frame này" if not is_selected else "✓ Frame đang chọn",
+                            key=hud_container_key("qa-select", candidate["candidate_id"]),
+                            disabled=is_selected,
+                            width="stretch",
+                        ):
+                            st.session_state.qa_selected_candidate_id = str(
+                                candidate["candidate_id"]
+                            )
+                            st.rerun()
+        selected = st.radio(
+            "Chọn đúng một candidate để suy luận",
+            candidate_ids,
+            index=candidate_ids.index(selected),
+            format_func=lambda candidate_id: next(
+                (
+                    f"#{value['retrieval_rank']} · {value['video_id']} · "
+                    f"frame {value['source_frame_idx']} · {int(value['timestamp_ms']) / 1000:.2f}s"
+                    for value in candidates
+                    if value["candidate_id"] == candidate_id
+                ),
+                candidate_id,
+            ),
+            key="qa_selected_candidate_id",
+        )
+
+        primary_engine = st.selectbox(
+            "Bộ máy trả lời single-frame",
+            ("gemini", "local"),
+            format_func=lambda value: (
+                "⚡ Gemini Flash API — Cloud, nhanh"
+                if value == "gemini"
+                else "🛡️ Qwen2.5-VL — Ollama, 100% offline"
+            ),
+            key="qa_engine",
+        )
+        answer_spec_id = st.selectbox(
+            "Chuẩn hóa câu trả lời",
+            (
+                QACompetitionSpec.conservative_general_text().spec_id,
+                QACompetitionSpec.historical_numeric().spec_id,
+            ),
+            format_func=lambda value: (
+                "Số nguyên" if value == QACompetitionSpec.historical_numeric().spec_id else "Văn bản"
+            ),
+            key="qa_answer_spec",
+        )
+        reasoning_policy = (
+            "gemini_then_local" if primary_engine == "gemini" else "local_only"
+        )
+        consent = False
+        answer_engine = "vlm"
+        florence_task = target_label = None
+        if primary_engine == "gemini":
+            consent = st.checkbox(
+                "Tôi đồng ý truyền đúng một frame đã chọn tới Gemini trong phiên này",
+                key="qa_external_transfer_consent",
+            )
+            st.caption("⚡ Gemini primary · Qwen local chỉ fallback khi lỗi tạm thời")
+        else:
+            st.caption("🛡️ Offline mode · không thực hiện request VLM ra Internet")
+
+        with st.expander("Florence-2 thử nghiệm · OCR / đếm object"):
+            use_florence = st.checkbox(
+                "Dùng Florence-2 CPU thay cho VLM chính",
+                key="qa_use_florence",
+            )
+            if use_florence:
+                answer_engine = "florence2"
+                reasoning_policy = "local_only"
+                consent = False
+                st.warning(
+                    "Florence-2 chỉ hỗ trợ OCR hoặc đếm nhãn object do operator chỉ định."
+                )
+                florence_task = st.selectbox(
+                    "Tác vụ Florence-2",
+                    ("ocr", "object_count"),
+                    format_func=lambda value: "OCR" if value == "ocr" else "Đếm object",
+                    key="qa_florence_task",
+                )
+                if florence_task == "object_count":
+                    target_label = st.text_input(
+                        "Nhãn object chính xác cần đếm",
+                        key="qa_florence_target_label",
+                    )
+
+        answer_disabled = (
+            not question.strip()
+            or (reasoning_policy == "gemini_then_local" and not consent)
+            or (answer_engine == "florence2" and florence_task == "object_count" and not str(target_label or "").strip())
+        )
+        answer_label = (
+            "⚡ Trả lời câu hỏi bằng Gemini Flash"
+            if reasoning_policy == "gemini_then_local"
+            else "🛡️ Trả lời offline bằng Qwen"
+            if answer_engine == "vlm"
+            else "🧪 Trả lời bằng Florence-2"
+        )
+        answer_clicked = st.button(
+            f"2. {answer_label}",
+            type="primary",
+            key="qa_answer_selected_candidate",
+            disabled=answer_disabled,
+        )
+        if answer_clicked:
+            answer_request = QASingleFrameAnswerRequest(
+                candidate_id=selected,
+                question=question,
+                answer_spec_id=answer_spec_id,
+                reasoning_policy=reasoning_policy,
+                allow_external_frame_transfer=consent,
+                answer_engine=answer_engine,
+                florence_task=florence_task,
+                florence_target_label=target_label,
+            )
+            selected_candidate = next(
+                value for value in candidates if value["candidate_id"] == selected
+            )
+            st.session_state.qa_request = QAQueryRequest(
+                query_id=str(st.session_state.qa_search_id),
+                event_description=event_description,
+                question=question,
+                mode="interactive",
+                answer_spec_id=answer_spec_id,
+                batch_filters=(str(selected_candidate["batch_id"]),),
+                limit=100,
+                reasoning_policy=reasoning_policy,
+                allow_external_frame_transfer=consent,
+            )
+            with st.spinner("Đang suy luận trên đúng một khung hình..."):
+                try:
+                    context.qa_pipeline.answer_candidate(
+                        str(st.session_state.qa_search_id), answer_request
+                    )
+                    snapshot = getattr(context.qa_pipeline, "last_snapshot", None)
+                    if snapshot is None:
+                        raise BackendError("backend_response_invalid")
+                    _apply_qa_snapshot(snapshot)
+                except BackendError as error:
+                    code = error.code
+                    if code == "florence_not_provisioned":
+                        st.warning("Florence-2 chưa được provision offline trên máy này.")
+                    else:
+                        _report_ui_error(
+                            error,
+                            workflow="qa",
+                            stage="single_frame_answer",
+                            batch_id=batch_id,
+                            query_or_session_id=st.session_state.qa_search_id,
+                        )
+                except Exception as error:
+                    _report_ui_error(
+                        error,
+                        workflow="qa",
+                        stage="single_frame_answer",
+                        batch_id=batch_id,
+                        query_or_session_id=st.session_state.qa_search_id,
+                    )
+
+    result = st.session_state.get("qa_result")
+    if isinstance(result, dict):
+        st.subheader("Kết quả single-frame")
+        with st.container(key="hud-qa-evidence", border=True):
+            st.markdown(
+                render_hud_readout("VLM ANSWER", result["answer"], tone="green"),
+                unsafe_allow_html=True,
+            )
+            st.code(
+                f"{result['video_id']}, {result['source_frame_idx']}, {result['answer']}",
+                language=None,
+            )
+            evidence = dict(result.get("evidence", {}))
+            provider = evidence.get("provider", result.get("answer_source", "unknown"))
+            response_ms = float(
+                evidence.get("answer_call_ms") or evidence.get("latency_ms") or 0
+            )
+            st.caption(
+                f"Response Time: {response_ms / 1000:.2f}s via {provider}"
+            )
+            if bool(evidence.get("fallback_used", False)):
+                st.warning(
+                    "Gemini tạm thời không khả dụng; kết quả này được trả bởi Qwen local "
+                    f"({evidence.get('fallback_reason_code') or 'provider_unavailable'})."
+                )
+            image = _source_frame_image(
+                context,
+                str(result["batch_id"]),
+                str(result["video_id"]),
+                int(result["source_frame_idx"]),
+            )
+            if image is not None:
+                st.image(image, caption="Frame bằng chứng duy nhất", width=640)
+            if st.button("Ghim kết quả này", key="qa_pin_single_frame"):
+                _pin_qa_prediction(result)
+                st.rerun()
+    elif candidates:
+        selected_id = str(st.session_state.get("qa_selected_candidate_id") or "")
+        selected_answer = next(
+            (
+                dict(value)
+                for value in reversed(st.session_state.get("qa_answers", ()))
+                if isinstance(value, dict) and value.get("candidate_id") == selected_id
+            ),
+            None,
+        )
+        if selected_answer is not None:
+            status = str(selected_answer.get("status", "unanswerable"))
+            if status == "unanswerable":
+                st.warning(
+                    "Frame đã chọn không cung cấp đủ bằng chứng để trả lời. "
+                    "Hãy chọn candidate khác và bấm lại bước 2; không cần chạy lại KIS."
+                )
+            elif status == "provider_failed":
+                st.error("Bộ máy VLM chưa trả lời được frame đã chọn; bạn có thể thử lại.")
+            st.caption(
+                f"Provider: {selected_answer.get('provider', 'unknown')} · "
+                f"latency {float(selected_answer.get('latency_ms') or 0):.0f} ms"
+            )
+
+    answered_ids = {
+        str(value.get("window_id"))
+        for value in st.session_state.get("qa_predictions", ())
+        if isinstance(value, dict) and value.get("window_id")
+    }
+    _render_qa_export(context, answered_window_ids=answered_ids)
+
+
 def _trake_readiness(
     context: RuntimeContext,
     batch_id: str | None,
@@ -1956,9 +2713,7 @@ def _trake_readiness(
         return False, {
             "runtime": {
                 "state": str(trake_warmup.get("state", "warming")),
-                "reason_code": str(
-                    trake_warmup.get("reason_code", "runtime_warming")
-                ),
+                "reason_code": str(trake_warmup.get("reason_code", "runtime_warming")),
             }
         }
 
@@ -2112,6 +2867,32 @@ def _render_trake(context: RuntimeContext) -> None:
         on_change=_invalidate_trake_results,
         placeholder="Ví dụ: Một người bước vào cửa hàng, chọn sản phẩm rồi thanh toán và rời đi.",
     )
+    trake_language_col, trake_override_col = st.columns((1, 2))
+    with trake_language_col:
+        trake_query_language = st.selectbox(
+            "Ngôn ngữ mô tả TRAKE",
+            ("auto", "vi", "en"),
+            format_func=lambda value: {
+                "auto": "Tự động",
+                "vi": "Tiếng Việt",
+                "en": "English",
+            }[value],
+            key="trake_query_language",
+            on_change=_invalidate_trake_results,
+        )
+    with trake_override_col:
+        trake_edit_translation = st.checkbox(
+            "Chỉnh từng bản dịch tiếng Anh",
+            key="trake_translation_edit",
+            on_change=_invalidate_trake_results,
+        )
+    if trake_edit_translation:
+        st.text_input(
+            "Mô tả toàn cảnh bằng tiếng Anh",
+            key="trake_global_description_en",
+            on_change=_invalidate_trake_results,
+            placeholder="Để trống để dùng bộ dịch offline",
+        )
 
     stage_count = max(2, min(20, int(st.session_state.trake_stage_count)))
     st.session_state.trake_stage_count = stage_count
@@ -2125,6 +2906,15 @@ def _render_trake(context: RuntimeContext) -> None:
             on_change=_invalidate_trake_results,
             placeholder=f"Mô tả hành động ở giai đoạn {stage_index}",
         )
+        if trake_edit_translation:
+            english_key = f"trake_stage_en_{stage_index}"
+            st.session_state.setdefault(english_key, "")
+            st.text_input(
+                f"Stage {stage_index} · English",
+                key=english_key,
+                on_change=_invalidate_trake_results,
+                placeholder="Để trống để dùng bộ dịch offline",
+            )
     add_col, remove_col, top_k_col = st.columns((1, 1, 2))
     with add_col:
         if st.button(
@@ -2135,6 +2925,7 @@ def _render_trake(context: RuntimeContext) -> None:
             _invalidate_trake_results()
             st.session_state.trake_stage_count = stage_count + 1
             st.session_state.setdefault(f"trake_stage_{stage_count + 1}", "")
+            st.session_state.setdefault(f"trake_stage_en_{stage_count + 1}", "")
             st.rerun()
     with remove_col:
         if st.button(
@@ -2144,6 +2935,7 @@ def _render_trake(context: RuntimeContext) -> None:
         ):
             _invalidate_trake_results()
             st.session_state.pop(f"trake_stage_{stage_count}", None)
+            st.session_state.pop(f"trake_stage_en_{stage_count}", None)
             st.session_state.trake_stage_count = stage_count - 1
             st.rerun()
     with top_k_col:
@@ -2166,10 +2958,7 @@ def _render_trake(context: RuntimeContext) -> None:
             _vi_status(status.get("reason_code") or status.get("state"))
             for status in channel_statuses.values()
         ]
-        st.warning(
-            "TRAKE chưa sẵn sàng"
-            + (f": {', '.join(reasons)}" if reasons else ".")
-        )
+        st.warning("TRAKE chưa sẵn sàng" + (f": {', '.join(reasons)}" if reasons else "."))
 
     if st.button(
         "Tìm chuỗi TRAKE",
@@ -2197,11 +2986,27 @@ def _render_trake(context: RuntimeContext) -> None:
                     query_id=str(uuid4()),
                     global_description=global_description,
                     stages=tuple(
-                        TRAKEStage(stage_index=index, description=description)
+                        TRAKEStage(
+                            stage_index=index,
+                            description=description,
+                            description_en=(
+                                str(
+                                    st.session_state.get(
+                                        f"trake_stage_en_{index}", ""
+                                    )
+                                ).strip()
+                                or None
+                            ),
+                        )
                         for index, description in enumerate(descriptions, start=1)
                     ),
                     batch_filters=batches,
                     top_k=top_k,
+                    query_language=trake_query_language,
+                    global_description_en=(
+                        str(st.session_state.get("trake_global_description_en", "")).strip()
+                        or None
+                    ),
                 )
                 with st.spinner("Đang truy xuất video và căn chỉnh chuỗi giai đoạn..."):
                     response = context.trake_pipeline.search(
@@ -2222,6 +3027,10 @@ def _render_trake(context: RuntimeContext) -> None:
                     query_or_session_id=(request.query_id if request is not None else None),
                     started_at=search_started,
                 )
+
+    _render_query_processing(
+        getattr(context.trake_pipeline, "last_query_processing", {})
+    )
 
     results = list(st.session_state.trake_results or [])
     if not results:
@@ -2256,6 +3065,15 @@ def _render_trake(context: RuntimeContext) -> None:
     if isinstance(matches, (list, tuple)) and matches:
         st.markdown("**Dòng thời gian ngang**")
         valid_matches = [match for match in matches if isinstance(match, dict)]
+        st.markdown(
+            render_hud_timeline_strip(
+                [
+                    int(match.get("stage_index", index + 1))
+                    for index, match in enumerate(valid_matches)
+                ]
+            ),
+            unsafe_allow_html=True,
+        )
         for row_start in range(0, len(valid_matches), 3):
             row_matches = valid_matches[row_start : row_start + 3]
             columns = st.columns(len(row_matches))
@@ -2267,20 +3085,35 @@ def _render_trake(context: RuntimeContext) -> None:
                 timestamp_ms = int(match.get("timestamp_ms", 0))
                 arrow = " →" if absolute_index < len(valid_matches) - 1 else ""
                 with column:
-                    st.markdown(f"**E{stage_index} · Giai đoạn {stage_index}{arrow}**")
-                    image = _trake_frame_image(
-                        context,
-                        str(selected.get("batch_id", batch_id)),
-                        str(selected.get("video_id", "")),
-                        source_frame_idx,
-                    )
-                    if image is not None:
-                        st.image(image, width="stretch")
-                    else:
-                        st.caption("Không có thumbnail")
-                    st.caption(
-                        f"{timestamp_ms / 1000:.2f} giây · khung nguồn {source_frame_idx}"
-                    )
+                    with st.container(
+                        key=hud_container_key(
+                            "trake-stage",
+                            selected.get("batch_id", batch_id),
+                            selected.get("video_id", ""),
+                            stage_index,
+                        ),
+                        border=True,
+                    ):
+                        st.markdown(f"**E{stage_index} · Giai đoạn {stage_index}{arrow}**")
+                        image = _trake_frame_image(
+                            context,
+                            str(selected.get("batch_id", batch_id)),
+                            str(selected.get("video_id", "")),
+                            source_frame_idx,
+                        )
+                        if image is not None:
+                            st.image(image, width="stretch")
+                        else:
+                            st.caption("Không có thumbnail")
+                        st.markdown(
+                            render_hud_readout(
+                                "SOURCE FRAME",
+                                source_frame_idx,
+                                tone="amber",
+                            ),
+                            unsafe_allow_html=True,
+                        )
+                        st.caption(f"{timestamp_ms / 1000:.2f} giây")
 
     query_id = str(st.session_state.trake_query_id or "trake")
     export_fingerprint = _result_fingerprint(
@@ -2352,11 +3185,19 @@ def render_app(context: RuntimeContext) -> None:
         page_title="AIC 2026 - Truy xuất video đa phương thức",
         page_icon="🔎",
         layout="wide",
-        initial_sidebar_state="collapsed",
+        initial_sidebar_state="auto",
     )
+    inject_cyberpunk_theme()
     try:
         _initialize_state()
-        st.title("AIC 2026 · Truy xuất video đa phương thức")
+        st.markdown(
+            render_hud_header(
+                "SYSTEM ONLINE // AIC 2026",
+                "Truy xuất video đa phương thức",
+                "Textual KIS · Visual Q&A · TRAKE temporal alignment",
+            ),
+            unsafe_allow_html=True,
+        )
         _render_warmup_sidebar(context)
         _render_launch_identity(context)
         _render_readiness(context)
@@ -2368,9 +3209,9 @@ def render_app(context: RuntimeContext) -> None:
             workflows,
             key="active_workflow",
             format_func=lambda value: {
-                "kis": "KIS văn bản",
-                "qa": "Hỏi đáp hình ảnh",
-                "trake": "TRAKE",
+                "kis": "[ KIS ENGINE ]",
+                "qa": "[ VISUAL QA ]",
+                "trake": "[ TRAKE TIMELINE ]",
             }[value],
             selection_mode="single",
         )

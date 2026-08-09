@@ -17,6 +17,7 @@ from src.contracts import (
     TRAKEStage,
     TRAKEStageMatch,
 )
+from src.query.translator import QueryProcessing, QueryTextAdapter, QueryVariant
 from src.retrieval.trake_trajectory_cache import TRAKETrajectoryCache
 
 TRAKE_ALIGNMENT_VERSION = "trake-exact-alignment-v3"
@@ -205,6 +206,8 @@ class TRAKEPipeline:
         grouped_search_workers: int = 4,
         vector_scroll_batch_size: int = 4_096,
         trajectory_cache: TRAKETrajectoryCache | None = None,
+        query_adapter: QueryTextAdapter | None = None,
+        lexical_channels: Sequence[Any] = (),
     ) -> None:
         selected_encoder = encoder or clip_encoder
         if encoder is not None and clip_encoder is not None and encoder is not clip_encoder:
@@ -231,6 +234,10 @@ class TRAKEPipeline:
         self.grouped_search_workers = grouped_search_workers
         self.vector_scroll_batch_size = vector_scroll_batch_size
         self.trajectory_cache = trajectory_cache
+        self.query_adapter = query_adapter
+        self.lexical_channels = tuple(lexical_channels)
+        self.last_query_processing: dict[str, Any] = {}
+        self.last_channel_statuses: dict[str, dict[str, Any]] = {}
 
     def _dependencies(self) -> tuple[TextEncoder, TRAKEVectorStore]:
         if self.encoder is None or self.vector_store is None:
@@ -261,11 +268,16 @@ class TRAKEPipeline:
 
     def _candidate_scores(
         self,
-        query_vectors: np.ndarray,
+        query_vectors: Sequence[np.ndarray],
         batch_id: str,
+        lexical_video_order: Sequence[str] = (),
     ) -> tuple[dict[str, float], tuple[dict[str, Any], ...]]:
+        if isinstance(query_vectors, np.ndarray):
+            if query_vectors.ndim != 2:
+                raise ValueError("query vectors must be a two-dimensional matrix")
+            query_vectors = tuple(row[None, :] for row in query_vectors)
         _, store = self._dependencies()
-        per_prompt: list[dict[str, float]] = []
+        per_prompt: list[dict[str, float]] = [dict() for _ in query_vectors]
         seed_points: list[dict[str, Any]] = []
         point_refs: list[tuple[str, Any]] = []
         grouped_search = store.search_grouped
@@ -307,12 +319,24 @@ class TRAKEPipeline:
                 kwargs["with_payload"] = not use_exact_cache
             return grouped_search(vector, **kwargs)
 
-        worker_count = min(self.grouped_search_workers, len(query_vectors))
+        flattened: list[np.ndarray] = []
+        prompt_indices: list[int] = []
+        for prompt_index, variants in enumerate(query_vectors):
+            if variants.ndim != 2 or not variants.shape[0]:
+                raise ValueError("each TRAKE prompt requires at least one query variant")
+            for vector in variants:
+                flattened.append(vector)
+                prompt_indices.append(prompt_index)
+        worker_count = min(self.grouped_search_workers, len(flattened))
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             # executor.map preserves prompt order even when requests complete out of order.
-            grouped_results = tuple(executor.map(retrieve, query_vectors))
-        for groups in grouped_results:
-            per_prompt.append(self._group_scores(groups))
+            grouped_results = tuple(executor.map(retrieve, flattened))
+        for prompt_index, groups in zip(prompt_indices, grouped_results, strict=True):
+            for video_id, score in self._group_scores(groups).items():
+                per_prompt[prompt_index][video_id] = max(
+                    score,
+                    per_prompt[prompt_index].get(video_id, -float("inf")),
+                )
             for group in groups:
                 hits = group.get("hits", ())
                 if not isinstance(hits, Sequence) or isinstance(hits, (str, bytes)):
@@ -341,7 +365,31 @@ class TRAKEPipeline:
             global_score = per_prompt[0].get(video_id, -1.0)
             stage_scores = [scores.get(video_id, -1.0) for scores in per_prompt[1:]]
             stage_a[video_id] = 0.25 * global_score + 0.75 * (sum(stage_scores) / stage_count)
-        ordered = sorted(stage_a, key=lambda video: (-stage_a[video], video))
+        dense_order = sorted(stage_a, key=lambda video: (-stage_a[video], video))
+        if lexical_video_order:
+            dense_ranks = {video_id: rank for rank, video_id in enumerate(dense_order, 1)}
+            lexical_ranks = {
+                video_id: rank for rank, video_id in enumerate(lexical_video_order, 1)
+            }
+            fused_videos = set(dense_ranks) | set(lexical_ranks)
+            ordered = sorted(
+                fused_videos,
+                key=lambda video_id: (
+                    -(
+                        (1.0 / (60 + dense_ranks[video_id]) if video_id in dense_ranks else 0.0)
+                        + (
+                            1.0 / (60 + lexical_ranks[video_id])
+                            if video_id in lexical_ranks
+                            else 0.0
+                        )
+                    ),
+                    video_id,
+                ),
+            )
+            for video_id in lexical_ranks:
+                stage_a.setdefault(video_id, -1.0)
+        else:
+            ordered = dense_order
         selected = {video: stage_a[video] for video in ordered[: self.top_k_videos]}
         selected_ids = set(selected)
         if supports_point_retrieval and point_refs:
@@ -390,6 +438,139 @@ class TRAKEPipeline:
             and point["payload"].get("video_id") in selected_ids
         )
         return selected, selected_seed_points
+
+    @staticmethod
+    def _video_ids_from_results(results: Sequence[Mapping[str, Any]]) -> tuple[str, ...]:
+        values: list[str] = []
+        seen: set[str] = set()
+        for item in results:
+            payload = item.get("payload", item)
+            video_id = payload.get("video_id") if isinstance(payload, Mapping) else None
+            if isinstance(video_id, str) and video_id and video_id not in seen:
+                seen.add(video_id)
+                values.append(video_id)
+        return tuple(values)
+
+    def _lexical_candidate_order(
+        self,
+        processings: Sequence[QueryProcessing],
+        batch_id: str,
+    ) -> tuple[str, ...]:
+        """Return bounded lexical video candidates without touching trajectories."""
+
+        if not self.lexical_channels:
+            return ()
+        escaped_batch = batch_id.replace('"', '\\"')
+        batch_filter = f'batch_id = "{escaped_batch}"'
+        per_prompt_scores: list[dict[str, float]] = [defaultdict(float) for _ in processings]
+        for channel in self.lexical_channels:
+            channel_name = str(getattr(channel, "name", "metadata"))
+            store = getattr(channel, "store", None)
+            if store is None:
+                continue
+            try:
+                available = getattr(store, "is_available", None)
+                if callable(available) and not available(batch_filter):
+                    self.last_channel_statuses[channel_name] = {
+                        "state": "not_provisioned",
+                        "reason_code": "no_compatible_documents",
+                    }
+                    continue
+                depth = min(300, int(getattr(channel, "depth", 100)))
+                for prompt_index, processing in enumerate(processings):
+                    variants = (
+                        self.query_adapter.lexical_variants(channel_name, processing)
+                        if self.query_adapter is not None
+                        else QueryTextAdapter().lexical_variants(channel_name, processing)
+                    )
+                    variant_orders: list[tuple[str, ...]] = []
+                    for variant in variants:
+                        kwargs: dict[str, Any] = {
+                            "top_k": depth,
+                            "filters": batch_filter,
+                        }
+                        try:
+                            parameters = tuple(signature(store.search).parameters.values())
+                            if variant.locale and any(
+                                value.name == "locales" or value.kind is Parameter.VAR_KEYWORD
+                                for value in parameters
+                            ):
+                                kwargs["locales"] = (variant.locale,)
+                        except (TypeError, ValueError):
+                            pass
+                        results = store.search(variant.text, **kwargs)
+                        variant_orders.append(self._video_ids_from_results(results))
+                    for order in variant_orders:
+                        for rank, video_id in enumerate(order, 1):
+                            per_prompt_scores[prompt_index][video_id] += 1.0 / (60 + rank)
+                self.last_channel_statuses[channel_name] = {
+                    "state": "ready",
+                    "reason_code": "query_completed",
+                }
+            except Exception:
+                self.last_channel_statuses[channel_name] = {
+                    "state": "service_unavailable",
+                    "reason_code": "channel_query_failed",
+                }
+        combined: dict[str, float] = defaultdict(float)
+        for scores in per_prompt_scores:
+            ordered = sorted(scores, key=lambda video_id: (-scores[video_id], video_id))
+            for rank, video_id in enumerate(ordered, 1):
+                combined[video_id] += 1.0 / (60 + rank)
+        return tuple(sorted(combined, key=lambda video_id: (-combined[video_id], video_id)))
+
+    def _query_embeddings(
+        self,
+        encoder: TextEncoder,
+        request: TRAKEQueryRequest,
+    ) -> tuple[tuple[np.ndarray, ...], tuple[QueryProcessing, ...]]:
+        texts = (request.global_description, *(stage.description for stage in request.stages))
+        overrides = (
+            request.global_description_en,
+            *(stage.description_en for stage in request.stages),
+        )
+        processings: list[QueryProcessing] = []
+        variants_by_prompt: list[tuple[QueryVariant, ...]] = []
+        adapter = self.query_adapter or QueryTextAdapter()
+        for text, override in zip(texts, overrides, strict=True):
+            processing = adapter.prepare(
+                text,
+                language_hint=request.query_language,
+                english_override=override,
+            )
+            variants = adapter.dense_variants(self.channel_name, processing)
+            if not variants:
+                raise RuntimeError("translation_unavailable")
+            processings.append(processing)
+            variants_by_prompt.append(variants)
+
+        flattened = [variant.text for variants in variants_by_prompt for variant in variants]
+        matrix = _normalized_matrix(encoder.encode_text(flattened), name="query embeddings")
+        query_sets: list[np.ndarray] = []
+        cursor = 0
+        for variants in variants_by_prompt:
+            stop = cursor + len(variants)
+            query_sets.append(matrix[cursor:stop])
+            cursor = stop
+        global_processing = processings[0]
+        self.last_query_processing = {
+            **global_processing.to_dict(),
+            "prompt_count": len(processings),
+            "translated_prompt_count": sum(
+                1
+                for processing in processings
+                if processing.translation.translation_applied
+            ),
+            "channel_policies": {
+                self.channel_name: {
+                    "policy": "+".join(
+                        global_processing.policies.get(self.channel_name, ("identity",))
+                    ),
+                    "variant_count": sum(len(value) for value in variants_by_prompt),
+                }
+            },
+        }
+        return tuple(query_sets), tuple(processings)
 
     @staticmethod
     def _payload_int(payload: Mapping[str, Any], name: str) -> int | None:
@@ -540,20 +721,30 @@ class TRAKEPipeline:
             request = TRAKEQueryRequest.model_validate(request)
         encoder, store = self._dependencies()
         batch_id = request.resolve_batch(default_batch_id)
-        texts = [request.global_description, *(stage.description for stage in request.stages)]
-        queries = _normalized_matrix(encoder.encode_text(texts), name="query embeddings")
-        if queries.shape[0] != len(texts):
-            raise ValueError("encoder returned the wrong number of query embeddings")
-        if queries.shape[1] != int(store.vector_size):
+        query_sets, processings = self._query_embeddings(encoder, request)
+        dimension = query_sets[0].shape[1]
+        if any(query_set.shape[1] != dimension for query_set in query_sets):
+            raise ValueError("encoder returned inconsistent query embedding dimensions")
+        if dimension != int(store.vector_size):
             raise ValueError(
                 "query embedding dimension does not match the selected dense collection"
             )
 
-        stage_a, seed_points = self._candidate_scores(queries, batch_id)
         exact_batch = (
             self.trajectory_cache.require(batch_id)
             if self.trajectory_cache is not None
             else None
+        )
+        self.last_channel_statuses = {}
+        lexical_video_order = (
+            self._lexical_candidate_order(processings, batch_id)
+            if exact_batch is not None
+            else ()
+        )
+        stage_a, seed_points = self._candidate_scores(
+            query_sets,
+            batch_id,
+            lexical_video_order,
         )
         frames_by_video = (
             {}
@@ -561,7 +752,7 @@ class TRAKEPipeline:
             else self._seeded_video_frames(
                 batch_id,
                 tuple(stage_a),
-                queries.shape[1],
+                dimension,
                 len(request.stages),
                 seed_points,
             )
@@ -628,7 +819,12 @@ class TRAKEPipeline:
                 packed_vectors = np.concatenate(
                     [item[2].vectors for item in exact_candidates], axis=0
                 )
-                packed_similarities = queries @ packed_vectors.T
+                packed_similarities = np.stack(
+                    [
+                        np.max(query_set @ packed_vectors.T, axis=0)
+                        for query_set in query_sets
+                    ]
+                )
                 cursor = 0
                 for video_id, stage_a_score, trajectory in exact_candidates:
                     stop = cursor + len(trajectory)
@@ -643,8 +839,8 @@ class TRAKEPipeline:
                     )
                     cursor = stop
         else:
-            global_vector = queries[0]
-            stage_vectors = queries[1:]
+            global_vectors = query_sets[0]
+            stage_vectors = query_sets[1:]
             for video_id, stage_a_score in stage_a.items():
                 frames = frames_by_video.get(video_id, ())
                 if not frames:
@@ -658,14 +854,16 @@ class TRAKEPipeline:
                 )
                 if matrix.shape[0] < len(request.stages):
                     continue
-                stage_similarities = stage_vectors @ matrix.T
+                stage_similarities = np.stack(
+                    [np.max(vectors @ matrix.T, axis=0) for vectors in stage_vectors]
+                )
                 append_alignment(
                     video_id,
                     stage_a_score,
                     source_frames,
                     timestamps_ms,
                     stage_similarities,
-                    float(np.max(matrix @ global_vector)),
+                    float(np.max(global_vectors @ matrix.T)),
                 )
         alignments.sort(
             key=lambda item: (
@@ -698,6 +896,7 @@ class TRAKEPipeline:
                 )
             )
         statuses = {name: dict(status) for name, status in (channel_statuses or {}).items()}
+        statuses.update(self.last_channel_statuses)
         if self.channel_name not in statuses:
             statuses[self.channel_name] = {"state": "ready", "attempted": True}
         return TRAKEResponse(

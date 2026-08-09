@@ -39,6 +39,20 @@ class _HTTP:
         self.calls.append((method, url, kwargs))
         if self.fail:
             raise requests.ConnectionError("secret-token C:/private/archive.zip")
+        if url.endswith("/api/tags") and method == "GET":
+            return _Response(
+                200,
+                {
+                    "models": [
+                        {
+                            "name": "qwen2.5vl:3b-q4_K_M",
+                            "digest": "fb90415cde1e-test",
+                        }
+                    ]
+                },
+            )
+        if url.endswith("/api/show") and method == "POST":
+            return _Response(200, {"capabilities": ["completion", "vision"]})
         if url.endswith("/collections/organizer-v1") and method == "GET":
             return _Response(
                 200,
@@ -111,14 +125,15 @@ def _config(tmp_path: Path) -> dict[str, Any]:
                             "organizer_clip",
                             "metadata",
                             "canonical_images",
-                            "gemini",
+                            "ollama_vlm",
                         ],
                     },
                     "channels": {
                         "organizer_clip": "required",
                         "metadata": "required",
                         "canonical_images": "required",
-                        "gemini": "required",
+                        "ollama_vlm": "required",
+                        "openrouter_vlm": "optional",
                         "visual": "optional",
                         "semantic_text": "optional",
                         "ocr": "optional",
@@ -129,15 +144,21 @@ def _config(tmp_path: Path) -> dict[str, Any]:
             "native_defaults": {
                 "workflows": {
                     "kis": ["visual"],
-                    "qa": ["visual", "gemini"],
+                    "qa": ["visual", "ollama_vlm"],
                     "trake": ["visual"],
                 },
-                "channels": {"visual": "required", "gemini": "required"},
+                "channels": {"visual": "required", "ollama_vlm": "required"},
             },
         },
         "data": {"artifact_db": "artifacts.sqlite3"},
         "services": {
-            "gemini": {"api_key": "test-only-key", "model": "gemini-test"},
+            "ollama_vlm": {
+                "url": "http://127.0.0.1:11434",
+                "model": "qwen2.5vl:3b-q4_K_M",
+                "expected_digest_prefix": "fb90415cde1e",
+                "connect_timeout_seconds": 1,
+            },
+            "openrouter_vlm": {"api_key": None},
             "qdrant": {
                 "url": "http://qdrant.test",
                 "collections": {
@@ -169,7 +190,6 @@ def _config(tmp_path: Path) -> dict[str, Any]:
                 "embedding_dim": 768,
             },
             "text": {"embedding_dim": 768, "model_name": "text", "revision": "r2"},
-            "qwen_vl": {"enabled": True, "enabled_profiles": ["accelerated"]},
         },
         "retrieval": {"rrf_k": 60, "candidate_depths": {}, "channel_weights": {}},
     }
@@ -188,7 +208,7 @@ def test_reference_readiness_is_batch_scoped_and_optional_channels_do_not_degrad
     channels = {item.name: item for item in report.channels}
 
     assert report.kis.state is WorkflowState.READY
-    assert report.qa.state is WorkflowState.READY
+    assert report.qa.state is WorkflowState.DEGRADED
     assert service.workflow_readiness(report, "trake").state is WorkflowState.READY
     assert report.selected_batch_id == "aic25-b1-reference"
     assert report.launch_identity["canonical"] is False
@@ -197,7 +217,7 @@ def test_reference_readiness_is_batch_scoped_and_optional_channels_do_not_degrad
     assert channels["metadata"].count == 12
     assert channels["canonical_images"].count == 2
     assert channels["visual"].state is ChannelState.NOT_PROVISIONED
-    assert channels["gemini"].state is ChannelState.CONFIGURED_UNVERIFIED
+    assert channels["ollama_vlm"].state is ChannelState.READY
     organizer_count = next(call for call in http.calls if call[1].endswith("/points/count"))
     assert organizer_count[2]["json"]["filter"]["must"][0]["match"]["value"] == (
         "aic25-b1-reference"
@@ -413,3 +433,64 @@ def test_invalid_batch_and_mode_are_rejected_without_network(tmp_path: Path) -> 
     with pytest.raises(ValueError, match="at least one"):
         service.retrieval_fingerprint(())
     assert http.calls == []
+
+
+def test_app_readiness_exposes_optional_query_translation_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _artifact_database(tmp_path / "artifacts.sqlite3")
+    config = _config(tmp_path)
+    config["models"]["query_translation"] = {
+        "enabled": True,
+        "converted_path": "models/translation",
+        "tokenizer_path": "models/tokenizer",
+        "asset_manifest": "checksums/query-translation.sha256",
+    }
+    monkeypatch.setattr(
+        readiness_module,
+        "_module_available",
+        lambda name: name != "ctranslate2",
+    )
+    monkeypatch.setattr(
+        readiness_module, "organizer_verification_passed", lambda *_a, **_k: True
+    )
+
+    report = ReadinessService(
+        config, project_root=tmp_path, http_client=_HTTP()
+    ).check("aic25-b1-reference")
+    check = next(item for item in report.checks if item.name == "query_translation")
+
+    assert check.state is ChannelState.BLOCKED_DEPENDENCY
+    assert check.reason_code == "translator_dependency_missing"
+    assert report.kis.state is WorkflowState.READY
+
+
+def test_query_translation_readiness_is_side_effect_free_and_asset_scoped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _artifact_database(tmp_path / "artifacts.sqlite3")
+    config = _config(tmp_path)
+    config["models"]["query_translation"] = {
+        "enabled": True,
+        "converted_path": "models/translation",
+        "tokenizer_path": "models/tokenizer",
+        "asset_manifest": "checksums/query-translation.sha256",
+    }
+    for relative in (
+        "models/translation/model.bin",
+        "models/translation/config.json",
+        "models/tokenizer/source.spm",
+        "models/tokenizer/target.spm",
+        "checksums/query-translation.sha256",
+    ):
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"fixture")
+    monkeypatch.setattr(readiness_module, "_module_available", lambda _name: True)
+
+    report = ReadinessService(
+        config, project_root=tmp_path, http_client=_HTTP()
+    ).check("aic25-b1-reference")
+    check = next(item for item in report.checks if item.name == "query_translation")
+
+    assert check.state is ChannelState.READY

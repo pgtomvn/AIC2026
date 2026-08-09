@@ -36,6 +36,27 @@ _FILTERABLE_ATTRIBUTES = [
 _TASK_TIMEOUT_MS = 120_000
 _MEILI_ID = re.compile(r"[A-Za-z0-9_-]{1,511}\Z")
 
+VIETNAMESE_STOP_WORDS = (
+    "một", "những", "các", "đang", "được", "ở", "tại", "trong", "trên",
+    "với", "và", "của", "là", "có",
+)
+
+BILINGUAL_METADATA_SYNONYMS = {
+    "cảnh sát": ("police", "police officer"),
+    "police": ("cảnh sát", "police officer"),
+    "xe ô tô": ("car", "automobile", "xe hơi"),
+    "xe hơi": ("car", "automobile", "xe ô tô"),
+    "car": ("xe ô tô", "xe hơi", "automobile"),
+    "xe cấp cứu": ("ambulance",),
+    "ambulance": ("xe cấp cứu",),
+    "xe máy": ("motorcycle", "motorbike"),
+    "motorcycle": ("xe máy", "motorbike"),
+    "điện thoại": ("phone", "mobile phone"),
+    "phone": ("điện thoại", "mobile phone"),
+    "kính mắt": ("glasses", "eyeglasses"),
+    "glasses": ("kính mắt", "eyeglasses"),
+}
+
 
 class TextStore:
     """Meilisearch lexical-search client wrapper.
@@ -155,6 +176,47 @@ class TextStore:
         filterable_task = index.update_filterable_attributes(filterable_attributes)
         self._wait_for_task(filterable_task, "update filterable attributes")
 
+    def configure_shadow_v2(self, profile: str) -> None:
+        """Apply versioned multilingual settings to a non-live v2 index.
+
+        The method refuses v1 names so an operator cannot accidentally trigger
+        a live reindex while preparing the shadow deployment.
+        """
+
+        if not self.index_name.endswith("_v2"):
+            raise ValueError("multilingual settings may be applied only to a shadow v2 index")
+        if profile not in {"ocr", "asr", "metadata"}:
+            raise ValueError("shadow profile must be ocr, asr, or metadata")
+        index = self._fetch_index()
+        localized = [
+            {
+                "attributePatterns": [
+                    "text", "text_raw", "text_nfc", "text_accent_folded",
+                    "ocr_text" if profile == "ocr" else "asr_text",
+                ],
+                "locales": ["vie"],
+            }
+        ]
+        settings: dict[str, Any] = {"localizedAttributes": localized}
+        if profile in {"ocr", "asr"}:
+            settings["stopWords"] = list(VIETNAMESE_STOP_WORDS)
+        else:
+            settings["synonyms"] = {
+                key: list(values) for key, values in BILINGUAL_METADATA_SYNONYMS.items()
+            }
+            settings["localizedAttributes"] = [
+                {
+                    "attributePatterns": ["text", "text_raw", "text_nfc"],
+                    "locales": ["vie", "eng"],
+                },
+                {
+                    "attributePatterns": ["text_accent_folded", "objects"],
+                    "locales": ["eng"],
+                },
+            ]
+        task_info = index.update_settings(settings)
+        self._wait_for_task(task_info, f"configure multilingual shadow {profile!r}")
+
     def add_documents(self, documents: list[dict[str, Any]], batch_size: int = 1000) -> None:
         """Validate and add documents in acknowledged batches."""
         if batch_size <= 0:
@@ -205,6 +267,7 @@ class TextStore:
         query: str,
         top_k: int = 50,
         filters: Optional[str] = None,
+        locales: tuple[str, ...] | list[str] | None = None,
     ) -> list[dict]:
         """Run lexical search and return canonical ranked result mappings.
 
@@ -218,6 +281,11 @@ class TextStore:
             raise ValueError("top_k must be positive")
         if filters is not None and not isinstance(filters, str):
             raise TypeError("filters must be a Meilisearch filter expression string")
+        if locales is not None:
+            if isinstance(locales, (str, bytes)) or any(
+                not isinstance(value, str) or not value for value in locales
+            ):
+                raise TypeError("locales must contain non-empty locale identifiers")
 
         options: dict[str, Any] = {
             "limit": top_k,
@@ -225,6 +293,8 @@ class TextStore:
         }
         if filters:
             options["filter"] = filters
+        if locales:
+            options["locales"] = list(locales)
         response = self._fetch_index().search(query, options)
         if not isinstance(response, Mapping):
             raise RuntimeError("Meilisearch returned a malformed search response")
@@ -271,3 +341,66 @@ class TextStore:
         if not isinstance(hits, list):
             raise RuntimeError("Meilisearch returned malformed availability hits")
         return bool(hits)
+
+    def count_documents(self, filters: Optional[str] = None) -> int:
+        """Return an exact service-reported count, optionally scoped by filter."""
+
+        if filters is not None and not isinstance(filters, str):
+            raise TypeError("filters must be a Meilisearch filter expression string")
+        index = self._fetch_index()
+        if not filters:
+            stats = index.get_stats()
+            if isinstance(stats, Mapping):
+                value = stats.get("numberOfDocuments", stats.get("number_of_documents"))
+            else:
+                value = getattr(stats, "number_of_documents", None)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise RuntimeError("Meilisearch stats are missing a valid document count")
+            return value
+        options: dict[str, Any] = {"limit": 0}
+        if filters:
+            options["filter"] = filters
+        response = index.search("", options)
+        if not isinstance(response, Mapping):
+            raise RuntimeError("Meilisearch returned a malformed count response")
+        value = response.get("estimatedTotalHits", response.get("totalHits"))
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise RuntimeError("Meilisearch count response is missing a valid total")
+        return value
+
+    def iter_documents(
+        self,
+        *,
+        filters: Optional[str] = None,
+        batch_size: int = 1_000,
+    ):
+        """Yield stored documents in bounded pages for an explicit shadow copy."""
+
+        if filters is not None and not isinstance(filters, str):
+            raise TypeError("filters must be a Meilisearch filter expression string")
+        if batch_size < 1 or batch_size > 10_000:
+            raise ValueError("batch_size must be between 1 and 10000")
+        index = self._fetch_index()
+        offset = 0
+        while True:
+            options: dict[str, Any] = {"offset": offset, "limit": batch_size}
+            if filters:
+                options["filter"] = filters
+            response = index.get_documents(options)
+            values = (
+                response.get("results", ())
+                if isinstance(response, Mapping)
+                else getattr(response, "results", ())
+            )
+            if not isinstance(values, (list, tuple)):
+                raise RuntimeError("Meilisearch returned malformed documents")
+            for value in values:
+                if isinstance(value, Mapping):
+                    yield dict(value)
+                elif hasattr(value, "__dict__"):
+                    yield dict(vars(value))
+                else:
+                    raise RuntimeError("Meilisearch returned a non-object document")
+            if len(values) < batch_size:
+                break
+            offset += len(values)

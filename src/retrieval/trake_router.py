@@ -72,6 +72,7 @@ class TRAKEPipelineRouter:
             str, tuple[float, bool, dict[str, dict[str, Any]]]
         ] = {}
         self._readiness_lock = threading.RLock()
+        self.last_query_processing: dict[str, Any] = {}
 
     def channel_for_batch(self, batch_id: str) -> str:
         """Return the sole compatible dense channel for one batch identity."""
@@ -209,11 +210,16 @@ class TRAKEPipelineRouter:
                 channel_statuses=statuses,
             )
         statuses[channel_name]["attempted"] = True
-        return pipeline.search(
+        response = pipeline.search(
             request,
             default_batch_id=batch_id,
             channel_statuses=statuses,
         )
+        processing = getattr(pipeline, "last_query_processing", {})
+        self.last_query_processing = (
+            dict(processing) if isinstance(processing, Mapping) else {}
+        )
+        return response
 
     def warm(self, batch_id: str) -> dict[str, Any]:
         """Warm only the one provisioned dense space selected for ``batch_id``."""

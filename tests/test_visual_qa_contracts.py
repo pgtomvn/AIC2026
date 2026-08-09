@@ -33,7 +33,7 @@ def _prediction(**overrides) -> QAPrediction:
         "timestamp_ms": 3017,
         "answer": "5",
         "confidence_score": 0.8,
-        "answer_source": "gemini",
+        "answer_source": "ollama-qwen",
         "window_id": "L21_V001:181:r4000:n5",
         "evidence": {"frame_indices": [170, 181, 192]},
         "raw_answer": "five",
@@ -71,17 +71,26 @@ def test_qa_query_request_round_trip_and_defaults() -> None:
         mode="interactive",
         batch_filters=["aic25-b1-reference"],
         limit=25,
+        allow_external_frame_transfer=True,
     )
 
     assert request.answer_spec_id == QA_HISTORICAL_NUMERIC_SPEC_ID
     assert request.batch_filters == ("aic25-b1-reference",)
     assert QAQueryRequest.from_dict(request.to_dict()) == request
     with pytest.raises(ValueError, match="mode"):
-        QAQueryRequest("qa-1", "event", "question", mode="unsupported")
+        QAQueryRequest(
+            "qa-1", "event", "question", mode="unsupported", reasoning_policy="local_only"
+        )
     with pytest.raises(ValueError, match="duplicates"):
-        QAQueryRequest("qa-1", "event", "question", batch_filters=("b1", "b1"))
+        QAQueryRequest(
+            "qa-1", "event", "question", batch_filters=("b1", "b1"),
+            reasoning_policy="local_only",
+        )
     with pytest.raises(ValueError, match="unknown Visual Q&A answer_spec_id"):
-        QAQueryRequest("qa-1", "event", "question", answer_spec_id="unknown-spec")
+        QAQueryRequest(
+            "qa-1", "event", "question", answer_spec_id="unknown-spec",
+            reasoning_policy="local_only",
+        )
 
 
 def test_qa_candidate_window_is_canonical_ordered_and_bounded() -> None:
@@ -96,9 +105,13 @@ def test_qa_candidate_window_is_canonical_ordered_and_bounded() -> None:
         timestamp_ms=1_000,
         shot_id="shot-1",
         frames=frames,
+        frame_selection_scores={9: 0.9, 10: 0.8},
     )
 
     assert QACandidateWindow.from_dict(window.to_dict()) == window
+    serialized = window.to_dict()
+    serialized["frame_selection_scores"] = {"9": 0.9, "10": 0.8}
+    assert QACandidateWindow.from_dict(serialized) == window
     with pytest.raises(ValueError, match="between 3 and 5"):
         QACandidateWindow(
             "short", 1, 0.5, "b1", "L21_V001", 10, 1_000, "shot-1", frames[:2]
@@ -126,6 +139,19 @@ def test_qa_candidate_window_is_canonical_ordered_and_bounded() -> None:
             1_200,
             "shot-1",
             frames,
+        )
+    with pytest.raises(ValueError, match="selected frames"):
+        QACandidateWindow(
+            "bad-score",
+            1,
+            0.5,
+            "b1",
+            "L21_V001",
+            10,
+            1_000,
+            "shot-1",
+            frames,
+            frame_selection_scores={999: 0.9},
         )
 
 

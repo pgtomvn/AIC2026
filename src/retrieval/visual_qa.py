@@ -13,7 +13,15 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, is_dataclass
 from typing import Any, Protocol
 
-from src.contracts import QACompetitionSpec, QAPrediction, QAQueryRequest
+from src.contracts import (
+    FrameRecord,
+    QACandidateFrame,
+    QACandidateRequest,
+    QACompetitionSpec,
+    QAPrediction,
+    QAQueryRequest,
+    QASingleFrameAnswerRequest,
+)
 from src.retrieval.qa_media import (
     CanonicalImageError,
     CanonicalImageProbe,
@@ -58,13 +66,18 @@ _PROVIDER_ERROR_CATEGORIES = frozenset(
         "client_unavailable",
         "invalid_request",
         "model_unavailable",
+        "model_missing",
         "network_unreachable",
         "not_configured",
+        "ollama_context_exceeded",
+        "ollama_timeout",
+        "ollama_response_invalid",
         "provider_chain_exhausted",
         "provider_request_failed",
         "rate_limited",
         "request_rejected",
         "response_invalid",
+        "resource_exhausted",
         "server_unavailable",
     }
 )
@@ -116,6 +129,7 @@ class QAWindowOutcome:
     provider: str | None = None
     model_name: str | None = None
     prompt_version: str | None = None
+    frame_prepare_ms: float | None = None
     provider_latency_ms: float | None = None
     attempts: int | None = None
     cache_status: str | None = None
@@ -244,6 +258,7 @@ class VisualQAPipeline:
         *,
         retriever: VisualQARetriever | None = None,
         reasoner: QAReasoner | None = None,
+        florence_reasoner: Any = None,
         image_resolver: ImageResolver | None = None,
         session_store: QASessionStore | None = None,
         competition_spec: Any = None,
@@ -267,6 +282,7 @@ class VisualQAPipeline:
         self.top_k_final = top_k_final
         self.retriever = retriever
         self.reasoner = reasoner or vlm_engine
+        self.florence_reasoner = florence_reasoner
         self.image_resolver = image_resolver
         self.session_store = session_store
         numeric_spec = QACompetitionSpec.historical_numeric()
@@ -402,10 +418,17 @@ class VisualQAPipeline:
         ).hexdigest()
 
     @classmethod
-    def _provider_cache_identities(cls, reasoner: QAReasoner) -> tuple[tuple[str, str], ...]:
+    def _provider_cache_identities(
+        cls,
+        reasoner: QAReasoner,
+        request: QAQueryRequest | None = None,
+    ) -> tuple[tuple[str, str], ...]:
         """Return provider name/fingerprint pairs in fallback execution order."""
 
-        configured = getattr(reasoner, "providers", None)
+        selector = getattr(reasoner, "providers_for", None)
+        configured = selector(request) if request is not None and callable(selector) else None
+        if configured is None:
+            configured = getattr(reasoner, "providers", None)
         providers = tuple(configured) if isinstance(configured, (list, tuple)) else (reasoner,)
         identities: list[tuple[str, str]] = []
         for provider in providers:
@@ -435,10 +458,16 @@ class VisualQAPipeline:
         raise ValueError("QA reasoner result provider does not match configured providers")
 
     @staticmethod
-    def _reasoning_lease_ttl(reasoner: QAReasoner) -> float:
+    def _reasoning_lease_ttl(
+        reasoner: QAReasoner,
+        request: QAQueryRequest | None = None,
+    ) -> float:
         """Derive a bounded lease from ordered provider retry/timeout budgets."""
 
-        configured = getattr(reasoner, "providers", None)
+        selector = getattr(reasoner, "providers_for", None)
+        configured = selector(request) if request is not None and callable(selector) else None
+        if configured is None:
+            configured = getattr(reasoner, "providers", None)
         providers = tuple(configured) if isinstance(configured, (list, tuple)) else (reasoner,)
         budget = 0.0
         for provider in providers:
@@ -519,6 +548,10 @@ class VisualQAPipeline:
             "timestamp_ms": cluster.timestamp_ms,
             "shot_id": cluster.shot_id,
             "frames": [frame.to_dict() for frame in cls._frame_refs(cluster)],
+            "frame_selection_scores": {
+                str(source_frame_idx): score
+                for source_frame_idx, score in cluster.frame_selection_scores.items()
+            },
         }
 
     @staticmethod
@@ -572,6 +605,12 @@ class VisualQAPipeline:
                         timestamp_ms=int(value["timestamp_ms"]),
                         shot_id=str(value["shot_id"]),
                         frames=tuple(frames),
+                        frame_selection_scores={
+                            int(source_frame_idx): float(score)
+                            for source_frame_idx, score in dict(
+                                value.get("frame_selection_scores", {})
+                            ).items()
+                        },
                     )
                 )
             except (KeyError, TypeError, ValueError):
@@ -750,26 +789,32 @@ class VisualQAPipeline:
         if getattr(reasoner, "max_attempts", None) != 1:
             raise ValueError("live one-window reasoner must have max_attempts=1")
         filters = tuple(batch_filters or request.batch_filters)
+        total_started = time.perf_counter()
+        retrieval_started = time.perf_counter()
         clusters = self.retriever.retrieve(
             request.event_description,
             batch_filters=filters,
             max_clusters=1,
         )
+        candidate_retrieval_ms = (time.perf_counter() - retrieval_started) * 1_000
         if not clusters:
             raise LookupError("Visual Q&A live check found no canonical candidate window")
         cluster = clusters[0]
-        started = time.perf_counter()
+        frame_started = time.perf_counter()
         resolved = tuple(self.image_resolver.resolve(frame) for frame in cluster.frames)
+        frame_prepare_ms = (time.perf_counter() - frame_started) * 1_000
         if sum(len(image.data) for image in resolved) > self.max_inline_image_bytes:
             raise _ImageWindowTooLargeError(
                 "canonical image window exceeds the configured inline byte limit"
             )
         images = tuple(_qa_image(image, index) for index, image in enumerate(resolved, 1))
         active_spec = self.competition_specs[request.answer_spec_id]
+        inference_started = time.perf_counter()
         response = reasoner.reason(request, images, active_spec)
+        ollama_inference_ms = (time.perf_counter() - inference_started) * 1_000
         reasoning = self._reasoning_result(response, active_spec)
         status = "answered" if reasoning["answerable"] else "unanswerable"
-        return self._outcome(
+        outcome = self._outcome(
             cluster,
             status,
             answer=reasoning["answer"] if reasoning["answerable"] else "",
@@ -780,12 +825,493 @@ class VisualQAPipeline:
             provider=reasoning.get("provider"),
             model_name=reasoning.get("model_name"),
             prompt_version=reasoning.get("prompt_version"),
+            frame_prepare_ms=frame_prepare_ms,
             provider_latency_ms=reasoning.get("latency_ms"),
             attempts=reasoning.get("attempts"),
             cache_status=reasoning.get("cache_status"),
-            served_latency_ms=(time.perf_counter() - started) * 1_000,
+            served_latency_ms=(time.perf_counter() - total_started) * 1_000,
             cache_layers={"candidate": "bypass", "reasoning": "bypass"},
         )
+        outcome["stage_timings"] = {
+            "candidate_retrieval_ms": round(candidate_retrieval_ms, 3),
+            "frame_prepare_ms": round(frame_prepare_ms, 3),
+            "ollama_inference_ms": round(ollama_inference_ms, 3),
+            "total_ms": round((time.perf_counter() - total_started) * 1_000, 3),
+        }
+        metrics = getattr(reasoner, "last_metrics", None)
+        outcome["ollama_metrics"] = dict(metrics) if isinstance(metrics, Mapping) else {}
+        outcome["frame_selection_scores"] = {
+            str(source_frame_idx): score
+            for source_frame_idx, score in cluster.frame_selection_scores.items()
+        }
+        return outcome
+
+    def retrieve_vqa_candidates(
+        self,
+        event_description: str,
+        top_k: int = 5,
+        *,
+        batch_filters: Sequence[str] = (),
+        query_language: str = "auto",
+        event_description_en: str | None = None,
+    ) -> tuple[QACandidateFrame, ...]:
+        """Run pure KIS retrieval and return canonical frames without media/VLM work."""
+
+        if self.retriever is None:
+            raise RuntimeError("Visual Q&A retriever is unavailable")
+        retrieve_frames = getattr(self.retriever, "retrieve_frames", None)
+        if not callable(retrieve_frames):
+            raise RuntimeError("Visual Q&A single-frame retrieval is unavailable")
+        return tuple(
+            retrieve_frames(
+                event_description,
+                batch_filters=tuple(batch_filters),
+                top_k=top_k,
+                query_language=query_language,
+                event_description_en=event_description_en,
+            )
+        )
+
+    @staticmethod
+    def _candidate_cache_key_v3(
+        retriever: VisualQARetriever,
+        event_description: str,
+        batch_filters: tuple[str, ...],
+        top_k: int,
+        retrieval_fingerprint: str,
+        query_language: str,
+        event_description_en: str | None,
+    ) -> str:
+        payload = {
+            "version": "qa-single-frame-candidates-v3",
+            "event_description": unicodedata.normalize("NFC", event_description.strip()),
+            "batch_filters": sorted(set(batch_filters)),
+            "top_k": top_k,
+            "retrieval": retrieval_fingerprint,
+            "retriever_type": f"{type(retriever).__module__}.{type(retriever).__qualname__}",
+            "query_language": query_language,
+            "event_description_en": event_description_en,
+        }
+        return hashlib.sha256(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+    def start_candidate_search(
+        self,
+        request: QACandidateRequest,
+        *,
+        session_id: str | None = None,
+        legacy_request: Mapping[str, Any] | None = None,
+    ) -> tuple[QACandidateFrame, ...]:
+        """Persist a v3 retrieval-only QA session and its immutable candidates."""
+
+        if not isinstance(request, QACandidateRequest):
+            raise TypeError("request must be a QACandidateRequest")
+        if self.retriever is None or self.session_store is None:
+            raise RuntimeError("Visual Q&A retrieval/session dependencies are unavailable")
+        search_id = str(session_id or uuid.uuid4().hex)
+        request_payload = request.to_dict()
+        if legacy_request:
+            request_payload["legacy_request"] = dict(legacy_request)
+        session = self.session_store.create_session(
+            search_id,
+            request_payload,
+            state={
+                "state_version": 3,
+                "status": "retrieving",
+                "answers": {},
+                "failures": {},
+                "predictions": [],
+                "channel_statuses": {},
+                "retrieval_errors": {},
+            },
+        )
+        existing = self.session_store.get_session_candidates(search_id)
+        if existing:
+            return tuple(QACandidateFrame.from_dict(value) for value in existing)
+
+        started = time.perf_counter()
+        filters = tuple(request.batch_filters)
+        retrieval_fingerprint = self._retrieval_cache_fingerprint(self.retriever, filters)
+        cache_key = self._candidate_cache_key_v3(
+            self.retriever,
+            request.event_description,
+            filters,
+            request.top_k,
+            retrieval_fingerprint,
+            request.query_language,
+            request.event_description_en,
+        )
+        cached = self.session_store.get_candidate_entry(cache_key)
+        candidate_values = cached[0] if cached is not None else None
+        candidates: tuple[QACandidateFrame, ...] = ()
+        if candidate_values is not None:
+            try:
+                candidates = tuple(QACandidateFrame.from_dict(value) for value in candidate_values)
+            except (TypeError, ValueError):
+                candidates = ()
+        cache_status = "hit" if candidates else "miss"
+        if not candidates:
+            candidates = self.retrieve_vqa_candidates(
+                request.event_description,
+                request.top_k,
+                batch_filters=filters,
+                query_language=request.query_language,
+                event_description_en=request.event_description_en,
+            )
+            textual = getattr(self.retriever, "textual_pipeline", None)
+            raw_statuses = getattr(textual, "last_channel_statuses", {})
+            raw_errors = getattr(textual, "last_channel_errors", {})
+            diagnostics = {
+                "channel_statuses": dict(raw_statuses) if isinstance(raw_statuses, Mapping) else {},
+                "retrieval_errors": {
+                    str(name): "channel_unavailable"
+                    for name in raw_errors
+                }
+                if isinstance(raw_errors, Mapping)
+                else {},
+                "query_processing": dict(
+                    getattr(textual, "last_query_processing", {})
+                )
+                if isinstance(getattr(textual, "last_query_processing", {}), Mapping)
+                else {},
+            }
+            self.session_store.put_candidate_set(
+                cache_key,
+                tuple(candidate.to_dict() for candidate in candidates),
+                diagnostics=diagnostics,
+            )
+        else:
+            diagnostics = cached[1] if cached is not None else {}
+        frozen = self.session_store.bind_session_candidates(
+            search_id, (candidate.to_dict() for candidate in candidates)
+        )
+        candidates = tuple(QACandidateFrame.from_dict(value) for value in frozen)
+        state = dict(session.state)
+        state.update(
+            {
+                "state_version": 3,
+                "status": "candidates_ready" if candidates else "no_candidates",
+                "candidate_retrieval_ms": round(
+                    (time.perf_counter() - started) * 1_000, 3
+                ),
+                "candidate_cache_status": cache_status,
+                "channel_statuses": dict(diagnostics.get("channel_statuses", {})),
+                "retrieval_errors": dict(diagnostics.get("retrieval_errors", {})),
+                "query_processing": dict(diagnostics.get("query_processing", {})),
+            }
+        )
+        self.session_store.update_state(
+            search_id, state, expected_revision=session.revision
+        )
+        return candidates
+
+    def answer_vqa_single_frame(
+        self,
+        selected_frame: FrameRecord,
+        question: str,
+        *,
+        event_description: str = "selected event frame",
+        answer_spec_id: str | None = None,
+        reasoning_policy: str = "gemini_then_local",
+        allow_external_frame_transfer: bool = False,
+        query_id: str | None = None,
+        reasoner: QAReasoner | None = None,
+        florence_task: str | None = None,
+        florence_target_label: str | None = None,
+        _resolved_image: Any | None = None,
+    ) -> tuple[dict[str, Any], dict[str, float]]:
+        """Resolve and reason over exactly one canonical frame."""
+
+        if not isinstance(selected_frame, FrameRecord):
+            raise TypeError("selected_frame must be a FrameRecord")
+        if not isinstance(question, str) or not question.strip():
+            raise ValueError("question must be a non-empty string")
+        if self.image_resolver is None:
+            raise RuntimeError("Visual Q&A image resolver is unavailable")
+        active_reasoner = reasoner or self.reasoner
+        if active_reasoner is None:
+            raise RuntimeError("Visual Q&A reasoner is unavailable")
+        spec_id = answer_spec_id or self.default_competition_spec_id
+        active_spec = self.competition_specs[spec_id]
+        provider_request = QAQueryRequest(
+            query_id=query_id or uuid.uuid4().hex,
+            event_description=event_description,
+            question=question,
+            mode="interactive",
+            answer_spec_id=spec_id,
+            batch_filters=(selected_frame.batch_id,),
+            limit=1,
+            reasoning_policy=reasoning_policy,
+            allow_external_frame_transfer=allow_external_frame_transfer,
+        )
+        frame_started = time.perf_counter()
+        resolved = (
+            _resolved_image
+            if _resolved_image is not None
+            else self.image_resolver.resolve(selected_frame)
+        )
+        frame_prepare_ms = (time.perf_counter() - frame_started) * 1_000
+        if len(resolved.data) > self.max_inline_image_bytes:
+            raise _ImageWindowTooLargeError("canonical image exceeds the inline-image limit")
+        image = _qa_image(resolved, 1)
+        inference_started = time.perf_counter()
+        reason_task = getattr(active_reasoner, "reason_task", None)
+        if florence_task is not None and callable(reason_task):
+            response = reason_task(
+                provider_request,
+                (image,),
+                active_spec,
+                task=florence_task,
+                target_label=florence_target_label,
+            )
+        else:
+            response = active_reasoner.reason(provider_request, (image,), active_spec)
+        answer_call_ms = (time.perf_counter() - inference_started) * 1_000
+        reasoning = self._reasoning_result(response, active_spec)
+        evidence = reasoning.get("evidence_frame_indices", ())
+        if reasoning["answerable"] and tuple(evidence) != (1,):
+            raise ValueError("single-frame reasoning evidence must be exactly [1]")
+        provider_latency = reasoning.get("latency_ms")
+        inference_ms = (
+            float(provider_latency)
+            if isinstance(provider_latency, (int, float))
+            and not isinstance(provider_latency, bool)
+            and float(provider_latency) >= 0
+            else answer_call_ms
+        )
+        metrics = {
+            "frame_prepare_ms": round(frame_prepare_ms, 3),
+            "vlm_inference_ms": round(inference_ms, 3),
+            "answer_call_ms": round(answer_call_ms, 3),
+        }
+        provider_metrics = getattr(active_reasoner, "last_metrics", None)
+        if isinstance(provider_metrics, Mapping):
+            handoff = provider_metrics.get("handoff_ms")
+            if isinstance(handoff, (int, float)) and not isinstance(handoff, bool):
+                metrics["gpu_handoff_ms"] = round(max(0.0, float(handoff)), 3)
+        return reasoning, metrics
+
+    def answer_candidate(
+        self,
+        search_id: str,
+        request: QASingleFrameAnswerRequest,
+    ) -> dict[str, Any]:
+        """Answer one persisted v3 candidate and update the restorable session."""
+
+        if self.session_store is None or self.retriever is None:
+            raise RuntimeError("Visual Q&A session dependencies are unavailable")
+        snapshot = self.session_store.get_snapshot(search_id)
+        if snapshot is None:
+            raise KeyError(search_id)
+        if int(snapshot.get("state_version", 0)) != 3:
+            raise RuntimeError("legacy_qa_session_read_only")
+        candidates = tuple(
+            QACandidateFrame.from_dict(value)
+            for value in snapshot.get("session_candidates", ())
+        )
+        candidate = next(
+            (value for value in candidates if value.candidate_id == request.candidate_id),
+            None,
+        )
+        if candidate is None:
+            raise ValueError("candidate_id is not part of this QA session")
+        repository = getattr(self.retriever, "frame_repository", None)
+        frame = repository.get_frame(
+            candidate.batch_id, candidate.video_id, candidate.source_frame_idx
+        ) if repository is not None else None
+        if frame is None or frame.timestamp_ms != candidate.timestamp_ms:
+            raise ValueError("candidate frame is no longer canonical")
+        stored_request = snapshot.get("request", {})
+        event_description = str(stored_request.get("event_description") or "")
+        active_reasoner = (
+            self.florence_reasoner
+            if request.answer_engine == "florence2"
+            else self.reasoner
+        )
+        if active_reasoner is None:
+            raise RuntimeError(
+                "florence_not_provisioned"
+                if request.answer_engine == "florence2"
+                else "qa_reasoner_unavailable"
+            )
+        resolved = self.image_resolver.resolve(frame) if self.image_resolver is not None else None
+        if resolved is None:
+            raise RuntimeError("media_unavailable")
+        request_payload = {
+            "version": "qa-single-frame-answer-v3",
+            "event_description": unicodedata.normalize("NFC", event_description.strip()),
+            "question": unicodedata.normalize("NFC", request.question.strip()),
+            "answer_spec_id": request.answer_spec_id,
+            "reasoning_policy": request.reasoning_policy,
+            "answer_engine": request.answer_engine,
+            "florence_task": request.florence_task,
+            "florence_target_label": request.florence_target_label,
+        }
+        request_fingerprint = hashlib.sha256(
+            json.dumps(request_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        frame_fingerprint = {
+            "batch_id": frame.batch_id,
+            "video_id": frame.video_id,
+            "source_frame_idx": frame.source_frame_idx,
+            "sha256": resolved.content_sha256,
+        }
+        provider_request = QAQueryRequest(
+            query_id=search_id,
+            event_description=event_description,
+            question=request.question,
+            mode="interactive",
+            answer_spec_id=request.answer_spec_id,
+            batch_filters=(frame.batch_id,),
+            limit=1,
+            reasoning_policy=request.reasoning_policy,
+            allow_external_frame_transfer=request.allow_external_frame_transfer,
+        )
+        identities = tuple(
+            (
+                provider_name,
+                provider_fingerprint,
+                reasoning_cache_key(
+                    provider_fingerprint=provider_fingerprint,
+                    request_fingerprint=request_fingerprint,
+                    answer_spec_id=request.answer_spec_id,
+                    frame_fingerprints=(frame_fingerprint,),
+                ),
+            )
+            for provider_name, provider_fingerprint in self._provider_cache_identities(
+                active_reasoner, provider_request
+            )
+        )
+        cache_key = identities[0][2]
+        reasoning = self.session_store.get_reasoning(cache_key)
+        timings = {"frame_prepare_ms": 0.0, "vlm_inference_ms": 0.0}
+        cache_status = "hit" if reasoning is not None else "miss"
+        try:
+            if reasoning is None:
+                reasoning, timings = self.answer_vqa_single_frame(
+                    frame,
+                    request.question,
+                    event_description=event_description,
+                    answer_spec_id=request.answer_spec_id,
+                    reasoning_policy=request.reasoning_policy,
+                    allow_external_frame_transfer=request.allow_external_frame_transfer,
+                    query_id=search_id,
+                    reasoner=active_reasoner,
+                    florence_task=request.florence_task,
+                    florence_target_label=request.florence_target_label,
+                    _resolved_image=resolved,
+                )
+                actual_cache_key = self._actual_provider_cache_key(reasoning, identities)
+                if not bool(reasoning.get("fallback_used", False)):
+                    self.session_store.put_reasoning(actual_cache_key, reasoning)
+            reasoning = dict(reasoning)
+            reasoning["cache_status"] = cache_status
+            prediction = None
+            if reasoning.get("answerable"):
+                prediction = QAPrediction(
+                    rank=1,
+                    batch_id=frame.batch_id,
+                    video_id=frame.video_id,
+                    source_frame_idx=frame.source_frame_idx,
+                    timestamp_ms=frame.timestamp_ms,
+                    answer=str(reasoning["answer"]),
+                    raw_answer=str(reasoning.get("raw_answer") or reasoning["answer"]),
+                    model_name=reasoning.get("model_name"),
+                    confidence_score=max(
+                        0.0,
+                        min(1.0, 1.0 / max(1, candidate.retrieval_rank)),
+                    ),
+                    answer_source="/".join(
+                        value
+                        for value in (
+                            reasoning.get("provider"),
+                            reasoning.get("model_name"),
+                        )
+                        if isinstance(value, str) and value
+                    )
+                    or "qa_reasoner",
+                    window_id=candidate.candidate_id,
+                    evidence={
+                        "candidate_id": candidate.candidate_id,
+                        "retrieval_rank": candidate.retrieval_rank,
+                        "retrieval_score": candidate.retrieval_score,
+                        "evidence_frame_indices": [1],
+                        "evidence_source_frame_indices": [frame.source_frame_idx],
+                        "provider": reasoning.get("provider"),
+                        "requested_policy": reasoning.get("requested_policy"),
+                        "fallback_used": bool(reasoning.get("fallback_used", False)),
+                        "fallback_reason_code": reasoning.get("fallback_reason_code"),
+                        "latency_ms": reasoning.get("latency_ms"),
+                        "answer_call_ms": timings.get("answer_call_ms"),
+                        "cache_status": cache_status,
+                    },
+                ).to_dict()
+            session = self.session_store.get_session(search_id)
+            if session is None:
+                raise QASessionStoreError("QA session expired during answering")
+            state = dict(session.state)
+            answers = dict(state.get("answers", {}))
+            failures = dict(state.get("failures", {}))
+            failures.pop(candidate.candidate_id, None)
+            answers[candidate.candidate_id] = {
+                "candidate_id": candidate.candidate_id,
+                "status": "answered" if prediction is not None else "unanswerable",
+                "reasoning": reasoning,
+                "prediction": prediction,
+                "stage_timings": timings,
+            }
+            predictions = [
+                value.get("prediction")
+                for _, value in sorted(
+                    answers.items(),
+                    key=lambda item: next(
+                        candidate.retrieval_rank
+                        for candidate in candidates
+                        if candidate.candidate_id == item[0]
+                    ),
+                )
+                if isinstance(value, Mapping) and value.get("prediction") is not None
+            ]
+            for rank, value in enumerate(predictions, 1):
+                value["rank"] = rank
+            state.update(
+                {
+                    "state_version": 3,
+                    "status": "answered" if predictions else "completed_no_answer",
+                    "selected_candidate_id": candidate.candidate_id,
+                    "answers": answers,
+                    "failures": failures,
+                    "predictions": predictions,
+                }
+            )
+            self.session_store.update_state(
+                search_id, state, expected_revision=session.revision
+            )
+            return answers[candidate.candidate_id]
+        except Exception as error:
+            session = self.session_store.get_session(search_id)
+            if session is not None:
+                state = dict(session.state)
+                failures = dict(state.get("failures", {}))
+                failures[candidate.candidate_id] = self._failure(error, "provider")[1]
+                state.update(
+                    {
+                        "state_version": 3,
+                        "status": "failed",
+                        "selected_candidate_id": candidate.candidate_id,
+                        "failures": failures,
+                    }
+                )
+                self.session_store.update_state(
+                    search_id, state, expected_revision=session.revision
+                )
+            raise
 
     def answer(
         self,
@@ -832,6 +1358,7 @@ class VisualQAPipeline:
         """Run or resume a Visual Q&A cascade and return unique ranked answers."""
 
         retriever, reasoner, resolver, sessions = self._dependencies()
+        candidate_started = time.perf_counter()
         question = request if isinstance(request, str) else _request_value(request, "question")
         if not isinstance(question, str) or not question.strip():
             raise ValueError("Visual Q&A request requires a non-empty question")
@@ -867,6 +1394,7 @@ class VisualQAPipeline:
                 question=question.strip(),
                 batch_filters=filters,
                 limit=self.top_k_final,
+                reasoning_policy="local_only",
             )
             payload = provider_request.to_dict()
         else:
@@ -1009,6 +1537,10 @@ class VisualQAPipeline:
             if bound_clusters is not None:
                 clusters = bound_clusters
         clusters = tuple(clusters or ())
+        state["candidate_retrieval_ms"] = round(
+            (time.perf_counter() - candidate_started) * 1_000,
+            3,
+        )
 
         prior_requested = int(state.get("requested_target_clusters", 0))
         requested_target = int(max_clusters if max_clusters is not None else self.top_k_retrieve)
@@ -1027,9 +1559,9 @@ class VisualQAPipeline:
         ]
         sessions.expand_targets(str(session_value), targets)
         request_fingerprint = self._semantic_request_fingerprint(event.strip(), question.strip())
-        provider_identities = self._provider_cache_identities(reasoner)
+        provider_identities = self._provider_cache_identities(reasoner, provider_request)
         chain_fingerprint = self._provider_fingerprint(reasoner)
-        reasoning_lease_ttl = self._reasoning_lease_ttl(reasoner)
+        reasoning_lease_ttl = self._reasoning_lease_ttl(reasoner, provider_request)
         state["requested_target_clusters"] = requested_target
         state["retrieved_clusters"] = len(clusters)
         state["retrieval_exhausted"] = len(clusters) < requested_target
@@ -1060,6 +1592,7 @@ class VisualQAPipeline:
         ) -> tuple[str, dict[str, Any], dict[str, Any] | None, str | None]:
             target_key = f"{cluster.batch_id}:{cluster.video_id}:{cluster.source_frame_idx}"
             served_started = time.perf_counter()
+            frame_prepare_ms = 0.0
             stage = "media"
             cache_layers = {
                 "candidate": candidate_cache_status,
@@ -1191,7 +1724,9 @@ class VisualQAPipeline:
                             raise RuntimeError("window work cache lease unavailable")
 
                 if reasoning is None:
+                    frame_prepare_started = time.perf_counter()
                     resolved = tuple(resolver.resolve(frame) for frame in cluster.frames)
+                    frame_prepare_ms = (time.perf_counter() - frame_prepare_started) * 1_000
                     if sum(len(image.data) for image in resolved) > self.max_inline_image_bytes:
                         raise _ImageWindowTooLargeError(
                             "QA image window exceeds aggregate inline-image limit"
@@ -1302,6 +1837,7 @@ class VisualQAPipeline:
                     provider=reasoning.get("provider"),
                     model_name=reasoning.get("model_name"),
                     prompt_version=reasoning.get("prompt_version"),
+                    frame_prepare_ms=frame_prepare_ms,
                     provider_latency_ms=reasoning.get("latency_ms"),
                     attempts=reasoning.get("attempts"),
                     cache_status=reasoning.get("cache_status"),
@@ -1323,6 +1859,7 @@ class VisualQAPipeline:
                 outcome = self._outcome(
                     cluster,
                     status,
+                    frame_prepare_ms=frame_prepare_ms,
                     served_latency_ms=(time.perf_counter() - served_started) * 1_000,
                     cache_layers=cache_layers,
                     failure_code=code,
@@ -1347,12 +1884,9 @@ class VisualQAPipeline:
                         stored_results[target_key] = result
                         failures.pop(target_key, None)
 
-        # Qwen deliberately remains resident across the five windows in one
-        # cascade batch. Release it (and its GPU lease) before another dense
-        # retrieval can start; Gemini's lazy client is safe to recreate.
-        unload_reasoner = getattr(reasoner, "unload", None)
-        if callable(unload_reasoner):
-            unload_reasoner()
+        # Provider lifetime is coordinated at the API workflow boundary.  In
+        # particular Ollama remains warm across progressive QA expansions and
+        # is explicitly released before a dense KIS/TRAKE workflow takes over.
 
         reasoned_clusters = [
             cluster

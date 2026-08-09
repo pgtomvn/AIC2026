@@ -11,7 +11,9 @@ import yaml
 
 from src import CONFIG_DIR
 from src.runtime import build_runtime
-from src.vlm.qa_reasoner import GeminiInteractionsReasoner, Qwen3VLReasoner
+from src.vlm.gemini import GeminiFlashReasoner
+from src.vlm.local_qwen import OllamaQwenReasoner
+from src.vlm.qa_router import QAReasonerRouter
 
 
 def _config(tmp_path: Path, profile: str) -> dict:
@@ -24,22 +26,24 @@ def _config(tmp_path: Path, profile: str) -> dict:
     config["data"]["qa_state_db"] = str(tmp_path / "qa.sqlite3")
     config["models"]["organizer_clip"]["enabled"] = False
     config["retrieval"]["raw_refinement"]["enabled"] = False
-    config["services"]["gemini"]["api_key"] = "fake-secret-runtime-key"
+    config["services"]["gemini_vlm"]["api_key"] = "fake-secret-runtime-key"
     return config
 
 
-def test_laptop_runtime_is_lazy_gemini_only_and_secret_safe(
-    tmp_path: Path, monkeypatch
+def test_laptop_runtime_is_lazy_local_first_and_secret_safe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     for name in tuple(os.environ):
         if name.startswith("AIC_LAUNCH_"):
             monkeypatch.delenv(name, raising=False)
     context = build_runtime(_config(tmp_path, "laptop"))
-    providers = context.qa_pipeline.reasoner.providers
+    reasoner = context.qa_pipeline.reasoner
 
-    assert len(providers) == 1
-    assert isinstance(providers[0], GeminiInteractionsReasoner)
-    assert providers[0].client_initialized is False
+    assert isinstance(reasoner, QAReasonerRouter)
+    assert isinstance(reasoner.local, OllamaQwenReasoner)
+    assert isinstance(reasoner.gemini, GeminiFlashReasoner)
+    assert reasoner.local._http is None
+    assert reasoner.gemini._client is None
     assert not (tmp_path / "jobs.sqlite3").exists()
     assert not (tmp_path / "artifacts.sqlite3").exists()
     assert not (tmp_path / "qa.sqlite3").exists()
@@ -88,13 +92,13 @@ def test_runtime_propagates_qdrant_grpc_without_connecting(tmp_path: Path) -> No
     assert context.trake_pipeline.readiness_cache_seconds == 300
 
 
-def test_accelerated_runtime_adds_unloaded_qwen_and_profile_visual(tmp_path: Path) -> None:
+def test_accelerated_runtime_keeps_same_qa_router_and_adds_visual_channel(
+    tmp_path: Path,
+) -> None:
     context = build_runtime(_config(tmp_path, "accelerated"))
-    providers = context.qa_pipeline.reasoner.providers
 
-    assert len(providers) == 2
-    assert isinstance(providers[1], Qwen3VLReasoner)
-    assert providers[1].loaded is False
+    assert isinstance(context.qa_reasoner, QAReasonerRouter)
+    assert isinstance(context.qa_reasoner.local, OllamaQwenReasoner)
     assert "accelerated_visual" in {
         channel.name for channel in context.pipeline.dense_channels
     }

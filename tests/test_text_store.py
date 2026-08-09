@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.indexing.text_store import TextStore
+from src.indexing.text_store import VIETNAMESE_STOP_WORDS, TextStore
 
 
 class IndexNotFoundError(Exception):
@@ -21,6 +21,9 @@ class FakeIndex:
         self.document_batches = []
         self.search_calls = []
         self.search_response = {"hits": []}
+        self.settings_updates = []
+        self.documents_response = {"results": []}
+        self.document_count = 0
 
     def update_searchable_attributes(self, attributes):
         self.searchable_attributes = list(attributes)
@@ -37,6 +40,17 @@ class FakeIndex:
     def search(self, query, options):
         self.search_calls.append((query, options))
         return self.search_response
+
+    def update_settings(self, settings):
+        self.settings_updates.append(dict(settings))
+        return self.client.new_task()
+
+    def get_documents(self, options):
+        self.last_document_options = dict(options)
+        return self.documents_response
+
+    def get_stats(self):
+        return {"numberOfDocuments": self.document_count}
 
 
 class FakeMeilisearchClient:
@@ -202,6 +216,67 @@ def test_search_rejects_malformed_response() -> None:
 
     with pytest.raises(RuntimeError, match="malformed"):
         store.search("query")
+
+
+def test_search_passes_an_explicit_vietnamese_locale() -> None:
+    client = FakeMeilisearchClient(exists=True)
+    store = make_store(client)
+
+    store.search("người đi xe đạp", locales=("vie",))
+
+    assert client.index.search_calls[-1][1]["locales"] == ["vie"]
+
+
+def test_shadow_v2_settings_are_versioned_and_never_touch_live_v1() -> None:
+    client = FakeMeilisearchClient(exists=True)
+    live = make_store(client)
+    live.index_name = "aic_ocr_v1"
+    with pytest.raises(ValueError, match="shadow v2"):
+        live.configure_shadow_v2("ocr")
+    assert client.index.settings_updates == []
+
+    shadow = make_store(client)
+    shadow.index_name = "aic_ocr_vi_v2"
+    shadow.configure_shadow_v2("ocr")
+    settings = client.index.settings_updates[-1]
+    assert settings["stopWords"] == list(VIETNAMESE_STOP_WORDS)
+    assert settings["localizedAttributes"][0]["locales"] == ["vie"]
+
+
+def test_metadata_shadow_has_symmetric_bilingual_synonyms() -> None:
+    client = FakeMeilisearchClient(exists=True)
+    store = make_store(client)
+    store.index_name = "aic_metadata_multilingual_v2"
+
+    store.configure_shadow_v2("metadata")
+
+    synonyms = client.index.settings_updates[-1]["synonyms"]
+    assert "police" in synonyms["cảnh sát"]
+    assert "cảnh sát" in synonyms["police"]
+    assert "ambulance" in synonyms["xe cấp cứu"]
+    assert "xe cấp cứu" in synonyms["ambulance"]
+
+
+def test_shadow_copy_count_and_document_iteration_are_bounded() -> None:
+    client = FakeMeilisearchClient(exists=True)
+    client.index.search_response = {"hits": [], "estimatedTotalHits": 2}
+    client.index.documents_response = {
+        "results": [{"id": "one"}, {"id": "two"}]
+    }
+    store = make_store(client)
+
+    client.index.document_count = 177_321
+    assert store.count_documents() == 177_321
+    assert store.count_documents('batch_id = "b1"') == 2
+    assert list(store.iter_documents(filters='batch_id = "b1"', batch_size=10)) == [
+        {"id": "one"},
+        {"id": "two"},
+    ]
+    assert client.index.last_document_options == {
+        "offset": 0,
+        "limit": 10,
+        "filter": 'batch_id = "b1"',
+    }
 
 
 def test_availability_is_scoped_and_requires_a_document() -> None:

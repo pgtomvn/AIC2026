@@ -34,16 +34,21 @@ dev = [
 ]
 competition = [
   "av>=14,<17",
+  "ctranslate2>=4.8,<5",
+  "einops>=0.8,<1",
   "faster-whisper>=1.1,<2",
   "huggingface-hub>=0.30,<1",
   "open-clip-torch>=2.32,<4",
   "paddleocr>=3,<4",
   # Paddle 3.3.x regresses CPU oneDNN/PIR inference used by PaddleOCR 3.7.
   "paddlepaddle==3.2.2",
+  "sacremoses>=0.1,<1",
   "sentencepiece>=0.2,<1",
   "torch==2.5.1",
   "torchvision==0.20.1",
-  "transformers>=4.51,<5",
+  # Florence-2's pinned remote model code is incompatible with the
+  # DynamicCache generation change in newer Transformers releases.
+  "transformers>=4.51,<4.52",
 ]
 
 [tool.setuptools.packages.find]

@@ -5,7 +5,11 @@ param(
     [string]$RuntimeProfile,
     [string]$BatchId,
     [ValidateRange(1, 65535)]
-    [int]$Port = 8501,
+    [int]$Port = 8504,
+    [ValidateRange(1, 65535)]
+    [int]$ApiPort = 8080,
+    [ValidateRange(1, 65535)]
+    [int]$OllamaPort = 11434,
     [switch]$AllowDegraded,
     [switch]$StartServices
 )
@@ -119,6 +123,38 @@ function Assert-PortAvailable {
     throw "Port $RequestedPort is already in use during $Phase. Choose another -Port; no process was stopped."
 }
 
+function Test-OllamaEndpoint {
+    param([Parameter(Mandatory = $true)][int]$RequestedPort)
+
+    try {
+        $response = Invoke-WebRequest -UseBasicParsing `
+            -Uri "http://127.0.0.1:$RequestedPort/api/tags" -TimeoutSec 2
+        if ($response.StatusCode -ne 200) { return $false }
+        $payload = $response.Content | ConvertFrom-Json
+        if ($null -eq $payload.models) { return $false }
+        $version = Invoke-WebRequest -UseBasicParsing `
+            -Uri "http://127.0.0.1:$RequestedPort/api/version" -TimeoutSec 2
+        if ($version.StatusCode -ne 200) { return $false }
+        $versionPayload = $version.Content | ConvertFrom-Json
+        return [string]$versionPayload.version -match "^[0-9]+\.[0-9]+\.[0-9]+"
+    }
+    catch { return $false }
+}
+
+function Resolve-OllamaExecutable {
+    $command = Get-Command ollama -ErrorAction SilentlyContinue
+    if ($null -ne $command) { return $command.Source }
+    $projectCandidate = Join-Path $ProjectRoot ".tools/Ollama/ollama.exe"
+    if (Test-Path -LiteralPath $projectCandidate -PathType Leaf) {
+        return $projectCandidate
+    }
+    if ($IsWindowsHost -and $env:LOCALAPPDATA) {
+        $candidate = Join-Path $env:LOCALAPPDATA "Programs/Ollama/ollama.exe"
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
+    }
+    return $null
+}
+
 function Write-OtherAicListeners {
     if (-not $IsWindowsHost) { return }
     try {
@@ -174,6 +210,10 @@ if ($LASTEXITCODE -ne 0 -or $ActualPythonVersion -ne $Stamp.python_version) {
     throw "Competition runtime interpreter does not match its stamp. Re-run bootstrap_runtime.ps1."
 }
 Assert-PortAvailable -RequestedPort $Port -Phase "initial preflight"
+if ($ApiPort -eq $Port -or $OllamaPort -in @($Port, $ApiPort)) {
+    throw "Streamlit, FastAPI, and Ollama ports must be different."
+}
+Assert-PortAvailable -RequestedPort $ApiPort -Phase "API preflight"
 
 $env:PYTHONUTF8 = "1"
 $env:AIC_PROFILE = $RuntimeProfile
@@ -181,7 +221,7 @@ $env:AIC_BATCH_ID = $BatchId
 $env:UV_PROJECT_ENVIRONMENT = $RuntimeEnvironment
 $env:PADDLE_PDX_CACHE_HOME = Join-Path $ProjectRoot ".cache/paddlex"
 $env:PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK = "True"
-$env:AIC_LAUNCH_CONTRACT = "run_app-v1"
+$env:AIC_LAUNCH_CONTRACT = "run_app-v2"
 $env:AIC_LAUNCH_ID = [guid]::NewGuid().ToString()
 $env:AIC_LAUNCH_PORT = [string]$Port
 $env:AIC_LAUNCH_BATCH = $BatchId
@@ -189,6 +229,23 @@ $env:AIC_LAUNCH_PROFILE = $RuntimeProfile
 $env:AIC_LAUNCHED_AT_UTC = [DateTime]::UtcNow.ToString("o")
 $env:AIC_LAUNCH_LOCK_SHA256 = $LockHash
 $env:AIC_RUNTIME_STAMP_SHA256 = (Get-FileHash -LiteralPath $StampPath -Algorithm SHA256).Hash.ToLowerInvariant()
+$env:AIC_API_URL = "http://127.0.0.1:$ApiPort"
+$env:OLLAMA_URL = "http://127.0.0.1:$OllamaPort"
+$env:OLLAMA_HOST = "127.0.0.1:$OllamaPort"
+$env:OLLAMA_MODELS = Join-Path $ProjectRoot "models/ollama"
+$env:OLLAMA_NO_CLOUD = "1"
+if (-not $env:OLLAMA_LLM_LIBRARY) {
+    $configuredLibrary = Get-LocalEnvValue -Name "OLLAMA_LLM_LIBRARY"
+    $env:OLLAMA_LLM_LIBRARY = if ($configuredLibrary) { $configuredLibrary } else { "vulkan" }
+}
+
+if ($IsWindowsHost) {
+    # Windows PowerShell may expose both Path and PATH, which Start-Process
+    # cannot copy into a child process. Normalize only this launcher process.
+    $processPath = [System.Environment]::GetEnvironmentVariable("Path", "Process")
+    [System.Environment]::SetEnvironmentVariable("PATH", $null, "Process")
+    [System.Environment]::SetEnvironmentVariable("Path", $processPath, "Process")
+}
 
 # Enumerating every process/listener through CIM is diagnostic-only and can take
 # several seconds on Windows.  The requested port is already checked twice with
@@ -201,6 +258,8 @@ if ($AllowDegraded) {
 }
 
 Push-Location $ProjectRoot
+$ApiProcess = $null
+$OllamaProcess = $null
 try {
     if ($StartServices) {
         if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
@@ -209,6 +268,36 @@ try {
         & docker compose --env-file .env up -d qdrant meilisearch
         if ($LASTEXITCODE -ne 0) {
             throw "docker compose failed with exit code $LASTEXITCODE."
+        }
+    }
+
+    if (-not (Test-OllamaEndpoint -RequestedPort $OllamaPort)) {
+        try {
+            Assert-PortAvailable -RequestedPort $OllamaPort -Phase "Ollama preflight"
+        }
+        catch {
+            throw "Ollama port $OllamaPort is occupied by a non-Ollama process."
+        }
+        $OllamaExecutable = Resolve-OllamaExecutable
+        if (-not $OllamaExecutable) {
+            throw "Ollama is not installed. Install the official Windows build before launch."
+        }
+        New-Item -ItemType Directory -Force -Path $env:OLLAMA_MODELS | Out-Null
+        $OllamaStart = @{
+            FilePath = $OllamaExecutable
+            ArgumentList = @("serve")
+            WorkingDirectory = $ProjectRoot
+            PassThru = $true
+        }
+        if ($IsWindowsHost) { $OllamaStart["WindowStyle"] = "Hidden" }
+        $OllamaProcess = Start-Process @OllamaStart
+        foreach ($attempt in 1..30) {
+            if ($OllamaProcess.HasExited) { break }
+            if (Test-OllamaEndpoint -RequestedPort $OllamaPort) { break }
+            Start-Sleep -Seconds 1
+        }
+        if (-not (Test-OllamaEndpoint -RequestedPort $OllamaPort)) {
+            throw "Ollama did not become healthy within 30 seconds."
         }
     }
 
@@ -235,8 +324,35 @@ try {
         throw "Runtime launch preflight is blocked. Verify the runtime and selected batch."
     }
 
-    Assert-PortAvailable -RequestedPort $Port -Phase "final launch"
-    Write-Host "Launching AIC 2026 on http://127.0.0.1:$Port (profile=$RuntimeProfile, batch=$BatchId, launch_id=$($env:AIC_LAUNCH_ID))"
+    Assert-PortAvailable -RequestedPort $ApiPort -Phase "final API launch"
+    $RunCache = Join-Path $ProjectRoot ".cache/run"
+    New-Item -ItemType Directory -Force -Path $RunCache | Out-Null
+    $ApiStdout = Join-Path $RunCache "fastapi-$ApiPort.out.log"
+    $ApiStderr = Join-Path $RunCache "fastapi-$ApiPort.err.log"
+    $ApiStart = @{
+        FilePath = $Python
+        ArgumentList = @("scripts/serve.py", "--host", "127.0.0.1", "--port", "$ApiPort")
+        WorkingDirectory = $ProjectRoot
+        PassThru = $true
+        RedirectStandardOutput = $ApiStdout
+        RedirectStandardError = $ApiStderr
+    }
+    if ($IsWindowsHost) { $ApiStart["WindowStyle"] = "Hidden" }
+    $ApiProcess = Start-Process @ApiStart
+    $ApiHealthy = $false
+    foreach ($attempt in 1..90) {
+        if ($ApiProcess.HasExited) { break }
+        try {
+            $health = Invoke-WebRequest -UseBasicParsing -Uri "$($env:AIC_API_URL)/healthz" -TimeoutSec 2
+            if ($health.StatusCode -eq 200) { $ApiHealthy = $true; break }
+        }
+        catch { }
+        Start-Sleep -Seconds 1
+    }
+    if (-not $ApiHealthy) { throw "FastAPI did not become healthy on the requested loopback port." }
+
+    Assert-PortAvailable -RequestedPort $Port -Phase "final UI launch"
+    Write-Host "Launching AIC 2026 UI on http://127.0.0.1:$Port and API on http://127.0.0.1:$ApiPort (profile=$RuntimeProfile, batch=$BatchId, launch_id=$($env:AIC_LAUNCH_ID))"
     & $Python -m streamlit run app/streamlit_app.py `
         --server.headless true `
         --server.address 127.0.0.1 `
@@ -247,5 +363,13 @@ try {
     }
 }
 finally {
+    if ($null -ne $ApiProcess -and -not $ApiProcess.HasExited) {
+        Stop-Process -Id $ApiProcess.Id -Force -ErrorAction SilentlyContinue
+        $ApiProcess.WaitForExit(10000) | Out-Null
+    }
+    if ($null -ne $OllamaProcess -and -not $OllamaProcess.HasExited) {
+        Stop-Process -Id $OllamaProcess.Id -Force -ErrorAction SilentlyContinue
+        $OllamaProcess.WaitForExit(10000) | Out-Null
+    }
     Pop-Location
 }

@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from inspect import Parameter, signature
 from typing import Any
 
 import numpy as np
 
 from src.embedding.text_chunks import encode_query_mean
+from src.query.translator import QueryProcessing, QueryTextAdapter, QueryVariant
 from src.retrieval.fusion import (
     ChannelRanking,
     aggregate_temporal_windows,
@@ -79,6 +82,7 @@ class TextualKISPipeline:
         early_cutoff: int = 20,
         early_per_video: int = 2,
         late_per_video: int = 5,
+        query_adapter: QueryTextAdapter | None = None,
     ) -> None:
         if not 1 <= top_k <= 100:
             raise ValueError("top_k must be between 1 and 100")
@@ -106,6 +110,7 @@ class TextualKISPipeline:
         self.early_cutoff = early_cutoff
         self.early_per_video = early_per_video
         self.late_per_video = late_per_video
+        self.query_adapter = query_adapter or QueryTextAdapter()
 
         configured_dense = list(dense_channels or ())
         configured_lexical = list(lexical_channels or ())
@@ -119,6 +124,7 @@ class TextualKISPipeline:
         self.lexical_channels = tuple(configured_lexical)
         self.last_channel_errors: dict[str, str] = {}
         self.last_channel_statuses: dict[str, dict[str, Any]] = {}
+        self.last_query_processing: dict[str, Any] = {}
 
     @property
     def fingerprint(self) -> str:
@@ -154,6 +160,7 @@ class TextualKISPipeline:
             },
             "dense": [channel_value(channel) for channel in self.dense_channels],
             "lexical": [channel_value(channel) for channel in self.lexical_channels],
+            "query_adapter": self.query_adapter.fingerprint,
         }
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
@@ -275,12 +282,15 @@ class TextualKISPipeline:
         request: str | Mapping[str, Any] | Any,
         *,
         query_vectors: Mapping[str, np.ndarray] | None = None,
+        processing: QueryProcessing | None = None,
     ) -> list[ChannelRanking]:
         vector_filter, lexical_filter = self._batch_filters(request)
         rankings: list[ChannelRanking] = []
         self.last_channel_errors = {}
         self.last_channel_statuses = {}
+        processing = processing or self._prepare_query(request, plan)
         for channel in self.dense_channels:
+            channel_started = time.monotonic()
             try:
                 is_available = getattr(channel.store, "is_available", None)
                 if callable(is_available) and not is_available(vector_filter):
@@ -292,41 +302,58 @@ class TextualKISPipeline:
                 diagnostics: dict[str, Any] = {}
                 if query_vectors and channel.name in query_vectors:
                     vectors = np.asarray(query_vectors[channel.name], dtype=np.float32)
+                    variant_vectors = (("feedback", vectors),)
                 else:
-                    diagnostic_encoder = getattr(
-                        channel.encoder,
-                        "encode_text_with_diagnostics",
-                        None,
-                    )
-                    if callable(diagnostic_encoder):
-                        encoded, diagnostic_value = diagnostic_encoder(plan.original_text)
-                        vectors = np.asarray(encoded, dtype=np.float32)
-                        to_dict = getattr(diagnostic_value, "to_dict", None)
-                        if callable(to_dict):
-                            diagnostics = dict(to_dict())
-                    else:
-                        vectors = np.asarray(
-                            channel.encoder.encode_text(plan.original_text),
-                            dtype=np.float32,
+                    variants = self.query_adapter.dense_variants(channel.name, processing)
+                    if not variants:
+                        self.last_channel_statuses[channel.name] = {
+                            "state": "degraded",
+                            "reason_code": "translation_unavailable",
+                            "translation_applied": False,
+                        }
+                        continue
+                    encoded_variants: list[tuple[str, np.ndarray]] = []
+                    variant_diagnostics: list[dict[str, Any]] = []
+                    for variant in variants:
+                        diagnostic_encoder = getattr(
+                            channel.encoder,
+                            "encode_text_with_diagnostics",
+                            None,
                         )
-                if vectors.ndim == 1:
-                    vectors = vectors[None, :]
-                if vectors.ndim != 2 or vectors.shape[0] < 1:
-                    raise ValueError("query encoder must return a non-empty vector matrix")
+                        if callable(diagnostic_encoder):
+                            encoded, diagnostic_value = diagnostic_encoder(variant.text)
+                            to_dict = getattr(diagnostic_value, "to_dict", None)
+                            if callable(to_dict):
+                                variant_diagnostics.append(dict(to_dict()))
+                        else:
+                            encoded = channel.encoder.encode_text(variant.text)
+                        encoded_variants.append(
+                            (variant.name, np.asarray(encoded, dtype=np.float32))
+                        )
+                    variant_vectors = tuple(encoded_variants)
+                    if variant_diagnostics:
+                        diagnostics = dict(variant_diagnostics[0])
+                        diagnostics["query_variant_count"] = len(variants)
+                        diagnostics["translation_applied"] = processing.translation.translation_applied
                 chunk_rankings: list[ChannelRanking] = []
-                for index, vector in enumerate(vectors):
-                    results = channel.store.search(
-                        self._normalized_vector(vector),
-                        top_k=channel.depth,
-                        filters=vector_filter,
-                    )
-                    chunk_rankings.append(
-                        ChannelRanking(
-                            f"{channel.name}:query_chunk_{index + 1}",
-                            self._resolve_results(results),
-                            1.0,
+                for variant_name, vectors in variant_vectors:
+                    if vectors.ndim == 1:
+                        vectors = vectors[None, :]
+                    if vectors.ndim != 2 or vectors.shape[0] < 1:
+                        raise ValueError("query encoder must return a non-empty vector matrix")
+                    for index, vector in enumerate(vectors):
+                        results = channel.store.search(
+                            self._normalized_vector(vector),
+                            top_k=channel.depth,
+                            filters=vector_filter,
                         )
-                    )
+                        chunk_rankings.append(
+                            ChannelRanking(
+                                f"{channel.name}:{variant_name}:query_chunk_{index + 1}",
+                                self._resolve_results(results),
+                                1.0,
+                            )
+                        )
                 results = (
                     list(chunk_rankings[0].results)
                     if len(chunk_rankings) == 1
@@ -342,6 +369,11 @@ class TextualKISPipeline:
                 self.last_channel_statuses[channel.name] = {
                     "state": "ready",
                     "reason_code": "query_completed",
+                    "result_count": len(results),
+                    "latency_ms": round(
+                        (time.monotonic() - channel_started) * 1_000,
+                        3,
+                    ),
                     **diagnostics,
                 }
             except Exception as error:  # isolate optional model/service channels
@@ -349,6 +381,7 @@ class TextualKISPipeline:
                 self.last_channel_statuses[channel.name] = self._failure_status(error)
 
         for channel in self.lexical_channels:
+            channel_started = time.monotonic()
             try:
                 is_available = getattr(channel.store, "is_available", None)
                 if callable(is_available) and not is_available(lexical_filter):
@@ -357,12 +390,42 @@ class TextualKISPipeline:
                         "reason_code": "no_compatible_documents",
                     }
                     continue
-                # Quoted on-screen text remains part of the original query and
-                # therefore naturally benefits exactness in Meilisearch.
-                results = channel.store.search(
-                    plan.normalized_text,
-                    top_k=channel.depth,
-                    filters=lexical_filter,
+                variants = self.query_adapter.lexical_variants(channel.name, processing)
+                variant_rankings: list[ChannelRanking] = []
+                for variant in variants:
+                    results = self._search_lexical(
+                        channel.store,
+                        variant,
+                        top_k=channel.depth,
+                        filters=lexical_filter,
+                    )
+                    if (
+                        not results
+                        and variant.name == "original"
+                        and processing.translation.detected_language == "vi"
+                        and processing.translation.accent_folded_text != variant.text.casefold()
+                    ):
+                        results = self._search_lexical(
+                            channel.store,
+                            QueryVariant(
+                                "accent_folded",
+                                processing.translation.accent_folded_text,
+                                "vie",
+                            ),
+                            top_k=channel.depth,
+                            filters=lexical_filter,
+                        )
+                    variant_rankings.append(
+                        ChannelRanking(
+                            f"{channel.name}:{variant.name}",
+                            self._resolve_results(results),
+                            1.0,
+                        )
+                    )
+                results = (
+                    list(variant_rankings[0].results)
+                    if len(variant_rankings) == 1
+                    else weighted_rrf(variant_rankings, k=self.rrf_k)
                 )
                 rankings.append(
                     ChannelRanking(
@@ -374,11 +437,63 @@ class TextualKISPipeline:
                 self.last_channel_statuses[channel.name] = {
                     "state": "ready",
                     "reason_code": "query_completed",
+                    "query_variant_count": len(variants),
+                    "translation_applied": processing.translation.translation_applied,
+                    "result_count": len(results),
+                    "latency_ms": round(
+                        (time.monotonic() - channel_started) * 1_000,
+                        3,
+                    ),
                 }
             except Exception as error:
                 self.last_channel_errors[channel.name] = str(error)
                 self.last_channel_statuses[channel.name] = self._failure_status(error)
         return rankings
+
+    @staticmethod
+    def _request_value(request: str | Mapping[str, Any] | Any, name: str) -> Any:
+        if isinstance(request, str):
+            return None
+        return request.get(name) if isinstance(request, Mapping) else getattr(request, name, None)
+
+    def _prepare_query(
+        self,
+        request: str | Mapping[str, Any] | Any,
+        plan: QueryPlan,
+    ) -> QueryProcessing:
+        language = self._request_value(request, "query_language") or "auto"
+        override = self._request_value(request, "english_text_override")
+        if override is None:
+            override = self._request_value(request, "event_description_en")
+        processing = self.query_adapter.prepare(
+            plan.original_text,
+            language_hint=str(language),
+            english_override=override if isinstance(override, str) else None,
+        )
+        self.last_query_processing = processing.to_dict()
+        return processing
+
+    @staticmethod
+    def _search_lexical(
+        store: Any,
+        variant: QueryVariant,
+        *,
+        top_k: int,
+        filters: str | None,
+    ) -> list[dict[str, Any]]:
+        try:
+            parameters = tuple(signature(store.search).parameters.values())
+            supports_kwargs = any(
+                value.kind is Parameter.VAR_KEYWORD for value in parameters
+            )
+            names = {value.name for value in parameters}
+        except (TypeError, ValueError):
+            supports_kwargs = False
+            names = set()
+        kwargs: dict[str, Any] = {"top_k": top_k, "filters": filters}
+        if variant.locale and (supports_kwargs or "locales" in names):
+            kwargs["locales"] = (variant.locale,)
+        return store.search(variant.text, **kwargs)
 
     def search(
         self,
@@ -394,7 +509,13 @@ class TextualKISPipeline:
         if not 1 <= requested_limit <= 100:
             raise ValueError("limit must be between 1 and 100")
         plan = self._plan(query)
-        rankings = self._collect_rankings(plan, query, query_vectors=query_vectors)
+        processing = self._prepare_query(query, plan)
+        rankings = self._collect_rankings(
+            plan,
+            query,
+            query_vectors=query_vectors,
+            processing=processing,
+        )
         fused = weighted_rrf(rankings, k=self.rrf_k)
         if self.reranker is not None and fused:
             fused = self.reranker.rerank(plan.original_text, fused, top_k=len(fused))
@@ -412,7 +533,19 @@ class TextualKISPipeline:
 
         if refine_raw and self.raw_refiner is not None and fused:
             coarse_keys = {canonical_key(item) for item in fused[:20]}
-            refined = self.raw_refiner(plan, fused[:20])
+            try:
+                raw_parameters = signature(self.raw_refiner).parameters.values()
+                raw_kwargs = any(value.kind is Parameter.VAR_KEYWORD for value in raw_parameters)
+                raw_names = {value.name for value in raw_parameters}
+            except (TypeError, ValueError):
+                raw_kwargs, raw_names = False, set()
+            visual_texts = tuple(
+                value.text for value in self.query_adapter.dense_variants("visual", processing)
+            )
+            if raw_kwargs or "query_texts" in raw_names:
+                refined = self.raw_refiner(plan, fused[:20], query_texts=visual_texts)
+            else:
+                refined = self.raw_refiner(plan, fused[:20])
             refined_keys = {canonical_key(item) for item in refined}
             replaced_keys = coarse_keys | refined_keys
             fused = list(refined) + [
@@ -446,6 +579,7 @@ class TextualKISPipeline:
         if not self.dense_channels:
             raise RuntimeError("relevance feedback requires a dense channel")
         plan = self._plan(query)
+        processing = self._prepare_query(query, plan)
         errors: dict[str, str] = {}
         for channel in self.dense_channels:
             try:
@@ -459,7 +593,13 @@ class TextualKISPipeline:
                     if negative_ids
                     else None
                 )
-                original = encode_query_mean(channel.encoder, plan.original_text)
+                variants = self.query_adapter.dense_variants(channel.name, processing)
+                if not variants:
+                    raise RuntimeError("translation is unavailable for this dense channel")
+                originals = np.stack(
+                    [encode_query_mean(channel.encoder, value.text) for value in variants]
+                )
+                original = self._normalized_vector(originals.mean(axis=0))
                 updated = alpha * original
                 if positive is not None:
                     updated += beta * positive.mean(axis=0)

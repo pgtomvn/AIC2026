@@ -1,0 +1,201 @@
+"""Offline tests for the Streamlit-to-FastAPI thin client boundary."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from app.http_backend import BackendError, build_http_runtime
+from src.contracts import QACompetitionSpec, QAQueryRequest, QueryRequest
+
+
+class _Response:
+    def __init__(self, payload: Any, status_code: int = 200) -> None:
+        self.payload = payload
+        self.status_code = status_code
+        self.content = b"image"
+
+    def json(self) -> Any:
+        return self.payload
+
+
+class _HTTP:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, dict[str, Any]]] = []
+
+    def request(self, method: str, url: str, **kwargs: Any) -> _Response:
+        self.calls.append((method, url, kwargs))
+        if url.endswith("/v1/runtime/capabilities"):
+            return _Response(
+                {
+                    "profile": "laptop",
+                    "default_batch_id": "b1",
+                    "qa": {
+                        "local": {"status": {"state": "ready"}},
+                        "cloud": {"status": {"state": "blocked_asset"}},
+                    },
+                }
+            )
+        if url.endswith("/v1/runtime/warmup"):
+            return _Response(
+                {
+                    "state": "evicted",
+                    "search_usable": False,
+                    "workflows": {"trake": {"state": "ready", "usable": True}},
+                }
+            )
+        if url.endswith("/v1/runtime/warmup/start"):
+            return _Response({"state": "warming", "search_usable": False})
+        if url.endswith("/v1/readiness"):
+            return _Response(
+                {
+                    "kis": {"state": "ready"},
+                    "qa": {"state": "ready"},
+                    "warmup": {"workflows": {"trake": {"state": "ready", "usable": True}}},
+                }
+            )
+        if url.endswith("/v1/kis/search") or url.endswith("/v1/kis/refine"):
+            return _Response(
+                {
+                    "hits": [{"video_id": "L21_V001", "source_frame_idx": 10}],
+                    "channel_statuses": {"organizer_clip": {"state": "ready"}},
+                }
+            )
+        if url.endswith("/v1/frames/validate"):
+            return _Response(
+                {
+                    "batch_active": True,
+                    "existing": [{"video_id": "L21_V001", "source_frame_idx": 10}],
+                    "ordinal_mappings": {},
+                    "timestamps_ms": {"L21_V001:10": 1_000},
+                }
+            )
+        raise AssertionError(f"unexpected request: {method} {url}")
+
+
+def test_thin_client_preserves_fastapi_as_the_only_runtime_owner() -> None:
+    source = Path("app/streamlit_app.py").read_text(encoding="utf-8")
+    assert "from src.runtime import build_runtime" not in source
+    assert "build_http_runtime(" in source
+
+
+def test_kis_adapter_serializes_feedback_ids_without_unknown_fields() -> None:
+    http = _HTTP()
+    context = build_http_runtime("http://127.0.0.1:8080", http=http)
+    request = QueryRequest(
+        query_id="q1",
+        original_text="một người đi bộ",
+        batch_filters=("b1",),
+    )
+
+    context.pipeline.search(request, limit=20, refine_raw=True)
+    context.pipeline.refine(
+        request,
+        positive_ids=(("L21_V001", 10),),
+        negative_ids=(("L21_V002", 20),),
+        limit=20,
+    )
+
+    search_payload = http.calls[1][2]["json"]
+    refine_payload = http.calls[2][2]["json"]
+    assert "refine_raw" not in search_payload
+    assert refine_payload["positive_feedback_ids"] == ["L21_V001:10"]
+    assert refine_payload["negative_feedback_ids"] == ["L21_V002:20"]
+    assert context.pipeline.last_channel_statuses["organizer_clip"]["state"] == "ready"
+
+
+def test_repository_uses_bounded_validation_api_for_export_membership() -> None:
+    http = _HTTP()
+    context = build_http_runtime("http://127.0.0.1:8080", http=http)
+
+    existing = context.artifact_repository.existing_source_frames("b1", (("L21_V001", 10),))
+    record = context.artifact_repository.get_source_frame("b1", "L21_V001", 10)
+
+    assert existing == {("L21_V001", 10)}
+    assert record is not None and record.timestamp_ms == 1_000
+    validation_calls = [call for call in http.calls if call[1].endswith("/v1/frames/validate")]
+    assert len(validation_calls) == 2
+
+
+def test_thin_client_warmup_poll_is_read_only_while_qwen_is_resident() -> None:
+    http = _HTTP()
+    context = build_http_runtime("http://127.0.0.1:8080", http=http)
+
+    snapshot = context.warmup.snapshot()
+
+    assert snapshot["state"] == "evicted"
+    assert http.calls[-1][0:2] == (
+        "GET",
+        "http://127.0.0.1:8080/v1/runtime/warmup",
+    )
+    assert not any(call[1].endswith("/v1/runtime/warmup/start") for call in http.calls)
+
+
+class _RecoverableQAHTTP(_HTTP):
+    def request(self, method: str, url: str, **kwargs: Any) -> _Response:
+        if url.endswith("/v1/qa/retrieve") and method == "POST":
+            self.calls.append((method, url, kwargs))
+            return _Response(
+                {
+                    "detail": {
+                        "code": "qa_reasoning_unavailable",
+                        "search_id": "server-search-id",
+                        "recoverable": True,
+                        "status": "failed",
+                        "failed_clusters": 1,
+                        "target_clusters": 1,
+                    }
+                },
+                503,
+            )
+        if url.endswith("/v1/qa/search/server-search-id") and method == "GET":
+            self.calls.append((method, url, kwargs))
+            return _Response(
+                {
+                    "search_id": "server-search-id",
+                    "status": "failed",
+                    "predictions": [],
+                    "window_outcomes": [{"window_id": "w1", "status": "provider_failed"}],
+                    "candidate_windows": [{"window_id": "w1", "status": "pending"}],
+                }
+            )
+        return super().request(method, url, **kwargs)
+
+
+def test_recoverable_503_keeps_authoritative_search_id_and_restores_snapshot() -> None:
+    http = _RecoverableQAHTTP()
+    context = build_http_runtime("http://127.0.0.1:8080", http=http)
+    request = QAQueryRequest(
+        query_id="correlation-only",
+        event_description="A man is broadcasting TV news.",
+        question="Does the man wear glasses?",
+        answer_spec_id=QACompetitionSpec.conservative_general_text().spec_id,
+        batch_filters=("b1",),
+        reasoning_policy="local_only",
+    )
+
+    with pytest.raises(BackendError) as captured:
+        context.qa_pipeline.search(request)
+
+    error = captured.value
+    assert error.status_code == 503
+    assert error.search_id == "server-search-id"
+    assert error.recoverable is True
+    assert error.snapshot is not None
+    assert error.snapshot["session_id"] == "server-search-id"
+    assert context.qa_pipeline.last_snapshot == error.snapshot
+    assert not any("correlation-only/expand" in call[1] for call in http.calls)
+
+
+def test_thin_client_refreshes_capabilities_and_uses_warmup_trake_readiness() -> None:
+    http = _HTTP()
+    context = build_http_runtime("http://127.0.0.1:8080", http=http)
+    report = context.readiness_service.check("b1")
+
+    capabilities = context.refresh_capabilities()
+    trake = context.readiness_service.workflow_readiness(report, "trake")
+
+    assert capabilities["qa"]["local"]["status"]["state"] == "ready"
+    assert trake.to_dict() == {"state": "ready", "usable": True}

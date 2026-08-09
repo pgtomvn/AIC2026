@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import math
 from collections import defaultdict, deque
 from collections.abc import Mapping, Sequence
 from typing import Any, Protocol
 
-from src.contracts import FrameRecord, QACandidateWindow
+from src.contracts import FrameRecord, QACandidateFrame, QACandidateWindow
 from src.retrieval.fusion import canonical_key
 
 
@@ -68,6 +69,25 @@ def _round_robin_by_video(
     return output
 
 
+def _preferred_dense_score(item: Mapping[str, Any], batch_id: str) -> float | None:
+    """Return a raw score from the one dense space compatible with the batch."""
+
+    evidence = item.get("evidence", ())
+    if isinstance(evidence, Mapping):
+        evidence = evidence.get("items", ())
+    if not isinstance(evidence, (list, tuple)):
+        return None
+    preferred = "organizer_clip" if "reference" in batch_id.casefold() else "visual"
+    for value in evidence:
+        if not isinstance(value, Mapping) or value.get("channel") != preferred:
+            continue
+        score = value.get("raw_score")
+        if isinstance(score, (int, float)) and not isinstance(score, bool):
+            result = float(score)
+            return result if math.isfinite(result) else None
+    return None
+
+
 class VisualQARetriever:
     """Reuse Textual KIS retrieval, then build diverse pseudo-shot windows."""
 
@@ -98,6 +118,91 @@ class VisualQARetriever:
         self.frames_per_cluster = frames_per_cluster
         self.pseudo_shot_separation_ms = pseudo_shot_separation_ms
 
+    def retrieve_frames(
+        self,
+        event_description: str,
+        *,
+        batch_filters: Sequence[str] = (),
+        top_k: int = 5,
+        query_language: str = "auto",
+        event_description_en: str | None = None,
+    ) -> tuple[QACandidateFrame, ...]:
+        """Return canonical KIS hits without resolving media or invoking a VLM."""
+
+        if not isinstance(event_description, str) or not event_description.strip():
+            raise ValueError("event_description must be a non-empty string")
+        if isinstance(top_k, bool) or not isinstance(top_k, int) or not 1 <= top_k <= 20:
+            raise ValueError("top_k must be between 1 and 20")
+        filters = tuple(str(value) for value in batch_filters)
+        hits = self.textual_pipeline.search(
+            {
+                "original_text": event_description,
+                "batch_filters": filters,
+                "query_language": query_language,
+                "event_description_en": event_description_en,
+            },
+            limit=max(top_k, min(self.retrieval_depth, 100)),
+            refine_raw=False,
+        )
+        candidates: list[QACandidateFrame] = []
+        seen: set[tuple[str, str, int]] = set()
+        for hit in hits:
+            if not isinstance(hit, Mapping):
+                continue
+            try:
+                video_id, source_frame_idx = canonical_key(hit)
+                batch_id = self._batch_id(hit, filters)
+            except (KeyError, TypeError, ValueError):
+                continue
+            identity = (batch_id, video_id, source_frame_idx)
+            if identity in seen:
+                continue
+            frame = self.frame_repository.get_frame(batch_id, video_id, source_frame_idx)
+            if frame is None:
+                continue
+            raw_ranks = hit.get("channel_ranks", {})
+            channel_ranks = (
+                {
+                    str(name): int(rank)
+                    for name, rank in raw_ranks.items()
+                    if isinstance(name, str)
+                    and isinstance(rank, int)
+                    and not isinstance(rank, bool)
+                    and rank >= 1
+                }
+                if isinstance(raw_ranks, Mapping)
+                else {}
+            )
+            raw_score = hit.get("fused_score", hit.get("score", 0.0))
+            score = (
+                float(raw_score)
+                if isinstance(raw_score, (int, float))
+                and not isinstance(raw_score, bool)
+                and math.isfinite(float(raw_score))
+                else 0.0
+            )
+            candidates.append(
+                QACandidateFrame(
+                    candidate_id=f"{batch_id}:{video_id}:{source_frame_idx}",
+                    retrieval_rank=len(candidates) + 1,
+                    retrieval_score=score,
+                    batch_id=batch_id,
+                    video_id=video_id,
+                    source_frame_idx=source_frame_idx,
+                    timestamp_ms=frame.timestamp_ms,
+                    shot_id=str(frame.shot_id or f"reference:{source_frame_idx}"),
+                    channel_ranks=channel_ranks,
+                    # Freeze only safe, channel-level provenance. Raw KIS
+                    # evidence can contain backend payloads or media URIs and
+                    # must never cross the QA session trust boundary.
+                    evidence={"retrieval_channels": sorted(channel_ranks)},
+                )
+            )
+            seen.add(identity)
+            if len(candidates) >= top_k:
+                break
+        return tuple(candidates)
+
     @staticmethod
     def _batch_id(item: Mapping[str, Any], batch_filters: tuple[str, ...]) -> str:
         batch_id = _value(item, "batch_id")
@@ -127,6 +232,19 @@ class VisualQARetriever:
             limit=self.retrieval_depth,
             refine_raw=False,
         )
+        dense_scores: dict[tuple[str, str, int], float] = {}
+        for hit in hits:
+            if not isinstance(hit, Mapping):
+                continue
+            try:
+                video_id, source_frame_idx = canonical_key(hit)
+                batch_id = self._batch_id(hit, filters)
+            except (KeyError, TypeError, ValueError):
+                continue
+            score = _preferred_dense_score(hit, batch_id)
+            if score is not None:
+                identity = (batch_id, video_id, source_frame_idx)
+                dense_scores[identity] = max(score, dense_scores.get(identity, -math.inf))
         unique: list[tuple[int, Mapping[str, Any]]] = []
         seen_frames: set[tuple[str, int]] = set()
         retained_pseudo_times: dict[str, list[int]] = defaultdict(list)
@@ -186,21 +304,31 @@ class VisualQARetriever:
                 ),
             )
             seed_is_real_shot = bool(seed.shot_id) and not seed.shot_id.startswith("reference:")
-            if seed_is_real_shot:
-                same_shot = [frame for frame in nearest if frame.shot_id == seed.shot_id]
-                if len(same_shot) >= 3:
-                    selected_frames = same_shot[: self.frames_per_cluster]
-                else:
-                    selected_frames = list(same_shot)
-                    selected_keys = {frame.source_frame_idx for frame in selected_frames}
-                    selected_frames.extend(
-                        frame
-                        for frame in nearest
-                        if frame.source_frame_idx not in selected_keys
-                    )
-                    selected_frames = selected_frames[:3]
-            else:
-                selected_frames = nearest[: self.frames_per_cluster]
+            same_shot = (
+                [frame for frame in nearest if frame.shot_id == seed.shot_id]
+                if seed_is_real_shot
+                else nearest
+            )
+            pool = same_shot if len(same_shot) >= 3 else nearest
+            remaining = [frame for frame in pool if frame.source_frame_idx != seed.source_frame_idx]
+
+            def frame_priority(frame: FrameRecord) -> tuple[bool, float, int, int, int]:
+                score = dense_scores.get((batch_id, video_id, frame.source_frame_idx))
+                return (
+                    score is None,
+                    -(score if score is not None else 0.0),
+                    abs(frame.timestamp_ms - timestamp_ms),
+                    frame.timestamp_ms,
+                    frame.source_frame_idx,
+                )
+
+            selected_frames = [seed, *sorted(remaining, key=frame_priority)[: self.frames_per_cluster - 1]]
+            if len(selected_frames) < 3:
+                selected_keys = {frame.source_frame_idx for frame in selected_frames}
+                selected_frames.extend(
+                    frame for frame in nearest if frame.source_frame_idx not in selected_keys
+                )
+                selected_frames = selected_frames[:3]
             frames = tuple(
                 sorted(
                     selected_frames,
@@ -221,6 +349,16 @@ class VisualQARetriever:
                     timestamp_ms=timestamp_ms,
                     shot_id=shot_id,
                     frames=frames,
+                    frame_selection_scores={
+                        frame.source_frame_idx: score
+                        for frame in frames
+                        if (
+                            score := dense_scores.get(
+                                (batch_id, video_id, frame.source_frame_idx)
+                            )
+                        )
+                        is not None
+                    },
                 )
             )
             if len(clusters) >= requested:

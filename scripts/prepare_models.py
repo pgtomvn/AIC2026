@@ -23,7 +23,17 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--only",
-        choices=("visual", "organizer", "accelerated", "text", "asr", "ocr", "qwen"),
+        choices=(
+            "visual",
+            "organizer",
+            "accelerated",
+            "text",
+            "asr",
+            "ocr",
+            "qwen",
+            "florence",
+            "translation",
+        ),
         action="append",
         help="Prepare selected assets; repeat as needed (default: all)",
     )
@@ -43,6 +53,8 @@ def main(argv: list[str] | None = None) -> int:
         selected = set(args.only)
     else:
         selected = {"visual", "text", "asr", "ocr"}
+        if models.get("query_translation", {}).get("enabled", False):
+            selected.add("translation")
         if models.get("organizer_clip", {}).get("enabled", False):
             selected.add("organizer")
         accelerated = models.get("accelerated_visual", {})
@@ -53,11 +65,6 @@ def main(argv: list[str] | None = None) -> int:
             not accelerated_profiles or config.get("profile") in accelerated_profiles
         ):
             selected.add("accelerated")
-        qwen = models.get("qwen_vl", {})
-        if qwen.get("enabled", False) and config.get("profile") in qwen.get(
-            "enabled_profiles", ()
-        ):
-            selected.add("qwen")
     frozen_paths: set[Path] = set()
     if "visual" in selected:
         visual = models["visual"]
@@ -168,33 +175,99 @@ def main(argv: list[str] | None = None) -> int:
             device="cpu",
         )
         frozen_paths.add(cache)
-    if "qwen" in selected:
-        qwen = models["qwen_vl"]
-        cache = _path(qwen["cache_dir"])
+    if "florence" in selected:
+        florence = models["florence2"]
+        local_path = _path(florence["model_path"])
         snapshot_download(
-            repo_id=qwen["model_name"],
-            revision=qwen["revision"],
-            cache_dir=cache,
+            repo_id=florence["model_name"],
+            revision=florence["revision"],
+            local_dir=local_path,
             max_workers=1,
             allow_patterns=(
-                "added_tokens.json",
-                "chat_template.json",
-                "chat_template.jinja",
                 "config.json",
-                "generation_config.json",
-                "merges.txt",
-                "model-*.safetensors",
-                "model.safetensors.index.json",
+                "configuration_florence2.py",
+                "model.safetensors",
+                "modeling_florence2.py",
                 "preprocessor_config.json",
-                "processor_config.json",
-                "special_tokens_map.json",
+                "processing_florence2.py",
                 "tokenizer.json",
                 "tokenizer_config.json",
-                "video_preprocessor_config.json",
+            ),
+        )
+        frozen_paths.add(local_path)
+    if "translation" in selected:
+        translation = models["query_translation"]
+        source_path = _path(translation["source_path"])
+        converted_path = _path(translation["converted_path"])
+        snapshot_download(
+            repo_id=translation["model_name"],
+            revision=translation["revision"],
+            local_dir=source_path,
+            max_workers=1,
+            allow_patterns=(
+                "config.json",
+                "generation_config.json",
+                "pytorch_model.bin",
+                "model.safetensors",
+                "source.spm",
+                "target.spm",
+                "tokenizer_config.json",
                 "vocab.json",
             ),
         )
-        frozen_paths.add(cache)
+        try:
+            from ctranslate2.converters import TransformersConverter
+        except ImportError as error:
+            raise RuntimeError(
+                "CTranslate2 is missing from the competition dependency group"
+            ) from error
+        class _PinnedTransformersConverter(TransformersConverter):
+            """Bridge CTranslate2 4.8's new dtype keyword to Transformers 4.51."""
+
+            def load_model(self, model_class, model_name_or_path, **kwargs):
+                dtype = kwargs.pop("dtype", None)
+                if dtype is not None:
+                    kwargs["torch_dtype"] = dtype
+                return model_class.from_pretrained(model_name_or_path, **kwargs)
+
+        converter = _PinnedTransformersConverter(
+            str(source_path),
+            copy_files=("source.spm", "target.spm", "tokenizer_config.json", "vocab.json"),
+        )
+        converter.convert(
+            str(converted_path),
+            quantization=str(translation.get("compute_type", "int8")),
+            force=True,
+        )
+        translation_manifest = _path(
+            translation.get(
+                "asset_manifest",
+                "checksums/query-translation.sha256",
+            )
+        )
+        freeze_assets(
+            (source_path, converted_path),
+            root=PROJECT_ROOT,
+            destination=translation_manifest,
+        )
+        frozen_paths.update((source_path, converted_path))
+    # A targeted ``--only`` run must extend the immutable manifest rather
+    # than dropping checksums for already prepared runtime assets.
+    if args.manifest.is_file():
+        for raw_line in args.manifest.read_text(encoding="utf-8-sig").splitlines():
+            parts = raw_line.strip().split("  ", 1)
+            if len(parts) != 2:
+                continue
+            relative = Path(parts[1])
+            if relative.is_absolute() or ".." in relative.parts:
+                continue
+            existing = (PROJECT_ROOT / relative).resolve()
+            try:
+                existing.relative_to(PROJECT_ROOT.resolve())
+            except ValueError:
+                continue
+            if existing.is_file():
+                frozen_paths.add(existing)
     count = freeze_assets(frozen_paths, root=PROJECT_ROOT, destination=args.manifest)
     print(f"Prepared {', '.join(sorted(selected))}; froze {count} files")
     return 0

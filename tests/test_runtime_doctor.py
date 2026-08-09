@@ -151,13 +151,15 @@ def test_launcher_contract_propagates_identity_and_never_kills_or_switches_ports
         "AIC_RUNTIME_STAMP_SHA256",
     ):
         assert f"$env:{name}" in source
-    assert source.count("Assert-PortAvailable -RequestedPort") == 2
+    assert source.count("Assert-PortAvailable -RequestedPort") == 5
     assert '"--startup-only"' in source
     assert '"--compact"' in source
     assert '"--wait-seconds", "60"' in source
     assert "if ($StartServices)" in source
     assert "Write-OtherAicListeners" in source
-    assert "Stop-Process" not in source
+    assert source.count("Stop-Process") == 2
+    assert "Stop-Process -Id $ApiProcess.Id" in source
+    assert "Stop-Process -Id $OllamaProcess.Id" in source
     assert '[string]$RuntimeProfile = "laptop"' not in source
     assert '[string]$BatchId = "aic25-b1-reference"' not in source
     assert '$PSBoundParameters.ContainsKey("RuntimeProfile")' in source
@@ -182,12 +184,11 @@ def test_streamlit_runtime_check_scans_logs_for_forbidden_diagnostics() -> None:
     assert "Competition Streamlit runtime logs contain no forbidden" in source
 
 
-def test_live_gemini_readiness_uses_exactly_one_provider_call_gate() -> None:
+def test_local_vlm_readiness_runs_explicit_cold_and_warm_checks() -> None:
     root = Path(__file__).resolve().parents[1]
     doctor_source = (root / "scripts" / "runtime_doctor.py").read_text(encoding="utf-8")
-    checker_source = (root / "scripts" / "check_gemini.py").read_text(encoding="utf-8")
+    checker_source = (root / "scripts" / "check_vlm_offline.py").read_text(encoding="utf-8")
 
-    assert "check_five_image_once" in doctor_source
-    assert "max_attempts=1" in checker_source
-    function = checker_source.split("def check_five_image_once", 1)[1]
-    assert function.count("reasoner.reason(") == 1
+    assert "--live-local-vlm" in doctor_source
+    assert 'for phase in ("cold", "warm")' in checker_source
+    assert checker_source.count("reasoner.reason(") == 1

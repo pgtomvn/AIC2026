@@ -180,7 +180,7 @@ def test_launch_identity_is_canonical_only_for_complete_matching_metadata() -> N
         "runtime": {"default_batch_id": "b2"},
     }
     environment = {
-        "AIC_LAUNCH_CONTRACT": "run_app-v1",
+        "AIC_LAUNCH_CONTRACT": "run_app-v2",
         "AIC_LAUNCH_ID": "08b8fdc7-2a15-49d3-887c-884299e42473",
         "AIC_LAUNCH_PORT": "8504",
         "AIC_LAUNCH_BATCH": "b2",
@@ -188,7 +188,7 @@ def test_launch_identity_is_canonical_only_for_complete_matching_metadata() -> N
         "AIC_LAUNCHED_AT_UTC": "2026-08-02T05:00:00Z",
         "AIC_LAUNCH_LOCK_SHA256": "b" * 64,
         "AIC_RUNTIME_STAMP_SHA256": "a" * 64,
-        "GEMINI_API_KEY": "must-not-appear",
+        "OPENROUTER_API_KEY": "must-not-appear",
     }
 
     identity = io_helpers.load_launch_identity(config, environ=environment)
@@ -203,7 +203,7 @@ def test_launch_identity_is_canonical_only_for_complete_matching_metadata() -> N
     invalid = io_helpers.load_launch_identity(config, environ=environment)
     assert invalid == {
         "canonical": False,
-        "contract": "run_app-v1",
+        "contract": "run_app-v2",
         "batch_id": "b2",
         "profile": "laptop",
         "reason_code": "invalid_launch_identity",

@@ -95,6 +95,16 @@ CREATE TABLE IF NOT EXISTS qa_session_windows (
     UNIQUE (session_id, window_id),
     FOREIGN KEY (session_id) REFERENCES qa_sessions(session_id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS qa_session_candidates (
+    session_id TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    candidate_id TEXT NOT NULL,
+    candidate_json TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (session_id, position),
+    UNIQUE (session_id, candidate_id),
+    FOREIGN KEY (session_id) REFERENCES qa_sessions(session_id) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS qa_image_fingerprints (
     cache_key TEXT PRIMARY KEY,
     fingerprint_json TEXT NOT NULL,
@@ -112,6 +122,8 @@ CREATE INDEX IF NOT EXISTS idx_qa_candidates_expiry ON qa_candidate_sets(expires
 CREATE INDEX IF NOT EXISTS idx_qa_images_expiry ON qa_image_fingerprints(expires_at);
 CREATE INDEX IF NOT EXISTS idx_qa_windows_session
 ON qa_session_windows(session_id, position);
+CREATE INDEX IF NOT EXISTS idx_qa_candidates_session
+ON qa_session_candidates(session_id, position);
 CREATE INDEX IF NOT EXISTS idx_qa_operator_edits_session
 ON qa_operator_edits(session_id, edit_id);
 """
@@ -495,6 +507,79 @@ class QASessionStore:
                 (session_id,),
             ).fetchall()
         return tuple(json.loads(row["window_json"]) for row in rows)
+
+    def bind_session_candidates(
+        self, session_id: str, candidates: Iterable[Mapping[str, Any]]
+    ) -> tuple[dict[str, Any], ...]:
+        """Freeze one ordered, URI-free single-frame candidate set."""
+
+        prepared = [self._mapping(candidate, "candidate") for candidate in candidates]
+        candidate_ids: set[str] = set()
+        for value in prepared:
+            self._reject_media_locations(value, "candidate")
+            candidate_id = value.get("candidate_id")
+            if not isinstance(candidate_id, str) or not candidate_id:
+                raise ValueError("QA candidate requires a non-empty candidate_id")
+            if candidate_id in candidate_ids:
+                raise ValueError("QA candidates must have unique candidate_id values")
+            candidate_ids.add(candidate_id)
+        now = self.clock()
+        with closing(self._connection()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            live = connection.execute(
+                "SELECT 1 FROM qa_sessions WHERE session_id = ? AND expires_at > ?",
+                (session_id, now),
+            ).fetchone()
+            if live is None:
+                raise QASessionStoreError("QA session is missing or expired")
+            existing = connection.execute(
+                """
+                SELECT candidate_json FROM qa_session_candidates
+                WHERE session_id = ? ORDER BY position
+                """,
+                (session_id,),
+            ).fetchall()
+            if existing:
+                frozen = tuple(json.loads(row["candidate_json"]) for row in existing)
+                connection.commit()
+                return frozen
+            for position, value in enumerate(prepared):
+                connection.execute(
+                    """
+                    INSERT INTO qa_session_candidates
+                        (session_id, position, candidate_id, candidate_json, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        session_id,
+                        position,
+                        value["candidate_id"],
+                        json.dumps(value, ensure_ascii=False, sort_keys=True),
+                        now,
+                    ),
+                )
+            connection.commit()
+        return tuple(prepared)
+
+    def get_session_candidates(self, session_id: str) -> tuple[dict[str, Any], ...]:
+        """Return frozen v3 candidates without extending the session TTL."""
+
+        now = self.clock()
+        with closing(self._connection()) as connection:
+            live = connection.execute(
+                "SELECT 1 FROM qa_sessions WHERE session_id = ? AND expires_at > ?",
+                (session_id, now),
+            ).fetchone()
+            if live is None:
+                raise QASessionStoreError("QA session is missing or expired")
+            rows = connection.execute(
+                """
+                SELECT candidate_json FROM qa_session_candidates
+                WHERE session_id = ? ORDER BY position
+                """,
+                (session_id,),
+            ).fetchall()
+        return tuple(json.loads(row["candidate_json"]) for row in rows)
 
     @staticmethod
     def _legacy_target_key(value: Mapping[str, Any]) -> str | None:
@@ -896,6 +981,41 @@ class QASessionStore:
         session = self.get_session(session_id)
         if session is None:
             return None
+        if int(session.state.get("state_version", 0)) >= 3:
+            candidates = self.get_session_candidates(session_id)
+            state = dict(session.state)
+            predictions = [
+                dict(value)
+                for value in state.get("predictions", ())
+                if isinstance(value, Mapping)
+            ]
+            answers = state.get("answers", {})
+            answer_values = dict(answers) if isinstance(answers, Mapping) else {}
+            failures = state.get("failures", {})
+            failure_values = dict(failures) if isinstance(failures, Mapping) else {}
+            status = str(state.get("status") or "candidates_ready")
+            return {
+                "session_id": session.session_id,
+                "request": session.request,
+                "state": state,
+                "created_at": session.created_at,
+                "updated_at": session.updated_at,
+                "expires_at": session.expires_at,
+                "revision": session.revision,
+                "state_version": 3,
+                "status": status,
+                "session_candidates": list(candidates),
+                "candidate_count": len(candidates),
+                "predictions": predictions,
+                "answers": answer_values,
+                "failures": failure_values,
+                "selected_candidate_id": state.get("selected_candidate_id"),
+                "candidate_retrieval_ms": state.get("candidate_retrieval_ms", 0.0),
+                "channel_statuses": dict(state.get("channel_statuses", {})),
+                "retrieval_errors": dict(state.get("retrieval_errors", {})),
+                "query_processing": dict(state.get("query_processing", {})),
+                "operator_edits": list(self.get_operator_edits(session_id)),
+            }
         targets = self.get_targets(session_id)
         windows = self.get_session_windows(session_id)
         state, outcomes, counts = self._snapshot_state(session.state, targets, windows)

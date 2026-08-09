@@ -24,35 +24,35 @@ readiness:
       expected_videos: 873
       workflows:
         kis: [organizer_clip, metadata]
-        qa: [organizer_clip, metadata, canonical_images, gemini]
+        qa: [organizer_clip, metadata, canonical_images]
         trake: [organizer_clip]
       channels:
         organizer_clip: required
         metadata: required
         canonical_images: required
-        gemini: required
+        ollama_vlm: required
+        gemini_vlm: optional
         visual: optional
         semantic_text: optional
         ocr: optional
         asr: optional
         accelerated_visual: optional
-        qwen: optional
   native_defaults:
     workflows:
       kis: [visual]
-      qa: [visual, canonical_images, gemini]
+      qa: [visual, canonical_images]
       trake: [visual]
     channels:
       visual: required
       canonical_images: required
-      gemini: required
+      ollama_vlm: required
+      gemini_vlm: optional
       metadata: optional
       semantic_text: optional
       ocr: optional
       asr: optional
       organizer_clip: not_applicable
       accelerated_visual: optional
-      qwen: optional
 
 tools:
   ffmpeg:
@@ -74,6 +74,7 @@ data:
   catalog_db: data/state/jobs.sqlite3
   artifact_db: data/state/artifacts.sqlite3
   qa_state_db: data/state/visual_qa.sqlite3
+  translation_cache_db: data/state/query_translation.sqlite3
   scratch_limit_gib: 12
   free_space_reserve_gib: 30
   thumbnail_max_dim: 512
@@ -107,6 +108,22 @@ ingestion:
   stages: [probe, frames, visual, activate, ocr, asr, text]
 
 models:
+  query_translation:
+    enabled: true
+    model_name: Helsinki-NLP/opus-mt-vi-en
+    revision: c8d2853e77f5fae31124d993e0b35176b1c8914e
+    source_path: models/huggingface/opus-mt-vi-en
+    converted_path: models/translation/opus-mt-vi-en-ct2-int8-c8d2853e
+    tokenizer_path: models/huggingface/opus-mt-vi-en
+    asset_manifest: checksums/query-translation.sha256
+    device: cpu
+    compute_type: int8
+    intra_threads: 8
+    max_decoding_length: 128
+    memory_cache_entries: 2048
+    disk_cache_entries: 10000
+    allow_transformers_fallback: true
+    local_files_only: true
   visual:
     backend: siglip2
     model_name: google/siglip2-base-patch16-224
@@ -150,6 +167,17 @@ models:
     batch_size: 16
     cache_dir: models/huggingface
     local_files_only: true
+  florence2:
+    # Experimental and operator-selected only; construction is lazy/offline.
+    # Missing assets produce a structured not-provisioned error.
+    enabled: true
+    model_name: microsoft/Florence-2-base
+    revision: 5ca5edf5bd017b9919c05d08aebef5e4c7ac3bac
+    model_path: models/huggingface/florence-2-base
+    weights_sha256: 03075d2d2d2bbd3e180b9ba0afae4aa8563226e2d32911656966e05b2f2ee060
+    device: cpu
+    max_new_tokens: 256
+    local_files_only: true
   ocr:
     engine: paddleocr
     recognition_model: latin_PP-OCRv5_mobile_rec
@@ -173,32 +201,25 @@ models:
     cache_dir: models/whisper
     local_files_only: true
     extract_audio_16khz: true
-  qwen_vl:
-    # Accelerated-profile fallback only.  The 4 GiB laptop never loads this model.
-    enabled: true
-    enabled_profiles: [accelerated]
-    model_name: Qwen/Qwen3-VL-4B-Instruct
-    revision: ebb281ec70b05090aa6165b016eac8ec08e71b17
-    device: cuda
-    dtype: float16
-    cache_dir: models/huggingface
-    local_files_only: true
-    max_pixels: 589824
-    max_new_tokens: 32
-
 services:
-  gemini:
+  gemini_vlm:
     api_key_env: GEMINI_API_KEY
     model: gemini-3.6-flash
+    timeout_seconds: 5
+    max_images: 1
     max_concurrency: 1
-    requests_per_minute: 13
-    min_request_interval_seconds: 4.5
-    timeout_seconds: 30
-    max_retries: 4
-    retry_base_seconds: 5
-    retry_max_seconds: 60
-    rate_limit_cooldown_seconds: 60
-    cooldown_max_seconds: 300
+  ollama_vlm:
+    url: http://127.0.0.1:11434
+    url_env: OLLAMA_URL
+    model: qwen2.5vl:3b-q4_K_M
+    expected_digest_prefix: fb90415cde1e
+    connect_timeout_seconds: 2
+    timeout_seconds: 60
+    keep_alive: 15m
+    num_ctx: 4096
+    max_new_tokens: 64
+    max_images: 1
+    max_concurrency: 1
   qdrant:
     url: http://127.0.0.1:6333
     url_env: QDRANT_URL
@@ -219,6 +240,10 @@ services:
       ocr: aic_ocr_v1
       asr: aic_asr_v1
       metadata: aic_metadata_v1
+    shadow_indexes:
+      ocr: aic_ocr_vi_v2
+      asr: aic_asr_vi_v2
+      metadata: aic_metadata_multilingual_v2
 
 retrieval:
   top_k: 100
@@ -226,6 +251,7 @@ retrieval:
   text_query:
     max_chunks: 4
     overlap_tokens: 8
+    language_default: auto
   candidate_depths:
     visual: 300
     organizer_clip: 300
@@ -282,12 +308,14 @@ retrieval:
     max_stages: 20
     raw_refinement_enabled: false
   visual_qa:
-    initial_clusters: 5
+    candidate_cards: 5
+    initial_clusters: 1
     expansion_step: 5
+    automatic_targets: [5, 10, 15, 20]
     max_clusters: 20
     candidate_pool: 100
     window_radius_ms: 4000
-    frames_per_window: 5
+    frames_per_window: 3
     min_frames_per_window: 3
     min_cluster_separation_ms: 3000
     session_ttl_seconds: 86400
@@ -295,7 +323,8 @@ retrieval:
     image_max_source_bytes: 16777216
     image_max_request_bytes: 20971520
     image_max_dimension: 768
-    default_answer_spec_id: aic-2024-visual-qa-numeric-v1
+    cuda_cache_clear_threshold: 0.80
+    default_answer_spec_id: aic-2026-visual-qa-general-text-provisional-v1
 
 competition:
   spec_id: aic-2025-textual-kis

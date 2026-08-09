@@ -437,7 +437,9 @@ class WarmupService:
                 )
             elif name == "qa":
                 workflow_failure = any(warmed.get(value) == "failed" for value in required)
-                hard_unavailable = any(value in unavailable for value in ("gemini", "canonical_images"))
+                hard_unavailable = any(
+                    value in unavailable for value in ("ollama_vlm", "canonical_images")
+                )
                 usable = bool(ready_retrieval) and not hard_unavailable
                 state = (
                     "ready"
@@ -572,6 +574,22 @@ class WarmupService:
             vector_filter, lexical_filter = self.pipeline._batch_filters(
                 {"batch_filters": (self.batch_id,)}
             )
+
+            adapter = getattr(self.pipeline, "query_adapter", None)
+            translator = getattr(adapter, "translator", None)
+            translation_needed = any(
+                channel.name in {"organizer_clip", "accelerated_visual"}
+                and readiness_by_name.get(channel.name) in _USABLE_CHANNEL_STATES
+                for channel in self.pipeline.dense_channels
+            )
+            if translation_needed and translator is not None:
+
+                def warm_translation() -> None:
+                    translator.warm()
+
+                channels.append(
+                    self._channel_result("query_translation", warm_translation)
+                )
 
             for channel in self.pipeline.dense_channels:
                 state = readiness_by_name.get(channel.name)

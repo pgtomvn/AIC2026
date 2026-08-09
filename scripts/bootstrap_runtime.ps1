@@ -46,8 +46,8 @@ try {
     }
 
     $imports = @(
-        "av", "faster_whisper", "google.genai", "open_clip", "paddleocr",
-        "streamlit", "torch", "torchvision", "transformers"
+        "av", "ctranslate2", "faster_whisper", "google.genai", "open_clip", "paddleocr", "requests",
+        "sacremoses", "sentencepiece", "streamlit", "torch", "torchvision", "transformers"
     ) -join ","
     & $Python -c "import importlib; [importlib.import_module(name) for name in '$imports'.split(',')]"
     if ($LASTEXITCODE -ne 0) {

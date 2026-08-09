@@ -59,6 +59,68 @@ class _TRAKEPipeline:
         )
 
 
+class _QAPipeline:
+    def __init__(self) -> None:
+        self.last_snapshot = None
+        self.retrieve_calls = 0
+        self.answer_calls = 0
+
+    def retrieve(self, request, *, session_id=None):
+        del session_id
+        self.retrieve_calls += 1
+        candidate = {
+            "candidate_id": "aic25-b1-reference:L21_V001:10",
+            "retrieval_rank": 1,
+            "retrieval_score": 0.9,
+            "batch_id": "aic25-b1-reference",
+            "video_id": "L21_V001",
+            "source_frame_idx": 10,
+            "timestamp_ms": 1_000,
+            "shot_id": "shot-1",
+            "channel_ranks": {"organizer_clip": 1},
+            "evidence": {},
+        }
+        self.last_snapshot = {
+            "search_id": "qa-apptest-session",
+            "state_version": 3,
+            "status": "candidates_ready",
+            "request": request.to_dict(),
+            "candidates": [candidate],
+            "answers": [],
+            "predictions": [],
+            "stage_timings": {"candidate_retrieval_ms": 10.0},
+        }
+        return [candidate]
+
+    def answer_candidate(self, search_id, request):
+        assert search_id == "qa-apptest-session"
+        assert request.candidate_id == "aic25-b1-reference:L21_V001:10"
+        self.answer_calls += 1
+        prediction = {
+            "rank": 1,
+            "batch_id": "aic25-b1-reference",
+            "video_id": "L21_V001",
+            "source_frame_idx": 10,
+            "timestamp_ms": 1_000,
+            "answer": "yes",
+            "answer_source": "ollama-qwen/fixture",
+            "confidence_score": 1.0,
+            "window_id": request.candidate_id,
+            "evidence": {"provider": "ollama-qwen", "latency_ms": 5.0},
+        }
+        self.last_snapshot = {
+            **self.last_snapshot,
+            "status": "answered",
+            "selected_candidate_id": request.candidate_id,
+            "answers": [{"candidate_id": request.candidate_id, "status": "answered"}],
+            "predictions": [prediction],
+        }
+        return [prediction]
+
+    def get_search(self, search_id):
+        return self.last_snapshot if search_id == "qa-apptest-session" else None
+
+
 class _Repository:
     @staticmethod
     def existing_source_frames(_batch_id, identities, *, include_refined=True):
@@ -93,7 +155,7 @@ def _context(*, canonical: bool):
         pipeline=pipeline,
         trake_pipeline=_TRAKEPipeline(),
         artifact_repository=_Repository(),
-        qa_pipeline=SimpleNamespace(),
+        qa_pipeline=_QAPipeline(),
         qa_session_store=None,
         qa_image_resolver=None,
         readiness_service=None,
@@ -101,7 +163,7 @@ def _context(*, canonical: bool):
         validate_batch_filters=validate_batch_filters,
         launch_identity={
             "canonical": canonical,
-            "contract": "run_app-v1" if canonical else "direct-streamlit",
+            "contract": "run_app-v2" if canonical else "direct-streamlit",
             "launch_id": "offline-apptest",
             "port": 8501,
             "batch_id": selected_batch_id,
@@ -148,22 +210,57 @@ def main() -> int:
         messages = [getattr(item, "message", str(item)) for item in app.exception]
         raise RuntimeError("Streamlit AppTest failed: " + " | ".join(messages))
     workflow = app.segmented_control(key="active_workflow")
-    if tuple(workflow.options) != ("KIS văn bản", "Hỏi đáp hình ảnh", "TRAKE"):
+    if tuple(workflow.options) != (
+        "[ KIS ENGINE ]",
+        "[ VISUAL QA ]",
+        "[ TRAKE TIMELINE ]",
+    ):
         raise RuntimeError("Streamlit workflow selector is incomplete")
     if workflow.value != "kis":
         raise RuntimeError("Streamlit did not preserve the default KIS workflow")
     no_match_message = "Không có kết quả đã lập chỉ mục phù hợp"
     if any(no_match_message in value for value in _messages(app.info)):
         raise RuntimeError("initial KIS view incorrectly reports an empty completed search")
-    if not any("run_app-v1" in value for value in _messages(app.caption)):
+    if not any("run_app-v2" in value for value in _messages(app.caption)):
         raise RuntimeError("canonical launch identity is not visible")
     workflow.set_value("qa")
     app.run()
     if app.exception:
         messages = [getattr(item, "message", str(item)) for item in app.exception]
         raise RuntimeError("QA workflow AppTest failed: " + " | ".join(messages))
-    if app.text_input(key="qa_batch_filters").value != context.selected_batch_id:
-        raise RuntimeError("QA batch filter was not prepopulated from selected_batch_id")
+    app.text_area(key="qa_event_description").set_value(
+        "A man is broadcasting TV news."
+    )
+    app.text_input(key="qa_question").set_value("Does the man wear glasses?")
+    app.button(key="qa_retrieve_candidates").click()
+    app.run()
+    if app.exception:
+        messages = [getattr(item, "message", str(item)) for item in app.exception]
+        raise RuntimeError("QA candidate retrieval AppTest failed: " + " | ".join(messages))
+    if context.qa_pipeline.retrieve_calls != 1 or context.qa_pipeline.answer_calls != 0:
+        raise RuntimeError("QA Stage 1 did not remain retrieval-only")
+    if len(app.session_state["qa_candidates"]) != 1:
+        raise RuntimeError("QA candidates were not persisted across the retrieval rerun")
+    if app.radio(key="qa_selected_candidate_id").value != (
+        "aic25-b1-reference:L21_V001:10"
+    ):
+        raise RuntimeError("QA did not select the stable Top-1 candidate identity")
+    if app.selectbox(key="qa_engine").value != "gemini":
+        raise RuntimeError("Gemini Flash is not the default QA answer engine")
+    app.checkbox(key="qa_external_transfer_consent").set_value(True)
+    app.run()
+    app.button(key="qa_answer_selected_candidate").click()
+    app.run()
+    if app.exception:
+        messages = [getattr(item, "message", str(item)) for item in app.exception]
+        raise RuntimeError("QA single-frame answering AppTest failed: " + " | ".join(messages))
+    if context.qa_pipeline.answer_calls != 1:
+        raise RuntimeError("QA Stage 2 did not invoke exactly one provider call")
+    if app.session_state["qa_result"]["answer"] != "yes":
+        raise RuntimeError("QA answer was not persisted across the answer rerun")
+    app.run()
+    if app.session_state["qa_result"]["answer"] != "yes":
+        raise RuntimeError("QA result was lost on an unrelated rerun")
     app.segmented_control(key="active_workflow").set_value("trake")
     app.run()
     if app.exception:

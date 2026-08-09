@@ -379,6 +379,65 @@ def test_qa_retrieval_uses_canonical_anchor_timing_for_collapsed_organizer_rows(
     assert seed in clusters[0].frames
 
 
+@pytest.mark.parametrize(
+    ("batch_id", "preferred_channel", "ignored_channel", "expected_frames"),
+    (
+        ("aic25-b1-reference", "organizer_clip", "visual", (8, 10, 12)),
+        ("aic26-b2-native", "visual", "organizer_clip", (8, 10, 12)),
+    ),
+)
+def test_qa_retrieval_selects_three_frames_from_only_the_compatible_dense_space(
+    tmp_path: Path,
+    batch_id: str,
+    preferred_channel: str,
+    ignored_channel: str,
+    expected_frames: tuple[int, ...],
+) -> None:
+    frames = [
+        _frame(
+            str(tmp_path / f"frame-{index}.jpg"),
+            batch_id=batch_id,
+            source_frame_idx=index,
+            timestamp_ms=1_000 + (index - 10) * 100,
+            shot_id="scene:news",
+        )
+        for index in (8, 9, 10, 11, 12)
+    ]
+    hits = []
+    for frame in (frames[2], frames[0], frames[1], frames[3], frames[4]):
+        preferred_score = 0.99 if frame.source_frame_idx in {8, 12} else 0.1
+        ignored_score = 1.0 if frame.source_frame_idx in {9, 11} else 0.0
+        hits.append(
+            {
+                "batch_id": batch_id,
+                "video_id": frame.video_id,
+                "source_frame_idx": frame.source_frame_idx,
+                "timestamp_ms": frame.timestamp_ms,
+                "shot_id": frame.shot_id,
+                "score": 0.5,
+                "evidence": [
+                    {"channel": preferred_channel, "raw_score": preferred_score},
+                    {"channel": ignored_channel, "raw_score": ignored_score},
+                ],
+            }
+        )
+    retriever = VisualQARetriever(
+        _FakeTextualPipeline(hits),
+        _FakeRepository(frames),
+        max_clusters=1,
+        frames_per_cluster=3,
+    )
+
+    cluster = retriever.retrieve(
+        "A man is broadcasting TV news.",
+        batch_filters=(batch_id,),
+        max_clusters=1,
+    )[0]
+
+    assert tuple(frame.source_frame_idx for frame in cluster.frames) == expected_frames
+    assert cluster.frame_selection_scores == {8: 0.99, 10: 0.1, 12: 0.99}
+
+
 def test_qa_session_ttls_cache_and_target_expansion_are_explicit_and_idempotent(
     tmp_path: Path,
 ) -> None:
@@ -467,8 +526,8 @@ def test_legacy_snapshot_is_ordered_safe_terminal_and_read_only(tmp_path: Path) 
                     "raw_answer": "two",
                     "answerable": True,
                     "evidence_frame_indices": [2],
-                    "provider": "gemini",
-                    "model_name": "gemini-test",
+                    "provider": "ollama-qwen",
+                    "model_name": "qwen2.5vl:test",
                     "attempts": 1,
                 },
             }
@@ -684,6 +743,65 @@ def test_visual_qa_cascade_resumes_session_and_reuses_reasoning_cache(tmp_path: 
     )
     assert third[0]["answer"] == first[0]["answer"]
     assert reasoner.calls == 1
+
+
+def test_interactive_initial_and_fast_retry_each_reason_exactly_one_new_window(
+    tmp_path: Path,
+) -> None:
+    clusters = []
+    for video_offset, video_id in enumerate(("L21_V001", "L21_V002")):
+        frames = tuple(
+            _frame(
+                str(tmp_path / f"{video_id}-{frame}.jpg"),
+                video_id=video_id,
+                source_frame_idx=frame,
+                timestamp_ms=1_000 + video_offset * 10_000 + position * 100,
+            )
+            for position, frame in enumerate((9, 10, 11))
+        )
+        clusters.append(
+            QACandidateCluster(
+                f"b1:{video_id}:10",
+                video_offset + 1,
+                0.8 - video_offset * 0.1,
+                "b1",
+                video_id,
+                10,
+                frames[1].timestamp_ms,
+                "s1",
+                frames,
+            )
+        )
+    reasoner = _FakeReasoner()
+    sessions = QASessionStore(tmp_path / "fast-retry.sqlite3")
+    sessions.initialize()
+    pipeline = VisualQAPipeline(
+        retriever=_FakeRetriever(tuple(clusters)),
+        reasoner=reasoner,
+        image_resolver=_FakeResolver(),
+        session_store=sessions,
+        competition_spec=QACompetitionSpec.conservative_general_text(),
+        top_k_retrieve=1,
+    )
+    request = QAQueryRequest(
+        query_id="qa-fast-retry",
+        event_description="A man is broadcasting TV news.",
+        question="Does the man wear glasses?",
+        mode="interactive",
+        answer_spec_id=QACompetitionSpec.conservative_general_text().spec_id,
+        batch_filters=("b1",),
+    )
+
+    pipeline.search(request, session_id="qa-fast-retry")
+    assert reasoner.calls == 1
+    assert pipeline.get_search("qa-fast-retry")["requested_target_clusters"] == 1
+
+    pipeline.expand("qa-fast-retry", 2)
+    assert reasoner.calls == 2
+    assert pipeline.get_search("qa-fast-retry")["requested_target_clusters"] == 2
+
+    pipeline.expand("qa-fast-retry", 2)
+    assert reasoner.calls == 2
 
 
 def test_live_one_window_check_is_bounded_and_does_not_create_a_session(

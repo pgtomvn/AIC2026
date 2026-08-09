@@ -439,11 +439,23 @@ class LocalFrameRefiner:
             and "estimated_pts" not in sampling_reasons
         )
 
-    def __call__(self, plan: QueryPlan, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def __call__(
+        self,
+        plan: QueryPlan,
+        candidates: list[dict[str, Any]],
+        *,
+        query_texts: tuple[str, ...] = (),
+    ) -> list[dict[str, Any]]:
         active = candidates[: self.top_windows]
         if self.frame_sink is None or not any(self.is_eligible(candidate) for candidate in active):
             return [dict(candidate) for candidate in candidates]
-        query_vector = encode_query_mean(self.encoder, plan.original_text)
+        texts = query_texts or (plan.original_text,)
+        vectors = np.stack([encode_query_mean(self.encoder, text) for text in texts])
+        query_vector = vectors.mean(axis=0)
+        norm = float(np.linalg.norm(query_vector))
+        if not np.isfinite(norm) or norm <= 0:
+            raise ValueError("refinement query embedding must have a finite non-zero norm")
+        query_vector = (query_vector / norm).astype(np.float32, copy=False)
         refined: list[dict[str, Any]] = []
         self.scratch.root.mkdir(parents=True, exist_ok=True)
         for candidate in candidates[: self.top_windows]:

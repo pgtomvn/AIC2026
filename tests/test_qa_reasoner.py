@@ -1,942 +1,534 @@
-"""CPU-only, offline tests for Visual Q&A provider boundaries."""
-
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
 import json
 import threading
 import time
-import traceback
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
 
-import httpx
 import pytest
+import requests
 from PIL import Image
 
-from src.contracts import QACompetitionSpec, QAQueryRequest, QAReasoningResult
+from src.contracts import QACompetitionSpec, QAQueryRequest, QASingleFrameAnswerRequest
+from src.vlm.gemini import GeminiFlashReasoner
+from src.vlm.local_qwen import OllamaQwenReasoner
 from src.vlm.qa_reasoner import (
-    GeminiInteractionsReasoner,
-    GeminiRequestGovernor,
-    ProviderChainReasoner,
     QAImage,
     QAProviderRequestError,
     QAProviderResponseError,
     QAProviderUnavailableError,
-    QAReasonerError,
-    Qwen3VLReasoner,
-    _reset_gemini_shared_controls_for_tests,
-    retry_delay_for_exception,
 )
-from src.vlm.vlm_engine import VLMEngine
+from src.vlm.qa_router import QAReasonerRouter
 
 
-@pytest.fixture(autouse=True)
-def _isolate_gemini_process_controls():
-    _reset_gemini_shared_controls_for_tests()
-    yield
-    _reset_gemini_shared_controls_for_tests()
+class _Response:
+    def __init__(self, value, status_code: int = 200) -> None:
+        self.value = value
+        self.status_code = status_code
+
+    def json(self):
+        return self.value
 
 
-def _image_bytes(*, size: tuple[int, int] = (12, 8)) -> bytes:
+class _OllamaHTTP:
+    def __init__(self, chat=None) -> None:
+        self.calls = []
+        self.chat = chat or {
+            "message": {
+                "content": json.dumps(
+                    {"answer": "3", "answerable": True, "evidence_frame_indices": [1]}
+                )
+            }
+        }
+
+    def request(self, method, url, **kwargs):
+        self.calls.append((method, url, kwargs))
+        if url.endswith("/api/tags"):
+            return _Response(
+                {
+                    "models": [
+                        {
+                            "name": "qwen2.5vl:3b-q4_K_M",
+                            "digest": "fb90415cde1e1234",
+                        }
+                    ]
+                }
+            )
+        if url.endswith("/api/show"):
+            return _Response({"capabilities": ["vision", "completion"]})
+        if url.endswith("/api/generate"):
+            return _Response({"done": True})
+        if url.endswith("/api/ps"):
+            return _Response(
+                {
+                    "models": [
+                        {
+                            "name": "qwen2.5vl:3b-q4_K_M",
+                            "size": 100,
+                            "size_vram": 75,
+                        }
+                    ]
+                }
+            )
+        return _Response(self.chat)
+
+
+class _OpenRouterHTTP:
+    def __init__(self, *, status_code: int = 200) -> None:
+        self.calls = []
+        self.status_code = status_code
+
+    def post(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        return _Response(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "answer": "đỏ",
+                                    "answerable": True,
+                                    "evidence_frame_indices": [1],
+                                }
+                            )
+                        }
+                    }
+                ]
+            },
+            self.status_code,
+        )
+
+
+def _image(index: int = 1) -> QAImage:
     output = io.BytesIO()
-    Image.new("RGB", size, "red").save(output, "PNG")
-    return output.getvalue()
-
-
-def _image(index: int = 1, *, size: tuple[int, int] = (12, 8)) -> QAImage:
-    data = _image_bytes(size=size)
+    Image.new("RGB", (24, 16), "red").save(output, format="PNG")
+    data = output.getvalue()
     return QAImage(
         data=data,
         mime_type="image/png",
         index=index,
-        source_frame_idx=(index - 1) * 10,
-        timestamp_ms=(index - 1) * 1_000,
+        source_frame_idx=index * 10,
+        timestamp_ms=index * 1_000,
         sha256=hashlib.sha256(data).hexdigest(),
     )
 
 
-def _request(*, question: str = "How many people are visible?") -> QAQueryRequest:
-    return QAQueryRequest(
-        query_id="qa-1",
-        event_description="Two people enter a room.",
-        question=question,
-        limit=2,
+def _webp_image(index: int = 1) -> QAImage:
+    output = io.BytesIO()
+    Image.new("RGB", (24, 16), "red").save(output, format="WEBP")
+    data = output.getvalue()
+    return QAImage(
+        data=data,
+        mime_type="image/webp",
+        index=index,
+        source_frame_idx=index * 10,
+        timestamp_ms=index * 1_000,
+        sha256=hashlib.sha256(data).hexdigest(),
     )
 
 
-def _response(answer: str = "two", *, evidence: list[int] | None = None) -> str:
-    return json.dumps(
-        {
-            "answer": answer,
-            "answerable": True,
-            "evidence_frame_indices": evidence or [1],
+def _request(**updates) -> QAQueryRequest:
+    value = QAQueryRequest(
+        query_id="qa-test",
+        event_description="ba hình tròn màu đỏ",
+        question="Có bao nhiêu hình tròn?",
+        answer_spec_id=QACompetitionSpec.conservative_general_text().spec_id,
+        batch_filters=("aic25-b1-reference",),
+        limit=5,
+        reasoning_policy="local_only",
+    )
+    return replace(value, **updates)
+
+
+def test_ollama_payload_uses_raw_base64_schema_and_deterministic_options() -> None:
+    http = _OllamaHTTP()
+    reasoner = OllamaQwenReasoner(http=http, expected_digest_prefix="fb90415cde1e")
+    assert reasoner.probe()["vision"] is True
+    result = reasoner.reason(_request(), (_image(),), QACompetitionSpec.conservative_general_text())
+    assert result.answer == "3"
+    method, url, kwargs = http.calls[-1]
+    assert (method, url.rsplit("/", 1)[-1]) == ("POST", "chat")
+    payload = kwargs["json"]
+    assert payload["stream"] is False
+    assert payload["options"] == {
+        "temperature": 0,
+        "seed": 0,
+        "num_ctx": 4096,
+        "num_predict": 64,
+    }
+    assert payload["keep_alive"] == "15m"
+    assert kwargs["timeout"] == (2.0, 60.0)
+    encoded = payload["messages"][1]["images"][0]
+    assert not encoded.startswith("data:")
+    assert base64.b64decode(encoded) == _image().data
+    assert payload["format"]["additionalProperties"] is False
+
+
+def test_ollama_normalizes_webp_frames_to_supported_jpeg_payloads() -> None:
+    http = _OllamaHTTP()
+    reasoner = OllamaQwenReasoner(http=http)
+
+    reasoner.reason(_request(), (_webp_image(),), QACompetitionSpec.conservative_general_text())
+
+    encoded = http.calls[-1][2]["json"]["messages"][1]["images"][0]
+    with Image.open(io.BytesIO(base64.b64decode(encoded))) as normalized:
+        assert normalized.format == "JPEG"
+        assert normalized.size == (24, 16)
+
+
+def test_ollama_reports_allowlisted_response_timings_and_residency() -> None:
+    http = _OllamaHTTP(
+        chat={
+            "message": {
+                "content": json.dumps(
+                    {"answer": "3", "answerable": True, "evidence_frame_indices": [1]}
+                )
+            },
+            "load_duration": 2_000_000,
+            "prompt_eval_duration": 3_000_000,
+            "eval_duration": 4_000_000,
+            "total_duration": 9_000_000,
+            "prompt_eval_count": 12,
+            "eval_count": 3,
+        }
+    )
+    reasoner = OllamaQwenReasoner(http=http)
+    reasoner.reason(_request(), (_image(),), QACompetitionSpec.conservative_general_text())
+
+    metrics = reasoner.last_metrics
+    assert {
+        name: metrics[name]
+        for name in (
+            "total_duration_ms",
+            "load_duration_ms",
+            "prompt_eval_duration_ms",
+            "eval_duration_ms",
+            "prompt_eval_count",
+            "eval_count",
+        )
+    } == {
+        "total_duration_ms": 9.0,
+        "load_duration_ms": 2.0,
+        "prompt_eval_duration_ms": 3.0,
+        "eval_duration_ms": 4.0,
+        "prompt_eval_count": 12,
+        "eval_count": 3,
+    }
+    assert metrics["wall_latency_ms"] >= 0.0
+    assert metrics["response_keys_valid"] is True
+    assert reasoner.last_metrics["wall_latency_ms"] >= 0
+    assert reasoner.runtime_status()["gpu_offload_percent"] == 75.0
+
+
+@pytest.mark.parametrize("url", ["https://localhost:11434", "http://example.com:11434"])
+def test_ollama_rejects_non_loopback_or_non_http_endpoint(url: str) -> None:
+    with pytest.raises(ValueError):
+        OllamaQwenReasoner(base_url=url)
+
+
+def test_ollama_missing_model_is_sanitized() -> None:
+    http = _OllamaHTTP()
+    http.request = lambda *_args, **_kwargs: _Response({"models": []})
+    with pytest.raises(QAProviderUnavailableError) as captured:
+        OllamaQwenReasoner(http=http).probe()
+    assert captured.value.category == "model_missing"
+    assert "models" not in str(captured.value)
+
+
+def test_ollama_timeout_is_one_attempt_and_not_rate_limited() -> None:
+    class Timeout:
+        def request(self, *_args, **_kwargs):
+            raise requests.Timeout("secret body")
+
+    with pytest.raises(QAProviderRequestError) as captured:
+        OllamaQwenReasoner(http=Timeout()).reason(
+            _request(), (_image(),), QACompetitionSpec.conservative_general_text()
+        )
+    assert captured.value.attempts == 1
+    assert captured.value.category == "ollama_timeout"
+    assert "secret" not in str(captured.value)
+
+
+def test_ollama_invalid_json_is_response_error() -> None:
+    http = _OllamaHTTP(chat={"message": {"content": "not-json"}})
+    with pytest.raises(QAProviderResponseError) as captured:
+        OllamaQwenReasoner(http=http).reason(
+            _request(), (_image(),), QACompetitionSpec.conservative_general_text()
+        )
+    assert captured.value.category == "ollama_response_invalid"
+
+
+def test_ollama_downgrades_empty_answer_with_false_positive_evidence() -> None:
+    http = _OllamaHTTP(
+        chat={
+            "message": {
+                "content": json.dumps(
+                    {
+                        "answer": "",
+                        "answerable": True,
+                        "evidence_frame_indices": [1],
+                    }
+                )
+            }
+        }
+    )
+    reasoner = OllamaQwenReasoner(http=http)
+
+    result = reasoner.reason(
+        _request(), (_image(),), QACompetitionSpec.conservative_general_text()
+    )
+
+    assert result.answerable is False
+    assert result.answer == ""
+    assert result.evidence_frame_indices == ()
+    assert reasoner.last_metrics["response_downgraded_unanswerable"] is True
+
+
+def test_ollama_context_exceeded_is_classified_without_body_leak() -> None:
+    class ContextExceeded(_OllamaHTTP):
+        def request(self, method, url, **kwargs):
+            if url.endswith("/api/chat"):
+                return _Response(
+                    {"error": "input context exceeds configured limit; private detail"},
+                    400,
+                )
+            return super().request(method, url, **kwargs)
+
+    with pytest.raises(QAProviderRequestError) as captured:
+        OllamaQwenReasoner(http=ContextExceeded()).reason(
+            _request(), (_image(),), QACompetitionSpec.conservative_general_text()
+        )
+    assert captured.value.category == "ollama_context_exceeded"
+    assert "private" not in str(captured.value)
+
+
+def test_ollama_accepts_exactly_one_image_and_rejects_multiple() -> None:
+    http = _OllamaHTTP()
+    reasoner = OllamaQwenReasoner(http=http)
+    image = _image(1)
+
+    reasoner.reason(_request(), (image,), QACompetitionSpec.conservative_general_text())
+
+    payload = http.calls[-1][2]["json"]
+    assert len(payload["messages"][1]["images"]) == 1
+    with pytest.raises(ValueError):
+        reasoner.reason(
+            _request(), (image, _image(2)), QACompetitionSpec.conservative_general_text()
+        )
+
+
+def test_ollama_stably_deduplicates_repeated_valid_evidence_indices() -> None:
+    http = _OllamaHTTP(
+        chat={
+            "message": {
+                "content": json.dumps(
+                    {
+                        "answer": "3",
+                        "answerable": True,
+                        "evidence_frame_indices": [1, 1, 1],
+                    }
+                )
+            }
         }
     )
 
-
-class _Interactions:
-    def __init__(self, outcomes) -> None:
-        self.outcomes = list(outcomes)
-        self.calls: list[dict] = []
-
-    def create(self, **kwargs):
-        self.calls.append(kwargs)
-        outcome = self.outcomes.pop(0)
-        if isinstance(outcome, BaseException):
-            raise outcome
-        return SimpleNamespace(output_text=outcome)
-
-
-class _Client:
-    def __init__(self, outcomes) -> None:
-        self.interactions = _Interactions(outcomes)
-        self.closed = False
-
-    def close(self) -> None:
-        self.closed = True
-
-
-class _ProviderHTTPError(RuntimeError):
-    def __init__(self, status_code: int, headers: dict[str, str] | None = None) -> None:
-        super().__init__("provider detail must remain private")
-        self.response = SimpleNamespace(status_code=status_code, headers=headers or {})
-
-
-def _gemini(client: _Client, **kwargs) -> GeminiInteractionsReasoner:
-    # Individual unit tests opt into pacing explicitly; production defaults are
-    # covered separately without adding wall-clock delays to the offline suite.
-    kwargs.setdefault("min_request_interval_seconds", 0)
-    return GeminiInteractionsReasoner(
-        api_key="dummy-test-key",
-        client_factory=lambda **_settings: client,
-        retry_base_seconds=0,
-        retry_max_seconds=0,
-        **kwargs,
+    result = OllamaQwenReasoner(http=http).reason(
+        _request(), (_image(),), QACompetitionSpec.conservative_general_text()
     )
 
+    assert result.answer == "3"
+    assert result.evidence_frame_indices == (1,)
 
-def test_qa_image_checks_content_hash_and_chronological_window() -> None:
-    image = _image()
-    assert image.index == 1
 
-    with pytest.raises(ValueError, match="does not match"):
-        QAImage(
-            data=image.data,
-            mime_type=image.mime_type,
-            index=1,
-            source_frame_idx=0,
-            timestamp_ms=0,
-            sha256="0" * 64,
-        )
-
-    reasoner = _gemini(_Client([_response()]))
-    with pytest.raises(ValueError, match="contiguous"):
-        reasoner.reason(_request(), (_image(2),), QACompetitionSpec.historical_numeric())
-    assert not reasoner.client_initialized
-
-
-def test_gemini_interactions_sends_inline_ordered_images_and_strict_schema() -> None:
-    client = _Client([_response("two", evidence=[1, 2])])
-    factory_calls: list[dict] = []
-    reasoner = GeminiInteractionsReasoner(
-        api_key="dummy-test-key",
-        client_factory=lambda **settings: factory_calls.append(settings) or client,
-    )
-    assert not reasoner.client_initialized
-    assert reasoner.max_attempts == 3
-    reasoner.initialize()
-    assert reasoner.client_initialized
-    assert client.interactions.calls == []
-
-    result = reasoner.reason(
-        _request(),
-        (_image(1), _image(2)),
-        QACompetitionSpec.historical_numeric(),
-    )
-
-    assert result.answer == "2"
-    assert result.raw_answer == "two"
-    assert result.evidence_frame_indices == (1, 2)
-    assert result.provider == "gemini"
-    assert result.attempts == 1
-    assert factory_calls[0]["timeout_seconds"] == 30.0
-    call = client.interactions.calls[0]
-    assert call["model"] == "gemini-3.6-flash"
-    assert call["store"] is False
-    assert call["response_format"][0]["mime_type"] == "application/json"
-    schema = call["response_format"][0]["schema"]
-    assert schema["additionalProperties"] is False
-    assert schema["properties"]["evidence_frame_indices"]["items"]["maximum"] == 2
-    assert [part["type"] for part in call["input"]] == [
-        "text",
-        "image",
-        "text",
-        "image",
-        "text",
-    ]
-    assert "dummy-test-key" not in repr(reasoner)
-
-    reasoner.unload()
-    assert client.closed
-
-
-class _StatusError(RuntimeError):
-    def __init__(self, status_code: int, detail: str = "provider failed") -> None:
-        super().__init__(detail)
-        self.status_code = status_code
-
-
-@pytest.mark.parametrize("status_code", [408, 429, 500, 503, 599])
-def test_gemini_retries_only_transient_statuses(status_code: int) -> None:
-    client = _Client([_StatusError(status_code), _response()])
-    reasoner = _gemini(client)
-
-    result = reasoner.reason(
-        _request(),
-        (_image(),),
-        QACompetitionSpec.historical_numeric(),
-    )
-
-    assert result.attempts == 2
-    assert len(client.interactions.calls) == 2
-
-
-@pytest.mark.parametrize(
-    ("status_code", "category"),
-    [
-        (400, "invalid_request"),
-        (401, "auth_or_permission"),
-        (403, "auth_or_permission"),
-        (404, "model_unavailable"),
-        (409, "request_rejected"),
-    ],
-)
-def test_gemini_does_not_retry_permanent_http_errors(status_code: int, category: str) -> None:
-    client = _Client([_StatusError(status_code, "secret provider body"), _response()])
-    reasoner = _gemini(client)
-
-    with pytest.raises(QAProviderRequestError) as captured:
-        reasoner.reason(
-            _request(),
-            (_image(),),
-            QACompetitionSpec.historical_numeric(),
-        )
-
-    assert len(client.interactions.calls) == 1
-    assert captured.value.safe_metadata() == {
-        "provider": "gemini",
-        "model": "gemini-3.6-flash",
-        "attempts": 1,
-        "category": category,
-        "status_code": status_code,
-    }
-    assert "secret provider body" not in str(captured.value)
-
-
-@pytest.mark.parametrize("outcome", ["not json", ""])
-def test_gemini_does_not_retry_invalid_structured_output(outcome) -> None:
-    client = _Client([outcome, _response()])
-    reasoner = _gemini(client)
-
-    with pytest.raises(QAProviderResponseError) as captured:
-        reasoner.reason(
-            _request(),
-            (_image(),),
-            QACompetitionSpec.historical_numeric(),
-        )
-    assert len(client.interactions.calls) == 1
-    assert captured.value.provider == "gemini"
-    assert captured.value.model == "gemini-3.6-flash"
-    assert captured.value.attempts == 1
-    assert captured.value.category == "response_invalid"
-
-
-@pytest.mark.parametrize(
-    "outcome",
-    [
-        TimeoutError("secret timeout"),
-        ConnectionError("secret connection"),
-        httpx.ReadTimeout(
-            "secret read timeout",
-            request=httpx.Request("POST", "https://example.invalid"),
-        ),
-        httpx.ConnectError(
-            "secret blocked connection",
-            request=httpx.Request("POST", "https://example.invalid"),
-        ),
-    ],
-)
-def test_gemini_retries_builtin_and_httpx_transport_errors(outcome: Exception) -> None:
-    client = _Client([outcome, _response()])
-    reasoner = _gemini(client)
-
-    result = reasoner.reason(
-        _request(),
-        (_image(),),
-        QACompetitionSpec.historical_numeric(),
-    )
-
-    assert result.attempts == 2
-    assert len(client.interactions.calls) == 2
-
-
-def test_gemini_exhausted_blocked_connection_is_sanitized_network_failure() -> None:
-    secret = "blocked-host-with-secret-token"
-    failures = [
-        httpx.ConnectError(
-            secret,
-            request=httpx.Request("POST", "https://example.invalid"),
-        )
-        for _ in range(3)
-    ]
-    reasoner = _gemini(_Client(failures))
-
-    with pytest.raises(QAProviderRequestError) as captured:
-        reasoner.reason(_request(), (_image(),), QACompetitionSpec.historical_numeric())
-
-    assert captured.value.category == "network_unreachable"
-    assert captured.value.attempts == 3
-    assert captured.value.status_code is None
-    assert secret not in str(captured.value)
-
-
-def test_gemini_bounds_attempts_and_scrubs_sdk_exception_chain() -> None:
-    secret = "fake-secret-value-that-must-not-survive"
-    client = _Client([RuntimeError(f"header credential={secret}")])
-    reasoner = _gemini(client)
-
-    with pytest.raises(QAProviderRequestError) as captured:
-        reasoner.reason(
-            _request(question=f"prompt containing {secret}"),
-            (_image(),),
-            QACompetitionSpec.historical_numeric(),
-        )
-
-    rendered = "".join(
-        traceback.format_exception(
-            type(captured.value),
-            captured.value,
-            captured.value.__traceback__,
-        )
-    )
-    assert secret not in str(captured.value)
-    assert secret not in repr(captured.value)
-    assert secret not in rendered
-    assert captured.value.__cause__ is None
-    assert captured.value.__context__ is None
-
-    with pytest.raises(ValueError, match="cannot exceed 5"):
-        GeminiInteractionsReasoner(api_key="dummy", max_attempts=6)
-
-
-def test_gemini_free_tier_governor_limits_thirteenth_request_window() -> None:
-    now = [0.0]
-    sleeps: list[float] = []
-
-    def clock() -> float:
-        return now[0]
-
-    def sleep(seconds: float) -> None:
-        sleeps.append(seconds)
-        now[0] += seconds
-
-    client = _Client([_response() for _ in range(14)])
-    reasoner = _gemini(
-        client,
-        requests_per_minute=13,
-        clock=clock,
-        sleep=sleep,
-    )
-    spec = QACompetitionSpec.historical_numeric()
-
-    for _ in range(14):
-        reasoner.reason(_request(), (_image(),), spec)
-
-    assert sleeps == [60.0]
-
-
-def test_gemini_uses_injected_governor_for_every_physical_attempt() -> None:
-    acquisitions: list[str] = []
-
-    class Governor:
-        def acquire(self) -> None:
-            acquisitions.append("acquire")
-
-    client = _Client([_StatusError(500), _response()])
-    reasoner = _gemini(client, request_governor=Governor())  # type: ignore[arg-type]
-
-    result = reasoner.reason(
-        _request(),
-        (_image(),),
-        QACompetitionSpec.historical_numeric(),
-    )
-
-    assert result.attempts == 2
-    assert acquisitions == ["acquire", "acquire"]
-
-
-def test_gemini_governor_preserves_minimum_spacing_across_threads() -> None:
-    now = [0.0]
-    sleeps: list[float] = []
-
-    def sleep(seconds: float) -> None:
-        sleeps.append(seconds)
-        now[0] += seconds
-
-    governor = GeminiRequestGovernor(
-        13,
-        clock=lambda: now[0],
-        sleep=sleep,
-        min_interval_seconds=4.5,
-    )
-    governor.acquire()
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        executor.submit(governor.acquire).result(timeout=1)
-
-    assert sleeps == [4.5]
-
-
-def test_gemini_reasoners_share_pacing_for_one_process_credential() -> None:
-    now = [0.0]
-    sleeps: list[float] = []
-
-    def clock() -> float:
-        return now[0]
-
-    def sleep(seconds: float) -> None:
-        sleeps.append(seconds)
-        now[0] += seconds
-
-    settings = {
-        "api_key": "one-process-key",
-        "clock": clock,
-        "sleep": sleep,
-        "min_request_interval_seconds": 4.5,
-        "retry_base_seconds": 0,
-        "retry_max_seconds": 0,
-    }
-    first = GeminiInteractionsReasoner(
-        client_factory=lambda **_settings: _Client([_response()]),
-        **settings,
-    )
-    second = GeminiInteractionsReasoner(
-        client_factory=lambda **_settings: _Client([_response()]),
-        **settings,
-    )
-
-    spec = QACompetitionSpec.historical_numeric()
-    first.reason(_request(), (_image(),), spec)
-    second.reason(_request(), (_image(),), spec)
-
-    assert sleeps == [4.5]
-
-
-def test_gemini_reasoners_share_terminal_429_cooldown() -> None:
-    now = [0.0]
-
-    def clock() -> float:
-        return now[0]
-
-    settings = {
-        "api_key": "one-process-key",
-        "clock": clock,
-        "sleep": lambda seconds: now.__setitem__(0, now[0] + seconds),
-        "min_request_interval_seconds": 0,
-        "max_attempts": 1,
-    }
-    limited_client = _Client([_ProviderHTTPError(429)])
-    waiting_client = _Client([_response()])
-    limited = GeminiInteractionsReasoner(
-        client_factory=lambda **_settings: limited_client,
-        **settings,
-    )
-    waiting = GeminiInteractionsReasoner(
-        client_factory=lambda **_settings: waiting_client,
-        **settings,
-    )
-
-    spec = QACompetitionSpec.historical_numeric()
-    with pytest.raises(QAProviderRequestError) as exhausted:
-        limited.reason(_request(), (_image(),), spec)
-    with pytest.raises(QAProviderRequestError) as cooling:
-        waiting.reason(_request(), (_image(),), spec)
-
-    assert exhausted.value.attempts == 1
-    assert cooling.value.attempts == 0
-    assert cooling.value.category == "rate_limited"
-    assert not waiting_client.interactions.calls
-
-
-def test_gemini_retry_headers_jitter_and_terminal_cooldown() -> None:
-    now = [0.0]
-    sleeps: list[float] = []
-
-    def sleep(seconds: float) -> None:
-        sleeps.append(seconds)
-        now[0] += seconds
-
-    client = _Client(
-        [_ProviderHTTPError(429, {"Retry-After": "7"}) for _ in range(5)]
-    )
-    reasoner = GeminiInteractionsReasoner(
-        api_key="dummy-test-key",
-        client_factory=lambda **_settings: client,
-        max_attempts=5,
-        retry_base_seconds=5,
-        retry_max_seconds=60,
-        rate_limit_cooldown_seconds=60,
-        clock=lambda: now[0],
-        sleep=sleep,
-        jitter=lambda _low, _high: 0.25,
-    )
-
-    with pytest.raises(QAProviderRequestError) as captured:
-        reasoner.reason(_request(), (_image(),), QACompetitionSpec.historical_numeric())
-    assert captured.value.attempts == 5
-    assert captured.value.category == "rate_limited"
-    assert len(client.interactions.calls) == 5
-    assert sleeps == [7.0, 10.25, 20.25, 40.25]
-
-    with pytest.raises(QAProviderRequestError) as cooling:
-        reasoner.reason(_request(), (_image(),), QACompetitionSpec.historical_numeric())
-    assert cooling.value.attempts == 0
-    assert cooling.value.status_code == 429
-    assert len(client.interactions.calls) == 5
-
-
-def test_retry_header_parser_supports_http_date_epoch_and_malformed_values() -> None:
-    from email.utils import formatdate
-
-    wall = 1_700_000_000.0
-    retry_date = _ProviderHTTPError(
-        429, {"Retry-After": formatdate(wall + 12, usegmt=True)}
-    )
-    assert retry_delay_for_exception(
-        retry_date,
-        1,
-        jitter=lambda _low, _high: 0,
-        wall_clock=lambda: wall,
-    ) == pytest.approx(12.0)
-
-    reset = _ProviderHTTPError(429, {"x-ratelimit-reset": str(wall + 9)})
-    assert retry_delay_for_exception(
-        reset,
-        1,
-        jitter=lambda _low, _high: 0,
-        wall_clock=lambda: wall,
-    ) == pytest.approx(9.0)
-
-    oversized = _ProviderHTTPError(429, {"Retry-After": "90"})
-    assert retry_delay_for_exception(
-        oversized,
-        1,
-        jitter=lambda _low, _high: 0,
-        wall_clock=lambda: wall,
-    ) == pytest.approx(60.0)
-
-    malformed = _ProviderHTTPError(429, {"Retry-After": "not-a-date"})
-    assert retry_delay_for_exception(
-        malformed,
-        1,
-        jitter=lambda _low, _high: 0,
-        wall_clock=lambda: wall,
-    ) == pytest.approx(5.0)
-
-
-def test_gemini_free_tier_backoff_sequence_is_deterministic() -> None:
-    now = [0.0]
-    sleeps: list[float] = []
-
-    def sleep(seconds: float) -> None:
-        sleeps.append(seconds)
-        now[0] += seconds
-
-    reasoner = GeminiInteractionsReasoner(
-        api_key="dummy-test-key",
-        client_factory=lambda **_settings: _Client(
-            [_ProviderHTTPError(500) for _ in range(5)]
-        ),
-        max_attempts=5,
-        retry_base_seconds=5,
-        retry_max_seconds=60,
-        clock=lambda: now[0],
-        sleep=sleep,
-        jitter=lambda _low, _high: 0,
-    )
-
-    with pytest.raises(QAProviderRequestError):
-        reasoner.reason(_request(), (_image(),), QACompetitionSpec.historical_numeric())
-
-    assert sleeps == [5.0, 10.0, 20.0, 40.0]
-
-
-def test_gemini_concurrency_bound_serializes_provider_calls() -> None:
-    entered = threading.Event()
-    release = threading.Event()
-    lock = threading.Lock()
-    state = {"active": 0, "maximum": 0, "calls": 0}
-
-    class BlockingInteractions:
-        def create(self, **_kwargs):
-            with lock:
-                state["active"] += 1
-                state["maximum"] = max(state["maximum"], state["active"])
-                state["calls"] += 1
-                entered.set()
-            release.wait(timeout=2)
-            with lock:
-                state["active"] -= 1
-            return SimpleNamespace(output_text=_response())
-
-    client = SimpleNamespace(interactions=BlockingInteractions())
-    reasoner = GeminiInteractionsReasoner(
-        api_key="dummy-test-key",
-        client_factory=lambda **_settings: client,
-        max_concurrency=1,
-        requests_per_minute=10,
-        # This test isolates semaphore behavior; pacing has its own deterministic test.
-        min_request_interval_seconds=0,
-    )
-    spec = QACompetitionSpec.historical_numeric()
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        first = executor.submit(reasoner.reason, _request(), (_image(),), spec)
-        assert entered.wait(timeout=1)
-        second = executor.submit(reasoner.reason, _request(), (_image(),), spec)
-        time.sleep(0.05)
-        assert state["calls"] == 1
-        release.set()
-        assert first.result(timeout=2).answer == "2"
-        assert second.result(timeout=2).answer == "2"
-    assert state["maximum"] == 1
-
-
-def test_gemini_free_tier_rejects_unsafe_rate_or_concurrency_configuration() -> None:
-    default = GeminiInteractionsReasoner(api_key="dummy-test-key")
-    assert default._rate_limiter._min_interval_seconds == 4.5
-    with pytest.raises(ValueError, match="cannot exceed.*13"):
-        GeminiInteractionsReasoner(api_key="dummy-test-key", requests_per_minute=14)
-    with pytest.raises(ValueError, match="max_concurrency must be 1"):
-        GeminiInteractionsReasoner(api_key="dummy-test-key", max_concurrency=2)
-
-
-def test_provider_fingerprints_are_deterministic_secret_free_and_ordered() -> None:
-    first = GeminiInteractionsReasoner(api_key="secret-a")
-    equivalent = GeminiInteractionsReasoner(api_key="secret-b")
-    other = GeminiInteractionsReasoner(api_key="secret-a", model_name="gemini-other")
-
-    assert first.fingerprint == equivalent.fingerprint
-    assert first.fingerprint != other.fingerprint
-    assert "secret" not in first.fingerprint
-    assert (
-        ProviderChainReasoner((first, other)).fingerprint
-        != ProviderChainReasoner((other, first)).fingerprint
-    )
-
-
-class _FailingReasoner:
-    provider_name = "failing"
-    fingerprint = "failing-v1"
-
-    def reason(self, *_args):
-        raise QAProviderRequestError(
-            "temporary provider failure",
-            attempts=5,
-            category="server_unavailable",
-        )
-
-    def unload(self) -> None:
-        return None
-
-
-class _SuccessfulReasoner:
-    provider_name = "successful"
-    fingerprint = "successful-v1"
-
-    def reason(self, *_args):
-        return QAReasoningResult(
-            raw_answer="two",
-            normalized_answer="2",
-            answerable=True,
-            evidence_frame_indices=(1,),
-            provider=self.provider_name,
-            model_name="fake",
-            prompt_version="fake-v1",
-            latency_ms=0,
-        )
-
-    def unload(self) -> None:
-        return None
-
-
-def test_provider_chain_falls_back_in_order() -> None:
-    result = ProviderChainReasoner((_FailingReasoner(), _SuccessfulReasoner())).reason(
-        _request(),
-        (_image(),),
-        QACompetitionSpec.historical_numeric(),
-    )
-    assert result.provider == "successful"
-
-
-@pytest.mark.parametrize(
-    "category",
-    ["client_initialization", "client_unavailable", "model_unavailable", "not_configured"],
-)
-def test_provider_chain_does_not_fallback_for_provider_setup_errors(category: str) -> None:
-    fallback = _SuccessfulReasoner()
-
-    class First(_FailingReasoner):
-        def reason(self, *_args):
-            raise QAProviderUnavailableError("provider unavailable", category=category)
-
-    with pytest.raises(QAProviderUnavailableError) as captured:
-        ProviderChainReasoner((First(), fallback)).reason(
-            _request(),
-            (_image(),),
-            QACompetitionSpec.historical_numeric(),
-        )
-
-    assert captured.value.category == category
-
-
-@pytest.mark.parametrize(
-    ("error", "category"),
-    [
-        (
-            QAProviderRequestError(
-                "private",
-                category="auth_or_permission",
-                status_code=401,
-            ),
-            "auth_or_permission",
-        ),
-        (
-            QAProviderRequestError(
-                "private",
-                category="invalid_request",
-                status_code=400,
-            ),
-            "invalid_request",
-        ),
-        (QAProviderResponseError("private", category="response_invalid"), "response_invalid"),
-    ],
-)
-def test_provider_chain_does_not_fallback_for_permanent_or_schema_errors(
-    error: Exception,
-    category: str,
+@pytest.mark.parametrize(("raw_answer", "expected"), (("true", "yes"), ("false", "no")))
+def test_ollama_normalizes_boolean_literals_for_yes_no_questions(
+    raw_answer: str,
+    expected: str,
 ) -> None:
-    fallback = _SuccessfulReasoner()
+    http = _OllamaHTTP(
+        chat={
+            "message": {
+                "content": json.dumps(
+                    {
+                        "answer": raw_answer,
+                        "answerable": True,
+                        "evidence_frame_indices": [1],
+                    }
+                )
+            }
+        }
+    )
 
-    class First(_FailingReasoner):
-        def reason(self, *_args):
-            raise error
-
-    with pytest.raises(QAReasonerError) as captured:
-        ProviderChainReasoner((First(), fallback)).reason(
-            _request(),
-            (_image(),),
-            QACompetitionSpec.historical_numeric(),
-        )
-
-    assert captured.value.category == category
-
-
-@pytest.mark.parametrize("category", ["network_unreachable", "rate_limited", "server_unavailable"])
-def test_provider_chain_falls_back_after_exhausted_transient_error(category: str) -> None:
-    class First(_FailingReasoner):
-        def reason(self, *_args):
-            raise QAProviderRequestError(
-                "private",
-                attempts=5,
-                category=category,
-            )
-
-    result = ProviderChainReasoner((First(), _SuccessfulReasoner())).reason(
-        _request(),
+    result = OllamaQwenReasoner(http=http).reason(
+        _request(question="Does the man wear glasses?"),
         (_image(),),
-        QACompetitionSpec.historical_numeric(),
-    )
-
-    assert result.provider == "successful"
-
-
-def test_provider_chain_preserves_only_safe_error_metadata() -> None:
-    secret = "raw-sdk-body-with-secret"
-
-    class LeakyReasoner(_FailingReasoner):
-        provider_name = "gemini"
-        model_name = "gemini-test"
-
-        def reason(self, *_args):
-            raise QAProviderRequestError(
-                secret,
-                provider=self.provider_name,
-                model=self.model_name,
-                attempts=1,
-                category="invalid_request",
-                status_code=400,
-            )
-
-    with pytest.raises(QAProviderRequestError) as captured:
-        ProviderChainReasoner((LeakyReasoner(),)).reason(
-            _request(),
-            (_image(),),
-            QACompetitionSpec.historical_numeric(),
-        )
-
-    assert secret not in str(captured.value)
-    assert captured.value.safe_metadata()["category"] == "invalid_request"
-    assert captured.value.safe_metadata()["status_code"] == 400
-
-
-def test_qwen_is_lazy_cache_only_pixel_bounded_and_releases_gpu(monkeypatch) -> None:
-    events: list[str] = []
-    processor_settings: dict = {}
-    observed_sizes: list[tuple[int, int]] = []
-
-    class Lease:
-        def __enter__(self):
-            events.append("lease-enter")
-            return self
-
-        def __exit__(self, *_args):
-            events.append("lease-exit")
-
-    class Batch(dict):
-        def to(self, device):
-            events.append(f"inputs-to-{device}")
-            return self
-
-    class Processor:
-        def apply_chat_template(self, messages, **settings):
-            events.append("process")
-            assert settings["tokenize"] is True
-            for part in messages[1]["content"]:
-                if part["type"] == "image":
-                    observed_sizes.append(part["image"].size)
-            return Batch(input_ids=[[1, 2]])
-
-        def batch_decode(self, *_args, **_kwargs):
-            raise AssertionError("string generation should bypass decoding")
-
-    class ProcessorFactory:
-        @staticmethod
-        def from_pretrained(model_name, **settings):
-            events.append("processor-load")
-            processor_settings.update({"model_name": model_name, **settings})
-            return Processor()
-
-    class Model:
-        def to(self, device):
-            events.append(f"model-to-{device}")
-            return self
-
-        def eval(self):
-            events.append("model-eval")
-
-        def generate(self, **settings):
-            events.append("generate")
-            assert settings["do_sample"] is False
-            assert settings["max_new_tokens"] == 32
-            return _response("Red")
-
-    class ModelFactory:
-        @staticmethod
-        def from_pretrained(model_name, **settings):
-            events.append("model-load")
-            assert model_name == "Qwen/Qwen3-VL-4B-Instruct"
-            assert settings["local_files_only"] is True
-            return Model()
-
-    class Cuda:
-        @staticmethod
-        def empty_cache():
-            events.append("empty-cache")
-
-    fake_torch = SimpleNamespace(
-        float16=object(),
-        inference_mode=nullcontext,
-        cuda=Cuda(),
-    )
-    fake_transformers = SimpleNamespace(
-        AutoProcessor=ProcessorFactory,
-        AutoModelForMultimodalLM=ModelFactory,
-    )
-
-    def import_module(name: str):
-        return {"torch": fake_torch, "transformers": fake_transformers}[name]
-
-    monkeypatch.setattr("src.vlm.qa_reasoner.importlib.import_module", import_module)
-    reasoner = Qwen3VLReasoner(
-        max_new_tokens=32,
-        max_pixels=25,
-        gpu_lease=Lease,
-        before_load=lambda: events.append("before-load"),
-    )
-    assert not reasoner.loaded
-    assert events == []
-
-    result = reasoner.reason(
-        _request(question="What color is the wall?"),
-        (_image(size=(20, 10)),),
         QACompetitionSpec.conservative_general_text(),
     )
 
-    assert result.answer == "red"
-    assert reasoner.loaded
-    assert events.index("lease-enter") < events.index("before-load")
-    assert events.index("before-load") < events.index("processor-load")
-    assert processor_settings["local_files_only"] is True
-    assert processor_settings["max_pixels"] == 25
-    assert observed_sizes and observed_sizes[0][0] * observed_sizes[0][1] <= 25
-
-    reasoner.unload()
-    assert not reasoner.loaded
-    assert events[-2:] == ["empty-cache", "lease-exit"]
+    assert result.answer == expected
 
 
-def test_vlm_engine_facade_preserves_legacy_shape_without_eager_calls(tmp_path) -> None:
-    class Reasoner:
-        fingerprint = "facade-fake-v1"
-
+def test_ollama_serializes_concurrent_inference_and_unloads_explicitly() -> None:
+    class ConcurrentHTTP(_OllamaHTTP):
         def __init__(self) -> None:
-            self.calls = []
-            self.unloaded = False
+            super().__init__()
+            self.active = 0
+            self.max_active = 0
+            self.guard = threading.Lock()
 
-        def reason(self, request, images, spec):
-            self.calls.append((request, images, spec))
-            return QAReasoningResult(
-                raw_answer="Red",
-                normalized_answer="red",
-                answerable=True,
-                evidence_frame_indices=(1,),
-                provider="fake",
-                model_name="fake-model",
-                prompt_version="fake-v1",
-                latency_ms=0,
+        def request(self, method, url, **kwargs):
+            if url.endswith("/api/chat"):
+                with self.guard:
+                    self.active += 1
+                    self.max_active = max(self.max_active, self.active)
+                time.sleep(0.02)
+                try:
+                    return super().request(method, url, **kwargs)
+                finally:
+                    with self.guard:
+                        self.active -= 1
+            return super().request(method, url, **kwargs)
+
+    http = ConcurrentHTTP()
+    reasoner = OllamaQwenReasoner(http=http)
+    spec = QACompetitionSpec.conservative_general_text()
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        results = list(
+            executor.map(lambda _index: reasoner.reason(_request(), (_image(),), spec), range(4))
+        )
+    reasoner.unload()
+
+    assert [result.answer for result in results] == ["3"] * 4
+    assert http.max_active == 1
+    method, url, kwargs = http.calls[-1]
+    assert (method, url.rsplit("/", 1)[-1]) == ("POST", "generate")
+    assert kwargs["json"] == {"model": "qwen2.5vl:3b-q4_K_M", "keep_alive": 0}
+
+
+def test_ollama_resource_exhaustion_is_sanitized() -> None:
+    class Exhausted(_OllamaHTTP):
+        def request(self, method, url, **kwargs):
+            if url.endswith("/api/chat"):
+                return _Response({"error": "private allocation details"}, 507)
+            return super().request(method, url, **kwargs)
+
+    with pytest.raises(QAProviderRequestError) as captured:
+        OllamaQwenReasoner(http=Exhausted()).reason(
+            _request(), (_image(),), QACompetitionSpec.conservative_general_text()
+        )
+    assert captured.value.category == "resource_exhausted"
+    assert "private" not in str(captured.value)
+
+
+def test_gemini_interactions_payload_is_single_image_structured_and_bounded() -> None:
+    calls: list[dict] = []
+    client_options: list[dict] = []
+
+    class Interactions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(
+                output_text=json.dumps(
+                    {"answer": "3", "answerable": True, "evidence_frame_indices": [1]}
+                )
+            )
+
+    def factory(**kwargs):
+        client_options.append(kwargs)
+        return SimpleNamespace(interactions=Interactions())
+
+    provider = GeminiFlashReasoner(api_key="secret", client_factory=factory)
+    request = _request(
+        reasoning_policy="gemini_then_local", allow_external_frame_transfer=True
+    )
+    result = provider.reason(request, (_image(),), QACompetitionSpec.conservative_general_text())
+
+    assert result.provider == "gemini"
+    assert client_options == [
+        {"api_key": "secret", "http_options": {"timeout": 5000, "retry_options": {"attempts": 1}}}
+    ]
+    assert calls[0]["input"][0]["type"] == "text"
+    assert calls[0]["input"][1]["type"] == "image"
+    assert base64.b64decode(calls[0]["input"][1]["data"]) == _image().data
+    assert calls[0]["generation_config"]["thinking_level"] == "minimal"
+    assert calls[0]["store"] is False
+    with pytest.raises(ValueError):
+        provider.reason(request, (_image(1), _image(2)), QACompetitionSpec.conservative_general_text())
+
+
+def test_router_local_only_never_calls_gemini() -> None:
+    class ForbiddenGemini:
+        provider_name = "gemini"
+        model_name = "gemini-test"
+        fingerprint = "gemini"
+
+        def reason(self, *_args, **_kwargs):
+            raise AssertionError("Gemini must not be called")
+
+        def unload(self):
+            return None
+
+    local_http = _OllamaHTTP()
+    router = QAReasonerRouter(ForbiddenGemini(), OllamaQwenReasoner(http=local_http))
+    result = router.reason(_request(), (_image(),), QACompetitionSpec.conservative_general_text())
+    assert result.provider == "ollama-qwen"
+    assert result.fallback_used is False
+
+
+def test_router_falls_back_from_missing_gemini_key_once() -> None:
+    local_http = _OllamaHTTP()
+    router = QAReasonerRouter(
+        GeminiFlashReasoner(api_key=None), OllamaQwenReasoner(http=local_http)
+    )
+    request = _request(
+        reasoning_policy="gemini_then_local", allow_external_frame_transfer=True
+    )
+    result = router.reason(request, (_image(),), QACompetitionSpec.conservative_general_text())
+    assert result.provider == "ollama-qwen"
+    assert result.fallback_used is True
+    assert result.fallback_reason_code == "not_configured"
+    assert result.attempts == 2
+
+
+def test_router_does_not_fallback_after_permanent_gemini_error() -> None:
+    class RejectedGemini:
+        provider_name = "gemini"
+        model_name = "gemini-test"
+        fingerprint = "gemini"
+
+        def reason(self, *_args, **_kwargs):
+            raise QAProviderRequestError(
+                "safe", provider=self.provider_name, category="invalid_request", status_code=400
             )
 
         def unload(self):
-            self.unloaded = True
+            return None
 
-    path = tmp_path / "frame.png"
-    path.write_bytes(_image_bytes())
-    provider = Reasoner()
-    engine = VLMEngine(reasoner=provider)
-    assert provider.calls == []
+    class ForbiddenLocal:
+        provider_name = "ollama-qwen"
+        model_name = "local-test"
+        fingerprint = "local"
 
-    result = engine.ask(path, "What color is the object?", system_prompt="A person enters.")
+        def reason(self, *_args, **_kwargs):
+            raise AssertionError("local fallback must not run")
 
-    assert result == {
-        "answer": "red",
-        "confidence": 1.0,
-        "answerable": True,
-        "evidence_frame_indices": [1],
-        "provider": "fake",
-        "model_name": "fake-model",
-    }
-    assert provider.calls[0][0].event_description == "A person enters."
-    engine.unload()
-    assert provider.unloaded
+        def unload(self):
+            return None
+
+    router = QAReasonerRouter(RejectedGemini(), ForbiddenLocal())
+    request = _request(
+        reasoning_policy="gemini_then_local", allow_external_frame_transfer=True
+    )
+    with pytest.raises(QAProviderRequestError):
+        router.reason(request, (_image(),), QACompetitionSpec.conservative_general_text())
+
+
+def test_gemini_policy_without_consent_is_rejected_by_contract() -> None:
+    with pytest.raises(ValueError):
+        QASingleFrameAnswerRequest(candidate_id="b1:V001:10", question="question")

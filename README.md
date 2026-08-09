@@ -55,26 +55,26 @@ spending ranks on near-duplicates.
 ## Visual Q&A architecture
 
 ```text
-event description -> Textual KIS (refine_raw=false) -> 20 diverse temporal clusters
+event description -> Textual KIS (refine_raw=false) -> five canonical candidates
                                                         |
-                                                        v
-                                  3--5 canonical frames within +/-4 seconds
+                                  UI/operator selects exactly one frame
                                                         |
-                           bounded ZIP/local resolver -> normalized inline images
+                           bounded ZIP/local resolver -> one normalized image
                                                         |
-                       Gemini 3.6 Flash -> optional cache-only Qwen3-VL fallback
+                  Gemini 3.6 Flash -> bounded local Qwen2.5-VL/Ollama fallback
                                                         |
-                         normalized answer + evidence positions + safe provenance
-                                                        |
-                  representative-first / neighbor-round-robin top-100 predictions
+                       concise answer + exact single-frame provenance
                                                         |
                        SQLite session/cache -> API/UI -> validated QA CSV
 ```
 
-Interactive searches reason over five clusters and expand idempotently to 10, 15, or 20;
-automatic searches perform the same bounded cascade to 20. Reference ZIP members are streamed
-without extraction. The resolver accepts only persisted canonical frame identities, applies EXIF
-orientation and bounded resizing, and hashes the normalized bytes used by provider/cache calls.
+Retrieval and answering are separate operations. Stage 1 never resolves media or calls a VLM;
+Stage 2 accepts only one candidate frozen in the version-3 session and sends exactly one image to
+the selected provider. A different candidate can be answered without rerunning retrieval. Legacy
+version-2 cascade sessions remain readable but cannot be expanded or mutated. Reference ZIP
+members are streamed without extraction. The resolver accepts only persisted canonical frame
+identities, applies EXIF orientation and bounded resizing, and hashes the normalized bytes used by
+provider/cache calls.
 
 ## TRAKE architecture
 
@@ -119,6 +119,9 @@ The validated contracts live in `src/contracts.py` and are JSON-friendly.
 | `SearchHit` | Rank, video, decoded source frame, timestamp, shot, fused score, channel ranks, evidence, thumbnail |
 | `CompetitionSpec` | Versioned output columns, video normalization, frame semantics, result maximum, cutoffs, interval rules |
 | `QAQueryRequest` | Event-only retrieval text, visual question, mode, batch filters, answer-spec ID, result limit |
+| `QACandidateRequest` | Retrieval-only event text, exactly one batch, and a candidate limit |
+| `QACandidateFrame` | Stable candidate identity, canonical frame/timestamp, score, channel ranks, and safe evidence |
+| `QASingleFrameAnswerRequest` | Candidate ID, question, answer spec, provider policy, and optional explicit Florence task |
 | `QAReasoningResult` | Raw/normalized answer, answerability, evidence positions, provider/model/prompt/cache provenance |
 | `QAPrediction` | Canonical batch/video/source frame, answer, ranking proxy, answer source, window and evidence |
 | `QACompetitionSpec` | Independent numeric/general answer normalization, three-column export, intervals and cutoffs |
@@ -146,7 +149,7 @@ src/extraction/       Media probe, adaptive keyframes, OCR, ASR, calibration
 src/embedding/        SigLIP2, Vietnamese text, and OpenCLIP adapters
 src/indexing/         Lazy Qdrant and Meilisearch adapters
 src/retrieval/        KIS, QA clustering/media/sessions, and strict TRAKE temporal alignment
-src/vlm/              Lazy Gemini/Qwen reasoners, normalization, and the compatibility facade
+src/vlm/              Gemini/Ollama providers, routing, normalization, and facade
 src/evaluation/       Textual KIS, Visual Q&A, and provisional TRAKE evaluators
 src/api.py            FastAPI transport over the shared retrieval runtime
 tests/                 CPU-only/offline default tests plus explicit integration boundaries
@@ -173,10 +176,9 @@ services. Those actions occur only through explicit CLI/application startup call
 ### Accelerated profile (optional)
 
 For a 12--24 GiB NVIDIA GPU, set `profile: accelerated`. This enables the profile-gated
-OpenCLIP channel and also permits the pinned cache-only
-`Qwen/Qwen3-VL-4B-Instruct` fallback after Gemini. Qwen acquires the shared GPU lease, unloads
-dense encoders, reasons over one five-frame window at a time, then releases VRAM before the next
-dense retrieval. The laptop profile remains Gemini-only for Visual Q&A.
+OpenCLIP channel and can use a separately configured larger Ollama vision model. Visual Q&A is
+local-first in both profiles. The runtime releases dense encoders before Ollama inference and
+asks Ollama to release its model before the next KIS or TRAKE request.
 
 ## Bootstrap and services
 
@@ -195,12 +197,31 @@ The supported workflow is Windows PowerShell with Python 3.11 managed locally by
 ```
 
 `bootstrap.ps1` does not overwrite `.env`. A new file receives independent local Qdrant and
-Meilisearch keys. Keep it uncommitted. Configure a newly rotated Gemini credential only as
-`GEMINI_API_KEY` in that file; never reuse a key pasted into chat, source, logs, or command
-history. Qdrant binds to `127.0.0.1:6333/6334` and Meilisearch to
+Meilisearch keys. Keep it uncommitted. `OLLAMA_URL` defaults to loopback; `GEMINI_API_KEY`
+remains server-side and is used only after explicit per-session frame-transfer consent.
+Qdrant binds to `127.0.0.1:6333/6334` and Meilisearch to
 `127.0.0.1:7700`. Qdrant uses Docker-managed Linux volumes so Windows bind-mount semantics cannot
 break atomic segment renames; Meilisearch state and any retained Qdrant migration rollback copy
 remain under `docker_data/`.
+
+Visual Q&A requires the official Ollama Windows build and exactly the pinned laptop model. The
+canonical launcher uses `.tools/Ollama/ollama.exe` when the standalone build is installed there,
+binds it to loopback, disables Ollama cloud, and stores generated model state under
+`models/ollama`. The laptop launcher defaults to the bundled Vulkan backend because the RTX 2050
+driver on the reference machine cannot execute the current CUDA-v12 kernels; override
+`OLLAMA_LLM_LIBRARY` only after a live check. Provision only the 3B tag on the laptop:
+
+```powershell
+$env:OLLAMA_MODELS = (Resolve-Path models).Path + "\ollama"
+$env:OLLAMA_HOST = "127.0.0.1:11434"
+$env:OLLAMA_NO_CLOUD = "1"
+.\.tools\Ollama\ollama.exe pull qwen2.5vl:3b-q4_K_M
+.\.venv-runtime\Scripts\python.exe scripts\check_vlm_offline.py
+```
+
+The configuration pins manifest digest prefix `fb90415cde1e`; do not substitute `latest`, which
+selects the larger 7B artifact. No Ollama SDK is required because the provider uses the local REST
+API directly.
 
 Runtime selection is deterministic for both `AIC_PROFILE` and `AIC_BATCH_ID`: an explicit
 process environment value wins, then the untracked `.env` value, then `config/settings.yaml`.
@@ -224,8 +245,8 @@ docker compose up -d
 ```
 
 This group includes PyAV, CUDA PyTorch 2.5.1/torchvision 0.20.1, Transformers, OpenCLIP,
-PaddleOCR/PaddlePaddle, Faster-Whisper, and the Hugging Face client. It does not download model
-weights merely by being installed.
+PaddleOCR/PaddlePaddle, Faster-Whisper, CTranslate2, SentencePiece/Sacremoses, and the Hugging
+Face client. It does not download model weights merely by being installed.
 
 ## Prepare pinned models and prove offline readiness
 
@@ -241,11 +262,38 @@ $Uv = Resolve-Path .tools/uv/0.11.16/uv.exe
 
 # Or prepare selected families. Repeat --only as needed in a single invocation.
 & $Uv run --frozen --group competition python scripts/prepare_models.py `
-  --only visual --only organizer --only accelerated --only text --only asr --only ocr --only qwen
+  --only visual --only organizer --only accelerated --only text --only asr --only ocr `
+  --only translation
 
 # Add other prepared runtime assets or tool directories to a checksum manifest.
 & $Uv run --frozen python scripts/freeze_assets.py models .tools/my-runtime-tool
 ```
+
+### Vietnamese query routing
+
+Vietnamese text is routed by encoder instead of being globally replaced. Organizer and
+accelerated OpenCLIP receive only the English translation; native SigLIP2 internally fuses the
+Vietnamese and English variants as one logical channel; the Vietnamese semantic encoder and
+OCR/ASR lexical indexes retain the original Vietnamese query. Metadata searches both variants.
+Translation is fully offline through the pinned OPUS-MT vi→en checkpoint converted to
+CTranslate2 CPU INT8. Missing or invalid translation assets degrade only English-centric
+channels and never trigger Ollama or a cloud provider.
+
+```powershell
+# Prepare/checksum only the offline translator (existing manifest entries are preserved).
+& $Uv run --frozen --group competition python scripts/prepare_models.py --only translation
+
+# Build multilingual shadow indexes. This never promotes or changes the live v1 indexes.
+& $Uv run --frozen python scripts/provision_meili_shadow.py --dry-run
+
+# Unlabeled comparison: reports rank agreement/Jaccard, never "precision".
+& $Uv run --frozen python scripts/test_vietnamese_retrieval.py `
+  --batch-id aic25-b1-reference
+```
+
+The UI exposes `auto|vi|en` and an optional English override for KIS, QA retrieval, and every
+TRAKE prompt. API responses include sanitized `query_processing` diagnostics; query text is not
+written to operational logs.
 
 The preparation commands create material generated state under `models/` and a runtime checksum
 manifest. They have not been run merely because this repository was checked out.
@@ -492,17 +540,14 @@ no-label/default report is retained for auditability but never overrides current
 
 ## API and interactive UI
 
-Start the automatic API and the interactive console in separate terminals:
+Run the API-backed stack with the canonical launcher:
 
 ```powershell
-$Uv = Resolve-Path .tools/uv/0.11.16/uv.exe
-& $Uv run --frozen python scripts/serve.py --host 127.0.0.1 --port 8080
-
 # One-time, pinned competition runtime (kept separate from the test .venv).
 .\scripts\bootstrap_runtime.ps1 -Profile laptop
 
-# Canonical UI launch: validates the runtime stamp, port, and selected batch.
-.\scripts\run_app.ps1 -Profile laptop -BatchId aic25-b1-reference -Port 8501
+# One stack: FastAPI owns RuntimeContext; Streamlit is an HTTP-only client.
+.\scripts\run_app.ps1 -Profile laptop -BatchId aic25-b1-reference -ApiPort 8080 -Port 8504
 ```
 
 The launcher never starts Docker unless requested, kills a port owner, or changes ports. It uses
@@ -510,14 +555,14 @@ a lightweight batch/runtime preflight so Streamlit liveness is available immedia
 service, index, and canonical-image audit then runs in the single-flight background warm-up;
 all search controls remain locked until that audit and required model warm-up finish.
 `python scripts/runtime_doctor.py --batch-id aic25-b1-reference` still prints the complete
-secret-free readiness report without starting the application. Add `--live-gemini` only for an
-explicit network integration check with the rotated key in untracked `.env`.
+secret-free readiness report without starting the application. Add `--live-local-vlm` only for
+an explicit Ollama inference check.
 
 The Textual KIS tab exposes editable clauses, evidence/channel ranks, neighboring frames,
-Rocchio feedback, pinning, and validated export. The isolated Visual Q&A tab retrieves by event
-description, displays chronological five-frame windows with selected evidence emphasized,
-supports manual or automatic five-cluster expansion, safe provider traces, raw/normalized
-answers, persisted audited operator edits, pinning, session restore, and validated QA export.
+Rocchio feedback, pinning, and validated export. The isolated Visual Q&A tab retrieves five
+canonical frames by event description, lets the operator choose one frame, and runs one explicit
+single-image answer request. Candidates, answers, selection, pinning, session restore, and
+validated QA export persist independently across UI reruns.
 The TRAKE tab provides a Vietnamese global description editor, 2--20 ordered stage controls,
 top-100 distinct-video results, a horizontal stage timeline with canonical source frames, and a
 validated no-header CSV download.
@@ -532,10 +577,14 @@ or indexes surface as errors rather than fabricated matches.
 | `POST` | `/v1/kis/search` | Automatic or interactive initial hybrid search |
 | `POST` | `/v1/kis/refine` | Fresh search with positive/negative `VIDEO_ID:SOURCE_FRAME_IDX` feedback IDs |
 | `GET` | `/v1/frames/{batch}/{video}/{source_frame_idx}/neighbors` | Timestamp-based canonical neighborhood (`radius_ms`, `limit`) |
-| `POST` | `/v1/qa/search` | Initial five-cluster QA search; automatic mode continues in five-cluster batches to 20 |
-| `POST` | `/api/v1/search/qa` | Deprecated compatibility alias for `/v1/qa/search` |
-| `POST` | `/v1/qa/search/{search_id}/expand` | Idempotently expand an interactive search to 10, 15, or 20 clusters |
-| `GET` | `/v1/qa/search/{search_id}` | Restore cumulative predictions, traces, failures, and audited edits |
+| `POST` | `/v1/qa/retrieve` | Retrieval-only Top-5 canonical candidates; never invokes a VLM |
+| `POST` | `/v1/qa/search` | Deprecated retrieval-only compatibility alias |
+| `POST` | `/api/v1/search/qa` | Deprecated retrieval-only compatibility alias |
+| `POST` | `/v1/qa/search/{search_id}/answer` | Answer on exactly one persisted candidate frame |
+| `POST` | `/v1/qa/search/{search_id}/expand` | Removed cascade endpoint; always returns `410 qa_expand_removed` |
+| `GET` | `/v1/qa/search/{search_id}` | Restore candidates, selected frame, answers, failures, and audited edits |
+| `POST` | `/v1/qa/search/{search_id}/edits` | Persist an audited operator answer edit through the API |
+| `POST` | `/v1/qa/diagnostics/image` | Run a non-persistent single-image diagnostic (8 MiB maximum) |
 | `GET` | `/v1/frames/{batch}/{video}/{source_frame_idx}/image` | Stream a bounded canonical image without accepting a client URI |
 | `POST` | `/v1/qa/submissions/export` | Validate an active batch and return headerless `video_name,frame_idx,answer` CSV |
 | `POST` | `/v1/trake/search` | Retrieve and strictly align 2--20 ordered event stages in one compatible dense space |
@@ -546,6 +595,7 @@ or indexes surface as errors rather than fabricated matches.
 | `GET` | `/v1/readiness?batch_id=...` | Batch-aware KIS/QA readiness, channel applicability, and sanitized canonical-launch identity |
 | `GET` | `/v1/health/status?batch_id=...` | Sanitized KIS/QA/TRAKE, ingest, warm-up, and aggregate channel health |
 | `GET` | `/api/v1/health/status?batch_id=...` | Deprecated compatibility alias for `/v1/health/status` |
+| `GET` | `/v1/runtime/capabilities` | Sanitized runtime, workflow, and Visual Q&A provider capabilities |
 | `GET` | `/healthz` | Process health |
 
 Minimal search request:
@@ -556,7 +606,9 @@ Minimal search request:
   "original_text": "một người mặc áo đỏ đi qua cây cầu",
   "mode": "automatic",
   "batch_filters": ["AIC26-B2"],
-  "limit": 100
+  "limit": 100,
+  "reasoning_policy": "local_only",
+  "allow_external_frame_transfer": false
 }
 ```
 
@@ -568,17 +620,27 @@ present, duplicates, inactive batches, unsafe filenames, and more than 100 rows.
 validation avoids misclassifying a legitimate refined source-frame number that merely equals an
 unrelated ordinal. The evidence is persisted during reference/native ingestion.
 
-Minimal Visual Q&A request:
+Minimal Visual Q&A Stage-1 request:
 
 ```json
 {
   "query_id": "qa-001",
   "event_description": "một người đang cầm ba quả táo",
-  "question": "Người đó đang cầm bao nhiêu quả táo?",
-  "mode": "interactive",
-  "answer_spec_id": "aic-2024-visual-qa-numeric-v1",
   "batch_filters": ["AIC26-B2"],
-  "limit": 100
+  "top_k": 5
+}
+```
+
+Stage 2 binds the question to one returned candidate:
+
+```json
+{
+  "candidate_id": "AIC26-B2:L01_V001:120",
+  "question": "Người đó đang cầm bao nhiêu quả táo?",
+  "answer_spec_id": "aic-2024-visual-qa-numeric-v1",
+  "reasoning_policy": "local_only",
+  "allow_external_frame_transfer": false,
+  "answer_engine": "qwen"
 }
 ```
 
@@ -652,21 +714,18 @@ Run the normal validation before handing off Python changes:
 .\scripts\check.ps1
 .\scripts\check.ps1 -IncludeCompose -IncludeServices -IncludeStreamlit -IncludeStreamlitRuntime
 
-# Explicit integrations only; neither runs during bootstrap/default checks.
-.\scripts\check.ps1 -IncludeGemini  # rotated key + network
-.\scripts\check.ps1 -IncludeQwen    # prepared cache + nominal 12 GiB CUDA GPU
+# Explicit local-model integration only; it does not run during default checks.
+.\scripts\check.ps1 -IncludeLocalVLM
 ```
 
-By default, `scripts/check_gemini.py` makes exactly one multimodal provider attempt using a tiny
-synthetic image. Its extended diagnostic requires `--allow-multiple-provider-calls`; all stages
-share the same 13-RPM governor and 4.5-second pacing. It prints only allowlisted operational
-metadata. Sending real competition frames is a separate, explicit one-call check:
+`scripts/check_vlm_offline.py` verifies the pinned Ollama tag, digest and vision capability,
+then runs one cold and one warm synthetic-image inference. The two-second warm target is a
+warning unless `--strict-latency` is supplied. Checking indexed media is separate:
 
 ```powershell
-.\.venv-runtime\Scripts\python.exe scripts\check_gemini.py
+.\.venv-runtime\Scripts\python.exe scripts\check_vlm_offline.py
 
 .\.venv-runtime\Scripts\python.exe scripts\check_qa_live.py `
-  --live-gemini --allow-external-frame-transfer `
   --batch-id aic25-b1-reference `
   --event-description "a person holding a cat" `
   --question "What animal is visible?" `
@@ -700,10 +759,10 @@ Environment/corpus acceptance remains a separate operation. Before competition d
   batch, and a real query; `--full` also passes feedback, temporary export, reconnect, and recovery.
 - The explicit `--operational` drill physically restarts local services and confirms persisted
   results after arrival cataloging and bounded core ingestion.
-- A live Gemini check succeeds with a newly rotated key, and cached replay remains below two
-  seconds locally. Initial/expansion batches never exceed five provider calls or 20 total.
-- The accelerated profile is marked ready only after `-IncludeQwen` completes five-frame
-  structured inference without OOM and reports peak VRAM on the target 12--24 GiB GPU.
+- The pinned local Ollama model reports vision capability and completes cold/warm structured
+  checks. Every answer request contains exactly one persisted canonical frame.
+- Any accelerated model tag is admitted only after Ollama confirms vision capability and the
+  target machine completes structured inference without OOM.
 
 These are acceptance gates to measure on the target machine; checkout, bootstrap, and unit tests
 alone do not prove them.
@@ -733,9 +792,9 @@ alone do not prove them.
   queries and ground-truth intervals that are not bundled automatically.
 - Batch 2 has not arrived in this workspace, so its native collections, ten-video ingestion
   projection, raw-refinement p95, and end-to-end `--operational` drill remain data-dependent gates.
-- Gemini live inference is always opt-in and requires a replacement credential stored only in
-  untracked `.env`; the compromised pasted credential is never used. Normal tests use injected
-  providers only, and real-frame transfer additionally requires its explicit consent flag.
+- Gemini is the primary single-frame QA provider and always requires an untracked server-side
+  key plus explicit per-session consent. Qwen local remains the bounded offline fallback, while
+  explicit local-only mode makes no outbound provider request.
 - The accelerated 12–24 GiB Qwen profile is implemented but cannot be validated on this 4 GiB
   laptop; its readiness remains a target-machine acceptance gate.
 - The default model preparation script covers the laptop core but not accelerated OpenCLIP or
@@ -744,7 +803,7 @@ alone do not prove them.
 - The TRAKE core, API, evaluator, provisional exporter, and UI are implemented, but the official
   AIC 2026 TRAKE schema/evaluator and Batch-2 latency gate are not yet available. Object-detector
   inference remains intentional scaffolding. Visual Q&A requires prepared canonical frame
-  artifacts and either a rotated Gemini key or a validated accelerated Qwen cache.
+  artifacts and a reachable pinned Ollama vision model.
 
 For a clean Python environment while retaining all user data, use
 `.\scripts\reset-env.ps1`. Add `-PurgePackageCache` only when deliberately discarding the

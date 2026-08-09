@@ -1,7 +1,10 @@
 """Visual-language reasoning providers and compatibility facade."""
 
+from src.vlm.florence2 import Florence2TaskReasoner
+from src.vlm.gemini import GeminiFlashReasoner
+from src.vlm.gpu_coordinator import GPUModelCoordinator
+from src.vlm.local_qwen import OllamaQwenReasoner
 from src.vlm.qa_reasoner import (
-    GeminiInteractionsReasoner,
     ProviderChainReasoner,
     QAImage,
     QAProviderRequestError,
@@ -10,12 +13,15 @@ from src.vlm.qa_reasoner import (
     QAReasoner,
     QAReasonerError,
     QAReasoningResult,
-    Qwen3VLReasoner,
 )
+from src.vlm.qa_router import QAReasonerRouter
 from src.vlm.vlm_engine import VLMEngine
 
 __all__ = [
-    "GeminiInteractionsReasoner",
+    "OllamaQwenReasoner",
+    "GeminiFlashReasoner",
+    "Florence2TaskReasoner",
+    "GPUModelCoordinator",
     "ProviderChainReasoner",
     "QAImage",
     "QAProviderRequestError",
@@ -24,6 +30,6 @@ __all__ = [
     "QAReasoner",
     "QAReasonerError",
     "QAReasoningResult",
-    "Qwen3VLReasoner",
+    "QAReasonerRouter",
     "VLMEngine",
 ]

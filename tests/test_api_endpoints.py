@@ -17,6 +17,7 @@ from src.readiness import (
     ChannelApplicability,
     ChannelReadiness,
     ChannelState,
+    ReadinessReport,
     WorkflowReadiness,
     WorkflowState,
 )
@@ -276,6 +277,43 @@ def test_warmup_gates_search_and_exposes_runtime_health(tmp_path: Path) -> None:
     assert ready_error.value.status_code == 503
 
 
+def test_warmup_start_releases_local_vlm_and_restarts_evicted_runtime(
+    tmp_path: Path,
+) -> None:
+    class _Warmup:
+        def __init__(self) -> None:
+            self.state = "evicted"
+            self.started = 0
+
+        def start(self) -> bool:
+            self.started += 1
+            self.state = "warming"
+            return True
+
+        def snapshot(self) -> dict[str, Any]:
+            return {
+                "state": self.state,
+                "search_usable": False,
+                "channels": [],
+            }
+
+    class _Reasoner:
+        def __init__(self) -> None:
+            self.unloaded = 0
+
+        def unload(self) -> None:
+            self.unloaded += 1
+
+    context = _context(tmp_path, FakePipeline())
+    context.warmup = _Warmup()
+    context.qa_reasoner = _Reasoner()
+    endpoint = _endpoint(create_app(context), "/v1/runtime/warmup/start", "POST")
+
+    assert endpoint()["state"] == "warming"
+    assert context.warmup.started == 1
+    assert context.qa_reasoner.unloaded == 1
+
+
 def test_workflow_gate_unlocks_kis_while_trake_is_still_warming(tmp_path: Path) -> None:
     class _Warmup:
         @staticmethod
@@ -316,6 +354,89 @@ def test_workflow_gate_unlocks_kis_while_trake_is_still_warming(tmp_path: Path) 
     assert trake_ready.value.detail["workflow"] == "trake"
 
 
+def test_qa_answer_readiness_reuses_published_warmup_report(tmp_path: Path) -> None:
+    report = SimpleNamespace(
+        batch_id="aic25-b1-reference",
+        channels=(
+            SimpleNamespace(name="canonical_images", usable=True),
+            SimpleNamespace(name="ollama_vlm", usable=True),
+        ),
+    )
+
+    class _Warmup:
+        @staticmethod
+        def readiness_report() -> Any:
+            return report
+
+        @staticmethod
+        def snapshot() -> dict[str, Any]:
+            return {"state": "ready", "search_usable": True, "workflows": {}}
+
+    context = _context(tmp_path, FakePipeline())
+    context.selected_batch_id = "aic25-b1-reference"
+    context.warmup = _Warmup()
+    context.readiness_service = SimpleNamespace(
+        check=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("published readiness must avoid a synchronous rescan")
+        )
+    )
+    ready = _endpoint(create_app(context), "/readyz", "GET")
+
+    assert ready("qa", "answer") == {
+        "status": "ready",
+        "workflow": "qa",
+        "stage": "answer",
+    }
+
+
+def test_readiness_endpoint_reuses_published_warmup_report(tmp_path: Path) -> None:
+    workflow = WorkflowReadiness(WorkflowState.READY, (), ())
+    report = ReadinessReport(
+        profile="laptop",
+        batch_id="aic25-b1-reference",
+        selected_batch_id="aic25-b1-reference",
+        launch_identity={},
+        mode="app",
+        kis=workflow,
+        qa=workflow,
+        channels=(
+            ChannelReadiness(
+                "canonical_images", ChannelApplicability.REQUIRED, ChannelState.READY
+            ),
+            ChannelReadiness(
+                "ollama_vlm", ChannelApplicability.REQUIRED, ChannelState.READY
+            ),
+        ),
+        checks=(),
+        checked_at_unix=1.0,
+    )
+
+    class _Warmup:
+        @staticmethod
+        def readiness_report() -> ReadinessReport:
+            return report
+
+        @staticmethod
+        def snapshot() -> dict[str, Any]:
+            return {"state": "ready", "search_usable": True, "workflows": {}}
+
+    context = _context(tmp_path, FakePipeline())
+    context.selected_batch_id = "aic25-b1-reference"
+    context.warmup = _Warmup()
+    context.readiness_service = SimpleNamespace(
+        check=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("published readiness must avoid a synchronous rescan")
+        )
+    )
+    endpoint = _endpoint(create_app(context), "/v1/readiness", "GET")
+
+    payload = endpoint()
+
+    assert payload["batch_id"] == "aic25-b1-reference"
+    assert payload["qa_stages"]["retrieve"]["usable"] is True
+    assert payload["qa_stages"]["answer"]["usable"] is True
+
+
 def test_provisioning_reuses_readiness_and_keeps_reference_ingest_null(
     tmp_path: Path,
 ) -> None:
@@ -324,9 +445,7 @@ def test_provisioning_reuses_readiness_and_keeps_reference_ingest_null(
         "batch_id": "aic25-b1",
         "kis": {"state": "ready"},
         "qa": {"state": "degraded"},
-        "channels": [
-            {"name": "visual", "state": "not_provisioned", "reason_code": "missing"}
-        ],
+        "channels": [{"name": "visual", "state": "not_provisioned", "reason_code": "missing"}],
         "checks": [],
         "checked_at_unix": 1.0,
     }

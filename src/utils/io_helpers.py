@@ -24,7 +24,7 @@ from src import CONFIG_DIR, PROJECT_ROOT
 _VALID_PROFILES = frozenset({"laptop", "accelerated"})
 _SAFE_BATCH_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
-_CANONICAL_LAUNCH_CONTRACT = "run_app-v1"
+_CANONICAL_LAUNCH_CONTRACT = "run_app-v2"
 _SAFE_LAUNCH_LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 

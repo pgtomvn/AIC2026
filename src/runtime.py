@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import threading
+import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,6 +25,7 @@ from src.indexing.vector_store import BatchVectorStore, VectorStore
 from src.ingest.ledger import JobLedger, LedgerError
 from src.ingest.native_pipeline import ScratchManager
 from src.organizer_verification import organizer_verification_passed
+from src.query.translator import OfflineVietnameseTranslator, QueryTextAdapter, TranslationCache
 from src.retrieval.raw_refiner import LocalFrameRefiner, PersistentRefinedFrameSink
 from src.retrieval.textual_kis import DenseChannel, LexicalChannel, TextualKISPipeline
 from src.utils.io_helpers import (
@@ -66,8 +67,11 @@ class RuntimeContext:
     ledger: JobLedger
     artifact_repository: Any = None
     qa_pipeline: Any = None
+    qa_reasoner: Any = None
     qa_session_store: Any = None
     qa_image_resolver: Any = None
+    florence_reasoner: Any = None
+    gpu_coordinator: Any = None
     readiness_service: Any = None
     selected_batch_id: str = ""
     launch_identity: dict[str, Any] = field(default_factory=dict)
@@ -92,12 +96,40 @@ class RuntimeContext:
         return tuple(validated)
 
 
-_QA_GPU_LEASE = threading.RLock()
-
-
 def _project_path(value: str) -> Path:
     path = Path(value)
     return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+def build_query_adapter(config: Mapping[str, Any]) -> QueryTextAdapter:
+    """Compose the optional offline translator without loading it or creating files."""
+
+    model = config.get("models", {}).get("query_translation", {})
+    if not isinstance(model, Mapping) or not bool(model.get("enabled", False)):
+        return QueryTextAdapter()
+    data = config.get("data", {})
+    cache = TranslationCache(
+        _project_path(str(data.get("translation_cache_db", "data/state/query_translation.sqlite3"))),
+        max_entries=int(model.get("disk_cache_entries", 10_000)),
+    )
+    translator = OfflineVietnameseTranslator(
+        model_name=str(model["model_name"]),
+        revision=str(model["revision"]),
+        model_path=_project_path(str(model["converted_path"])),
+        tokenizer_path=_project_path(str(model.get("tokenizer_path", model["source_path"]))),
+        source_model_path=_project_path(str(model["source_path"])),
+        cache=cache,
+        memory_entries=int(model.get("memory_cache_entries", 2_048)),
+        compute_type=str(model.get("compute_type", "int8")),
+        intra_threads=int(model.get("intra_threads", 4)),
+        max_decoding_length=int(model.get("max_decoding_length", 128)),
+        allow_transformers_fallback=bool(model.get("allow_transformers_fallback", True)),
+        asset_manifest=_project_path(str(model["asset_manifest"]))
+        if model.get("asset_manifest")
+        else None,
+        asset_root=PROJECT_ROOT,
+    )
+    return QueryTextAdapter(translator)
 
 
 def build_pipeline(config: dict[str, Any] | None = None) -> TextualKISPipeline:
@@ -107,6 +139,7 @@ def build_pipeline(config: dict[str, Any] | None = None) -> TextualKISPipeline:
     models = settings["models"]
     services = settings["services"]
     retrieval = settings["retrieval"]
+    query_adapter = build_query_adapter(settings)
     visual = models["visual"]
     qdrant = services["qdrant"]
     meili = services["meilisearch"]
@@ -275,6 +308,7 @@ def build_pipeline(config: dict[str, Any] | None = None) -> TextualKISPipeline:
         early_cutoff=int(diversity.get("early_cutoff", 20)),
         early_per_video=int(diversity.get("early_per_video", 2)),
         late_per_video=int(diversity.get("late_per_video", 5)),
+        query_adapter=query_adapter,
     )
 
 
@@ -421,6 +455,8 @@ def build_runtime(config: dict[str, Any] | None = None) -> RuntimeContext:
             grouped_search_workers=int(trake_settings.get("grouped_search_workers", 8)),
             vector_scroll_batch_size=int(trake_settings.get("vector_scroll_batch_size", 4_096)),
             trajectory_cache=trajectory_cache,
+            query_adapter=pipeline.query_adapter,
+            lexical_channels=pipeline.lexical_channels,
         )
     trake_pipeline = TRAKEPipelineRouter(
         trake_cores,
@@ -462,7 +498,8 @@ def build_runtime(config: dict[str, Any] | None = None) -> RuntimeContext:
             top_windows=int(refinement["top_windows"]),
             frame_sink=frame_sink,
         )
-    qa_pipeline = qa_session_store = qa_image_resolver = None
+    qa_pipeline = qa_session_store = qa_image_resolver = qa_reasoner = None
+    florence_reasoner = gpu_coordinator = None
     warmup_service: WarmupService | None = None
     if repository is not None:
         from src.contracts import QACompetitionSpec
@@ -470,11 +507,10 @@ def build_runtime(config: dict[str, Any] | None = None) -> RuntimeContext:
         from src.retrieval.qa_retrieval import VisualQARetriever
         from src.retrieval.qa_session import QASessionStore
         from src.retrieval.visual_qa import VisualQAPipeline
-        from src.vlm.qa_reasoner import (
-            GeminiInteractionsReasoner,
-            ProviderChainReasoner,
-            Qwen3VLReasoner,
-        )
+        from src.vlm.gemini import GeminiFlashReasoner
+        from src.vlm.gpu_coordinator import GPUModelCoordinator
+        from src.vlm.local_qwen import OllamaQwenReasoner
+        from src.vlm.qa_router import QAReasonerRouter
 
         qa = settings.get("retrieval", {}).get("visual_qa", {})
         qa_session_store = QASessionStore(
@@ -493,59 +529,63 @@ def build_runtime(config: dict[str, Any] | None = None) -> RuntimeContext:
             retrieval_depth=int(qa.get("candidate_pool", 100)),
             max_clusters=int(qa.get("max_clusters", 20)),
             radius_ms=int(qa.get("window_radius_ms", 4_000)),
-            frames_per_cluster=int(qa.get("frames_per_window", 5)),
+            frames_per_cluster=int(qa.get("frames_per_window", 3)),
             pseudo_shot_separation_ms=int(qa.get("min_cluster_separation_ms", 3_000)),
         )
 
-        gemini = settings.get("services", {}).get("gemini", {})
-        providers: list[Any] = [
-            GeminiInteractionsReasoner(
-                api_key=gemini.get("api_key"),
-                model_name=str(gemini.get("model", "gemini-3.6-flash")),
-                timeout_seconds=float(gemini.get("timeout_seconds", 30)),
-                max_attempts=int(gemini.get("max_retries", 2)) + 1,
-                requests_per_minute=int(gemini.get("requests_per_minute", 13)),
-                max_concurrency=int(gemini.get("max_concurrency", 1)),
-                retry_base_seconds=float(gemini.get("retry_base_seconds", 5)),
-                retry_max_seconds=float(gemini.get("retry_max_seconds", 60)),
-                rate_limit_cooldown_seconds=float(gemini.get("rate_limit_cooldown_seconds", 60)),
-                cooldown_max_seconds=float(gemini.get("cooldown_max_seconds", 300)),
-                min_request_interval_seconds=float(gemini.get("min_request_interval_seconds", 4.5)),
-                max_total_image_bytes=int(qa.get("image_max_request_bytes", 20 * 1024 * 1024)),
-            )
-        ]
-        qwen = settings.get("models", {}).get("qwen_vl", {})
-        enabled_profiles = tuple(str(value) for value in qwen.get("enabled_profiles", ()))
-        if bool(qwen.get("enabled", False)) and str(settings.get("profile")) in enabled_profiles:
+        ollama = settings.get("services", {}).get("ollama_vlm", {})
+        gemini = settings.get("services", {}).get("gemini_vlm", {})
 
-            def unload_dense_encoders() -> None:
-                for channel in pipeline.dense_channels:
-                    unload = getattr(channel.encoder, "unload", None)
-                    if callable(unload):
-                        unload()
-                if warmup_service is not None:
-                    warmup_service.mark_evicted()
+        def coordinated_handoff(batch_id: str | None) -> Mapping[str, Any] | None:
+            if gpu_coordinator is None:
+                return None
+            return gpu_coordinator.before_vlm_inference(batch_id)
 
-            providers.append(
-                Qwen3VLReasoner(
-                    model_name=str(qwen["model_name"]),
-                    revision=qwen.get("revision"),
-                    cache_dir=str(_project_path(str(qwen["cache_dir"]))),
-                    device=str(qwen.get("device", "cuda")),
-                    dtype=str(qwen.get("dtype", "float16")),
-                    max_new_tokens=int(qwen.get("max_new_tokens", 32)),
-                    max_pixels=int(qwen.get("max_pixels", 589_824)),
-                    local_files_only=bool(qwen.get("local_files_only", True)),
-                    max_total_image_bytes=int(qa.get("image_max_request_bytes", 20 * 1024 * 1024)),
-                    gpu_lease=lambda: _QA_GPU_LEASE,
-                    before_load=unload_dense_encoders,
-                )
+        local_reasoner = OllamaQwenReasoner(
+            base_url=str(ollama.get("url", "http://127.0.0.1:11434")),
+            model_name=str(ollama.get("model", "qwen2.5vl:3b-q4_K_M")),
+            expected_digest_prefix=ollama.get("expected_digest_prefix"),
+            connect_timeout_seconds=float(ollama.get("connect_timeout_seconds", 2)),
+            timeout_seconds=float(ollama.get("timeout_seconds", 60)),
+            keep_alive=ollama.get("keep_alive", "15m"),
+            num_ctx=int(ollama.get("num_ctx", 4096)),
+            max_new_tokens=int(ollama.get("max_new_tokens", 64)),
+            max_images=int(ollama.get("max_images", 1)),
+            max_total_image_bytes=int(qa.get("image_max_request_bytes", 20 * 1024 * 1024)),
+            before_inference=coordinated_handoff,
+        )
+        gemini_reasoner = GeminiFlashReasoner(
+            api_key=gemini.get("api_key"),
+            model_name=str(gemini.get("model", "gemini-3.6-flash")),
+            timeout_seconds=float(gemini.get("timeout_seconds", 5)),
+            max_total_image_bytes=int(qa.get("image_max_request_bytes", 20 * 1024 * 1024)),
+        )
+        qa_reasoner = QAReasonerRouter(gemini_reasoner, local_reasoner)
+        gpu_coordinator = GPUModelCoordinator(
+            dense_channels=pipeline.dense_channels,
+            local_reasoner=local_reasoner,
+            clear_threshold=float(qa.get("cuda_cache_clear_threshold", 0.80)),
+        )
+        florence = settings.get("models", {}).get("florence2", {})
+        if bool(florence.get("enabled", False)):
+            from src.vlm.florence2 import Florence2TaskReasoner
+
+            florence_reasoner = Florence2TaskReasoner(
+                _project_path(str(florence["model_path"])),
+                model_name=str(florence.get("model_name", "microsoft/Florence-2-base")),
+                revision=str(florence["revision"]),
+                expected_weights_sha256=florence.get("weights_sha256"),
+                max_new_tokens=int(florence.get("max_new_tokens", 256)),
             )
 
         specs = (
             QACompetitionSpec.historical_numeric(),
             QACompetitionSpec.conservative_general_text(),
         )
+        qa_fingerprint_cache: dict[
+            tuple[tuple[str, ...], tuple[tuple[str, int | None], ...]],
+            tuple[float, str],
+        ] = {}
 
         def qa_retrieval_fingerprint(batch_filters: tuple[str, ...]) -> str:
             batches = tuple(sorted(set(batch_filters)))
@@ -557,32 +597,77 @@ def build_runtime(config: dict[str, Any] | None = None) -> RuntimeContext:
                     # Readiness still fingerprints physical resource counts and
                     # states when a batch has not been registered locally yet.
                     generations[batch_id] = None
-            readiness_fingerprint = (
-                readiness_service.retrieval_fingerprint(batches)
-                if batches
-                else pipeline.fingerprint
-            )
+            cache_key = (batches, tuple(sorted(generations.items())))
+            now = time.monotonic()
+            cached = qa_fingerprint_cache.get(cache_key)
+            if cached is not None and now - cached[0] <= 30.0:
+                return cached[1]
+            warmed_report = None
+            if warmup_service is not None:
+                report_getter = getattr(warmup_service, "readiness_report", None)
+                if callable(report_getter):
+                    warmed_report = report_getter()
+            if (
+                warmed_report is not None
+                and getattr(warmed_report, "batch_id", None) in batches
+            ):
+                channel_snapshot = [
+                    {
+                        "name": channel.name,
+                        "state": channel.state.value,
+                        "count": channel.count,
+                        "resource": channel.resource_name,
+                        "dimension": channel.expected_dimension,
+                    }
+                    for channel in warmed_report.channels
+                    if channel.name
+                    in {
+                        "visual",
+                        "organizer_clip",
+                        "semantic_text",
+                        "ocr",
+                        "asr",
+                        "metadata",
+                    }
+                ]
+                readiness_fingerprint = hashlib.sha256(
+                    json.dumps(
+                        channel_snapshot,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+            else:
+                readiness_fingerprint = (
+                    readiness_service.retrieval_fingerprint(batches)
+                    if batches
+                    else pipeline.fingerprint
+                )
             payload = {
                 "version": "qa-runtime-retrieval-v1",
                 "pipeline": pipeline.fingerprint,
                 "readiness": readiness_fingerprint,
                 "generations": generations,
             }
-            return hashlib.sha256(
+            fingerprint = hashlib.sha256(
                 json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
             ).hexdigest()
+            qa_fingerprint_cache.clear()
+            qa_fingerprint_cache[cache_key] = (now, fingerprint)
+            return fingerprint
 
         qa_pipeline = VisualQAPipeline(
             retriever=qa_retriever,
-            reasoner=ProviderChainReasoner(providers),
+            reasoner=qa_reasoner,
+            florence_reasoner=florence_reasoner,
             image_resolver=qa_image_resolver,
             session_store=qa_session_store,
-            competition_spec=specs[0],
+            competition_spec=specs[1],
             competition_specs={spec.spec_id: spec for spec in specs},
-            top_k_retrieve=int(qa.get("initial_clusters", 5)),
+            top_k_retrieve=int(qa.get("initial_clusters", 1)),
             top_k_final=100,
             max_inline_image_bytes=int(qa.get("image_max_request_bytes", 20 * 1024 * 1024)),
-            reasoning_workers=min(2, max(1, int(gemini.get("max_concurrency", 1)))),
+            reasoning_workers=1,
             retrieval_fingerprint=qa_retrieval_fingerprint,
         )
     warmup_config = settings.get("warmup", {})
@@ -598,17 +683,22 @@ def build_runtime(config: dict[str, Any] | None = None) -> RuntimeContext:
             trake_pipeline=trake_pipeline,
             startup_budget_seconds=float(warmup_config.get("startup_budget_seconds", 90)),
         )
+    if gpu_coordinator is not None:
+        gpu_coordinator.warmup = warmup_service
     return RuntimeContext(
-        settings,
-        pipeline,
-        ledger,
-        repository,
-        qa_pipeline,
-        qa_session_store,
-        qa_image_resolver,
-        readiness_service,
-        selected_batch_id,
-        launch_identity,
-        warmup_service,
-        trake_pipeline,
+        config=settings,
+        pipeline=pipeline,
+        ledger=ledger,
+        artifact_repository=repository,
+        qa_pipeline=qa_pipeline,
+        qa_reasoner=qa_reasoner,
+        qa_session_store=qa_session_store,
+        qa_image_resolver=qa_image_resolver,
+        florence_reasoner=florence_reasoner,
+        gpu_coordinator=gpu_coordinator,
+        readiness_service=readiness_service,
+        selected_batch_id=selected_batch_id,
+        launch_identity=launch_identity,
+        warmup=warmup_service,
+        trake_pipeline=trake_pipeline,
     )

@@ -372,14 +372,9 @@ class ReadinessService:
         batch_id: str,
         *,
         mode: str = "app",
-        gemini_live_verified: bool = False,
         force: bool = False,
     ) -> ReadinessReport:
-        """Return a sanitized readiness report for ``batch_id``.
-
-        ``gemini_live_verified`` may only be supplied by an explicit external
-        integration check.  This method itself never calls Gemini.
-        """
+        """Return a sanitized readiness report for ``batch_id``."""
 
         if not isinstance(batch_id, str) or not _SAFE_BATCH.fullmatch(batch_id):
             raise ValueError("batch_id must be a safe non-empty identifier")
@@ -390,7 +385,7 @@ class ReadinessService:
             raise ValueError("profile must be laptop or accelerated")
         key = (profile, batch_id, mode)
         now = self.clock()
-        if not force and not gemini_live_verified:
+        if not force:
             with self._lock:
                 cached = self._cache.get(key)
                 if cached is not None and now - cached[0] <= self.cache_seconds:
@@ -410,8 +405,8 @@ class ReadinessService:
             "asr",
             "metadata",
             "canonical_images",
-            "gemini",
-            "qwen",
+            "gemini_vlm",
+            "ollama_vlm",
         )
         channels = tuple(
             self._probe_channel(
@@ -419,7 +414,6 @@ class ReadinessService:
                 batch_id,
                 applicability.get(name, ChannelApplicability.NOT_APPLICABLE),
                 specification,
-                gemini_live_verified=gemini_live_verified,
             )
             for name in known_channels
         )
@@ -440,9 +434,8 @@ class ReadinessService:
             checks,
             now,
         )
-        if not gemini_live_verified:
-            with self._lock:
-                self._cache[key] = (now, report)
+        with self._lock:
+            self._cache[key] = (now, report)
         return report
 
     def workflow_readiness(
@@ -481,12 +474,56 @@ class ReadinessService:
         return self._workflow(required, by_name, qa=workflow == "qa")
 
     def _runtime_checks(self, mode: str) -> tuple[RuntimeCheck, ...]:
+        translation = self._query_translation_check()
         if mode == "app":
-            return ()
-        checks = [self._ffmpeg_check(), self._ingest_dependency_check(), self._cuda_check()]
+            return (translation,)
+        checks = [
+            self._ffmpeg_check(),
+            self._ingest_dependency_check(),
+            self._cuda_check(),
+            translation,
+        ]
         if mode == "full":
             checks.append(self._asset_manifest_check())
         return tuple(checks)
+
+    def _query_translation_check(self) -> RuntimeCheck:
+        """Report the optional offline VI-to-EN adapter without loading it."""
+
+        model = self.config.get("models", {}).get("query_translation", {})
+        if not isinstance(model, Mapping) or not bool(model.get("enabled", False)):
+            return RuntimeCheck(
+                "query_translation",
+                ChannelState.DISABLED_BY_PROFILE,
+                "translator_disabled",
+                "prepare_query_translation",
+            )
+        if not _module_available("ctranslate2"):
+            return RuntimeCheck(
+                "query_translation",
+                ChannelState.BLOCKED_DEPENDENCY,
+                "translator_dependency_missing",
+                "bootstrap_runtime",
+            )
+
+        converted = _path(str(model.get("converted_path", "")), self.project_root)
+        tokenizer = _path(str(model.get("tokenizer_path", "")), self.project_root)
+        manifest = _path(str(model.get("asset_manifest", "")), self.project_root)
+        required = (
+            converted / "model.bin",
+            converted / "config.json",
+            tokenizer / "source.spm",
+            tokenizer / "target.spm",
+            manifest,
+        )
+        if any(not path.is_file() for path in required):
+            return RuntimeCheck(
+                "query_translation",
+                ChannelState.BLOCKED_ASSET,
+                "translator_asset_missing",
+                "prepare_query_translation",
+            )
+        return RuntimeCheck("query_translation", ChannelState.READY)
 
     def _ffmpeg_check(self) -> RuntimeCheck:
         value = self.config.get("tools", {}).get("ffmpeg", {}).get("manifest")
@@ -543,7 +580,7 @@ class ReadinessService:
             value = model.get("local_path", model.get("cache_dir"))
             if isinstance(value, str) and value:
                 required.add(_path(value, self.project_root))
-        for key in ("accelerated_visual", "qwen_vl"):
+        for key in ("accelerated_visual",):
             model = models.get(key, {})
             if not _profile_enabled(model, profile):
                 continue
@@ -586,10 +623,29 @@ class ReadinessService:
         unavailable = tuple(
             name for name in required if name not in channels or not channels[name].usable
         )
-        if not unavailable:
+        if qa:
+            gemini_usable = bool(channels.get("gemini_vlm") and channels["gemini_vlm"].usable)
+            local_usable = bool(channels.get("ollama_vlm") and channels["ollama_vlm"].usable)
+            if "canonical_images" in unavailable or not (gemini_usable or local_usable):
+                state = WorkflowState.BLOCKED
+            elif unavailable:
+                retrieval_names = {
+                    "visual", "organizer_clip", "accelerated_visual", "semantic_text",
+                    "ocr", "asr", "metadata",
+                }
+                usable_retrieval = any(
+                    name in retrieval_names and channel.state in _USABLE_STATES
+                    for name, channel in channels.items()
+                )
+                state = WorkflowState.DEGRADED if usable_retrieval else WorkflowState.BLOCKED
+            else:
+                state = (
+                    WorkflowState.READY
+                    if gemini_usable and local_usable
+                    else WorkflowState.DEGRADED
+                )
+        elif not unavailable:
             state = WorkflowState.READY
-        elif qa and any(name in unavailable for name in ("gemini", "canonical_images")):
-            state = WorkflowState.BLOCKED
         else:
             retrieval_names = {
                 "visual",
@@ -613,8 +669,6 @@ class ReadinessService:
         batch_id: str,
         applicability: ChannelApplicability,
         specification: Mapping[str, Any],
-        *,
-        gemini_live_verified: bool,
     ) -> ChannelReadiness:
         if applicability is ChannelApplicability.NOT_APPLICABLE:
             return ChannelReadiness(
@@ -629,10 +683,10 @@ class ReadinessService:
             return self._probe_meili(name, batch_id, applicability)
         if name == "canonical_images":
             return self._probe_canonical_images(batch_id, applicability, specification)
-        if name == "gemini":
-            return self._probe_gemini(applicability, gemini_live_verified)
-        if name == "qwen":
-            return self._probe_qwen(applicability)
+        if name == "ollama_vlm":
+            return self._probe_ollama_vlm(applicability)
+        if name == "gemini_vlm":
+            return self._probe_gemini_vlm(applicability)
         return ChannelReadiness(
             name,
             applicability,
@@ -1012,93 +1066,105 @@ class ReadinessService:
             resource_name=database.name,
         )
 
-    def _probe_gemini(
-        self,
-        applicability: ChannelApplicability,
-        live_verified: bool,
-    ) -> ChannelReadiness:
-        gemini = self.config.get("services", {}).get("gemini", {})
+    def _probe_ollama_vlm(self, applicability: ChannelApplicability) -> ChannelReadiness:
+        service = self.config.get("services", {}).get("ollama_vlm", {})
+        model = str(service.get("model", "qwen2.5vl:3b-q4_K_M"))
+        base_url = str(service.get("url", "http://127.0.0.1:11434")).rstrip("/")
+        try:
+            status, tags = self._request_json("GET", f"{base_url}/api/tags")
+            if status != 200 or not isinstance(tags, Mapping):
+                raise ValueError("invalid local model catalog")
+            models = tags.get("models")
+            model_values = models if isinstance(models, list) else []
+            record = next(
+                (
+                    value
+                    for value in model_values
+                    if isinstance(value, Mapping)
+                    and str(value.get("name") or value.get("model") or "") == model
+                ),
+                None,
+            )
+            if record is None:
+                return ChannelReadiness(
+                    "ollama_vlm",
+                    applicability,
+                    ChannelState.BLOCKED_ASSET,
+                    "ollama_model_missing",
+                    "pull_local_vlm_model",
+                    resource_name=model,
+                )
+            expected = str(service.get("expected_digest_prefix") or "").casefold()
+            digest = str(record.get("digest") or "").casefold()
+            if expected and not digest.startswith(expected):
+                return ChannelReadiness(
+                    "ollama_vlm",
+                    applicability,
+                    ChannelState.INCOMPATIBLE_INDEX,
+                    "ollama_model_fingerprint_mismatch",
+                    "pull_pinned_local_vlm_model",
+                    resource_name=model,
+                )
+            show_status, details = self._request_json(
+                "POST", f"{base_url}/api/show", json={"model": model}
+            )
+            capabilities = details.get("capabilities") if isinstance(details, Mapping) else None
+            if show_status != 200 or not isinstance(capabilities, list) or "vision" not in capabilities:
+                return ChannelReadiness(
+                    "ollama_vlm",
+                    applicability,
+                    ChannelState.BLOCKED_ASSET,
+                    "ollama_model_not_vision_capable",
+                    "configure_vision_model",
+                    resource_name=model,
+                )
+        except (KeyError, TypeError, ValueError, requests.RequestException, OSError):
+            return ChannelReadiness(
+                "ollama_vlm",
+                applicability,
+                ChannelState.SERVICE_UNAVAILABLE,
+                "ollama_service_unavailable",
+                "start_ollama",
+                resource_name=model,
+            )
+        return ChannelReadiness(
+            "ollama_vlm",
+            applicability,
+            ChannelState.READY,
+            resource_name=model,
+        )
+
+    def _probe_gemini_vlm(self, applicability: ChannelApplicability) -> ChannelReadiness:
+        """Report configuration without contacting the external provider."""
+
+        service = self.config.get("services", {}).get("gemini_vlm", {})
+        model = str(service.get("model", "gemini-3.6-flash"))
+        key = service.get("api_key")
         if not _module_available("google.genai"):
             return ChannelReadiness(
-                "gemini",
+                "gemini_vlm",
                 applicability,
                 ChannelState.BLOCKED_DEPENDENCY,
                 "gemini_sdk_missing",
                 "bootstrap_runtime",
+                resource_name=model,
             )
-        key = gemini.get("api_key")
         if not isinstance(key, str) or not key.strip():
             return ChannelReadiness(
-                "gemini",
+                "gemini_vlm",
                 applicability,
                 ChannelState.BLOCKED_ASSET,
                 "gemini_key_not_configured",
                 "configure_gemini_key",
+                resource_name=model,
             )
         return ChannelReadiness(
-            "gemini",
-            applicability,
-            ChannelState.READY if live_verified else ChannelState.CONFIGURED_UNVERIFIED,
-            None if live_verified else "live_check_not_run",
-            None if live_verified else "run_live_gemini_check",
-            resource_name=str(gemini.get("model", "gemini")),
-        )
-
-    def _probe_qwen(self, applicability: ChannelApplicability) -> ChannelReadiness:
-        qwen = self.config.get("models", {}).get("qwen_vl", {})
-        profile = str(self.config.get("profile", "laptop"))
-        if not _profile_enabled(qwen, profile):
-            return ChannelReadiness(
-                "qwen",
-                applicability,
-                ChannelState.DISABLED_BY_PROFILE,
-                "profile_does_not_enable_channel",
-                "select_accelerated_profile",
-            )
-        if not _module_available("torch") or not _module_available("transformers"):
-            return ChannelReadiness(
-                "qwen",
-                applicability,
-                ChannelState.BLOCKED_DEPENDENCY,
-                "competition_dependency_missing",
-                "bootstrap_runtime",
-            )
-        if not self._model_snapshot_exists(qwen):
-            return ChannelReadiness(
-                "qwen",
-                applicability,
-                ChannelState.BLOCKED_ASSET,
-                "pinned_model_snapshot_missing",
-                "prepare_models",
-            )
-        try:
-            import torch
-
-            if not torch.cuda.is_available():
-                raise RuntimeError("CUDA unavailable")
-            free_bytes, _total_bytes = torch.cuda.mem_get_info()
-            minimum_gib = float(
-                self.config.get("readiness", {}).get(
-                    "accelerated_min_usable_vram_gib", 11.5
-                )
-            )
-            if int(free_bytes) < int(minimum_gib * 1024**3):
-                raise RuntimeError("insufficient usable memory")
-        except (ImportError, RuntimeError, TypeError, ValueError):
-            return ChannelReadiness(
-                "qwen",
-                applicability,
-                ChannelState.BLOCKED_ASSET,
-                "accelerated_gpu_memory_insufficient",
-                "select_laptop_profile",
-            )
-        return ChannelReadiness(
-            "qwen",
+            "gemini_vlm",
             applicability,
             ChannelState.CONFIGURED_UNVERIFIED,
-            "five_frame_gpu_gate_not_run",
-            "run_qwen_check",
-            resource_name=str(qwen.get("model_name", "qwen")),
+            "external_check_not_run",
+            "run_explicit_gemini_check",
+            resource_name=model,
         )
 
 

@@ -13,7 +13,7 @@ import re
 import unicodedata
 from dataclasses import asdict, dataclass, field
 from fractions import Fraction
-from typing import Any, ClassVar, Mapping
+from typing import Any, ClassVar, Literal, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator, model_validator
 
@@ -339,12 +339,18 @@ class QueryRequest:
     attributes: tuple[str, ...] | None = None
     positive_feedback_ids: tuple[str, ...] = ()
     negative_feedback_ids: tuple[str, ...] = ()
+    query_language: str = "auto"
+    english_text_override: str | None = None
 
     def __post_init__(self) -> None:
         _require_text(self.query_id, "query_id")
         _require_text(self.original_text, "original_text")
         if self.mode not in _QUERY_MODES:
             raise ValueError(f"mode must be one of {sorted(_QUERY_MODES)}")
+        if self.query_language not in {"auto", "vi", "en"}:
+            raise ValueError("query_language must be auto, vi, or en")
+        if self.english_text_override is not None:
+            _require_text(self.english_text_override, "english_text_override")
         _require_int(self.limit, "limit", minimum=1)
         if self.limit > 100:
             raise ValueError("limit cannot exceed the competition maximum of 100")
@@ -406,14 +412,30 @@ class QAQueryRequest:
     answer_spec_id: str = QA_HISTORICAL_NUMERIC_SPEC_ID
     batch_filters: tuple[str, ...] = ()
     limit: int = 100
+    reasoning_policy: str = "gemini_then_local"
+    allow_external_frame_transfer: bool = False
+    query_language: str = "auto"
+    event_description_en: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("query_id", "event_description", "question", "answer_spec_id"):
             _require_text(getattr(self, name), name)
         if self.mode not in _QUERY_MODES:
             raise ValueError(f"mode must be one of {sorted(_QUERY_MODES)}")
+        if self.query_language not in {"auto", "vi", "en"}:
+            raise ValueError("query_language must be auto, vi, or en")
+        if self.event_description_en is not None:
+            _require_text(self.event_description_en, "event_description_en")
         if self.answer_spec_id not in _QA_SPEC_IDS:
             raise ValueError(f"unknown Visual Q&A answer_spec_id: {self.answer_spec_id!r}")
+        if self.reasoning_policy not in {"gemini_then_local", "local_only"}:
+            raise ValueError("reasoning_policy must be gemini_then_local or local_only")
+        if not isinstance(self.allow_external_frame_transfer, bool):
+            raise TypeError("allow_external_frame_transfer must be a boolean")
+        # QAQueryRequest is also the compatibility envelope for deprecated
+        # retrieval-only calls, which never transfer a frame. Provider routing
+        # and QASingleFrameAnswerRequest enforce consent at the actual Stage-2
+        # trust boundary.
         filters = _as_string_tuple(self.batch_filters, "batch_filters")
         if len(filters) != len(set(filters)):
             raise ValueError("batch_filters must not contain duplicates")
@@ -437,6 +459,155 @@ class QAQueryRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class QACandidateRequest:
+    """Pure retrieval request for the first Visual Q&A stage."""
+
+    query_id: str
+    event_description: str
+    batch_filters: tuple[str, ...] = ()
+    top_k: int = 5
+    query_language: str = "auto"
+    event_description_en: str | None = None
+
+    def __post_init__(self) -> None:
+        _require_text(self.query_id, "query_id")
+        _require_text(self.event_description, "event_description")
+        if self.query_language not in {"auto", "vi", "en"}:
+            raise ValueError("query_language must be auto, vi, or en")
+        if self.event_description_en is not None:
+            _require_text(self.event_description_en, "event_description_en")
+        filters = _as_string_tuple(self.batch_filters, "batch_filters")
+        if len(filters) != len(set(filters)):
+            raise ValueError("batch_filters must not contain duplicates")
+        if len(filters) > 1:
+            raise ValueError("Visual Q&A retrieval requires exactly one batch")
+        object.__setattr__(self, "batch_filters", filters)
+        _require_int(self.top_k, "top_k", minimum=1)
+        if self.top_k > 20:
+            raise ValueError("top_k cannot exceed 20")
+
+    def to_dict(self) -> dict[str, Any]:
+        result = asdict(self)
+        result["batch_filters"] = list(self.batch_filters)
+        return result
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> QACandidateRequest:
+        return cls(**dict(value))
+
+
+@dataclass(frozen=True, slots=True)
+class QASingleFrameAnswerRequest:
+    """On-demand reasoning request bound to one persisted QA candidate."""
+
+    candidate_id: str
+    question: str
+    answer_spec_id: str = QA_GENERAL_TEXT_SPEC_ID
+    reasoning_policy: str = "gemini_then_local"
+    allow_external_frame_transfer: bool = False
+    answer_engine: str = "vlm"
+    florence_task: str | None = None
+    florence_target_label: str | None = None
+
+    def __post_init__(self) -> None:
+        _require_text(self.candidate_id, "candidate_id")
+        _require_text(self.question, "question")
+        if self.answer_spec_id not in _QA_SPEC_IDS:
+            raise ValueError(f"unknown Visual Q&A answer_spec_id: {self.answer_spec_id!r}")
+        if self.reasoning_policy not in {"gemini_then_local", "local_only"}:
+            raise ValueError("unsupported Visual Q&A reasoning_policy")
+        if not isinstance(self.allow_external_frame_transfer, bool):
+            raise TypeError("allow_external_frame_transfer must be a boolean")
+        if (
+            self.reasoning_policy == "gemini_then_local"
+            and not self.allow_external_frame_transfer
+        ):
+            raise ValueError("Gemini requires external frame transfer consent")
+        if self.answer_engine not in {"vlm", "florence2"}:
+            raise ValueError("answer_engine must be vlm or florence2")
+        if self.answer_engine == "florence2":
+            if self.reasoning_policy != "local_only" or self.allow_external_frame_transfer:
+                raise ValueError("Florence-2 is an offline local-only answer engine")
+            if self.florence_task not in {"ocr", "object_count"}:
+                raise ValueError("Florence-2 supports only ocr or object_count")
+            if self.florence_task == "object_count":
+                _require_text(self.florence_target_label, "florence_target_label")
+            normalized_question = " ".join(self.question.casefold().split())
+            unsupported_prefixes = (
+                "is ",
+                "are ",
+                "was ",
+                "were ",
+                "do ",
+                "does ",
+                "did ",
+                "can ",
+                "could ",
+                "has ",
+                "have ",
+                "will ",
+                "would ",
+                "should ",
+            )
+            if normalized_question.startswith(unsupported_prefixes) or any(
+                marker in normalized_question for marker in (" color", "colour", "màu ")
+            ):
+                raise ValueError("florence_task_unsupported")
+        elif self.florence_task is not None or self.florence_target_label is not None:
+            raise ValueError("Florence task fields require answer_engine=florence2")
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> QASingleFrameAnswerRequest:
+        return cls(**dict(value))
+
+
+@dataclass(frozen=True, slots=True)
+class QACandidateFrame:
+    """One canonical frame returned by pure Visual Q&A retrieval."""
+
+    candidate_id: str
+    retrieval_rank: int
+    retrieval_score: float
+    batch_id: str
+    video_id: str
+    source_frame_idx: int
+    timestamp_ms: int
+    shot_id: str
+    channel_ranks: Mapping[str, int] = field(default_factory=dict)
+    evidence: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        for name in ("candidate_id", "batch_id", "video_id", "shot_id"):
+            _require_text(getattr(self, name), name)
+        expected_id = f"{self.batch_id}:{self.video_id}:{self.source_frame_idx}"
+        if self.candidate_id != expected_id:
+            raise ValueError("candidate_id must match the canonical frame identity")
+        _require_int(self.retrieval_rank, "retrieval_rank", minimum=1)
+        _require_finite_number(self.retrieval_score, "retrieval_score")
+        _require_int(self.source_frame_idx, "source_frame_idx", minimum=0)
+        _require_int(self.timestamp_ms, "timestamp_ms", minimum=0)
+        ranks = _json_mapping(self.channel_ranks, "channel_ranks")
+        for channel, rank in ranks.items():
+            _require_int(rank, f"channel_ranks[{channel!r}]", minimum=1)
+        object.__setattr__(self, "retrieval_score", float(self.retrieval_score))
+        object.__setattr__(self, "channel_ranks", ranks)
+        object.__setattr__(self, "evidence", _json_mapping(self.evidence, "evidence"))
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> QACandidateFrame:
+        data = dict(value)
+        if "frame_id" in data:
+            raise ValueError("ambiguous frame_id is forbidden; use source_frame_idx")
+        return cls(**data)
+
+
+@dataclass(frozen=True, slots=True)
 class QACandidateWindow:
     """A retrieval anchor and its ordered canonical evidence frames."""
 
@@ -449,6 +620,7 @@ class QACandidateWindow:
     timestamp_ms: int
     shot_id: str
     frames: tuple[FrameRecord, ...]
+    frame_selection_scores: Mapping[int, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         for name in ("cluster_id", "batch_id", "video_id", "shot_id"):
@@ -487,6 +659,15 @@ class QACandidateWindow:
         if anchor.timestamp_ms != self.timestamp_ms:
             raise ValueError("timestamp_ms must match the retrieval anchor frame")
         object.__setattr__(self, "frames", frames)
+        scores = dict(self.frame_selection_scores)
+        valid_frames = {frame.source_frame_idx for frame in frames}
+        for source_frame_idx, score in scores.items():
+            _require_int(source_frame_idx, "frame_selection_scores key", minimum=0)
+            if source_frame_idx not in valid_frames:
+                raise ValueError("frame_selection_scores must reference selected frames")
+            _require_finite_number(score, "frame_selection_scores value")
+            scores[source_frame_idx] = float(score)
+        object.__setattr__(self, "frame_selection_scores", scores)
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable representation."""
@@ -506,6 +687,18 @@ class QACandidateWindow:
             frame if isinstance(frame, FrameRecord) else FrameRecord.from_dict(frame)
             for frame in data.get("frames", ())
         )
+        scores = data.get("frame_selection_scores")
+        if isinstance(scores, Mapping):
+            converted: dict[int, Any] = {}
+            for raw_frame, score in scores.items():
+                if isinstance(raw_frame, bool):
+                    raise TypeError("frame_selection_scores key must be an integer")
+                try:
+                    source_frame_idx = int(raw_frame)
+                except (TypeError, ValueError):
+                    raise TypeError("frame_selection_scores key must be an integer") from None
+                converted[source_frame_idx] = score
+            data["frame_selection_scores"] = converted
         return cls(**data)
 
 
@@ -617,6 +810,9 @@ class QAReasoningResult:
     attempts: int = 1
     cache_status: str = "miss"
     failure: Mapping[str, Any] | None = None
+    requested_policy: str | None = None
+    fallback_used: bool = False
+    fallback_reason_code: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.answerable, bool):
@@ -641,6 +837,14 @@ class QAReasoningResult:
             raise ValueError("latency_ms cannot be negative")
         object.__setattr__(self, "latency_ms", float(self.latency_ms))
         _require_int(self.attempts, "attempts", minimum=1)
+        if self.requested_policy is not None:
+            _require_text(self.requested_policy, "requested_policy")
+        if not isinstance(self.fallback_used, bool):
+            raise TypeError("fallback_used must be a boolean")
+        if self.fallback_reason_code is not None:
+            _require_text(self.fallback_reason_code, "fallback_reason_code")
+        if not self.fallback_used and self.fallback_reason_code is not None:
+            raise ValueError("fallback_reason_code requires fallback_used=true")
         if self.failure is not None:
             object.__setattr__(self, "failure", _json_mapping(self.failure, "failure"))
 
@@ -968,6 +1172,7 @@ class TRAKEStage(_TRAKEModel):
 
     stage_index: int = Field(ge=1, le=20, strict=True)
     description: str = Field(min_length=1)
+    description_en: str | None = Field(default=None, min_length=1)
 
 
 class TRAKEQueryRequest(_TRAKEModel):
@@ -978,6 +1183,8 @@ class TRAKEQueryRequest(_TRAKEModel):
     stages: tuple[TRAKEStage, ...] = Field(min_length=2, max_length=20)
     batch_filters: tuple[str, ...] = ()
     top_k: int = Field(default=100, ge=1, le=100, strict=True)
+    query_language: Literal["auto", "vi", "en"] = "auto"
+    global_description_en: str | None = Field(default=None, min_length=1)
 
     @field_validator("batch_filters")
     @classmethod
