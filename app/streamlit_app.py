@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import base64
+import csv
 import hashlib
+import io
 import json
 import logging
 import os
@@ -262,7 +264,10 @@ def _source_frame_image(
     frame = getter(batch_id, video_id, source_frame_idx)
     if frame is None:
         return None
-    image = resolver.resolve(frame)
+    try:
+        image = resolver.resolve(frame)
+    except Exception:
+        return None
     data = getattr(image, "data", None)
     return data if isinstance(data, bytes) else None
 
@@ -333,6 +338,13 @@ def _initialize_state() -> None:
         "trake_query_language": "auto",
         "trake_translation_edit": False,
         "trake_global_description_en": "",
+        "codabench_staging": {},
+        "codabench_entry_errors": {},
+        "codabench_bundle_cache": None,
+        "codabench_bundle_mode": "all",
+        "codabench_query_id_kis": "",
+        "codabench_query_id_qa": "",
+        "codabench_query_id_trake": "",
     }
     for name, value in defaults.items():
         st.session_state.setdefault(name, value)
@@ -2433,6 +2445,24 @@ def _render_qa(context: RuntimeContext) -> None:
         if selected not in candidate_ids:
             selected = candidate_ids[0]
             st.session_state.qa_selected_candidate_id = selected
+        candidate_images = {
+            str(candidate["candidate_id"]): _source_frame_image(
+                context,
+                str(candidate["batch_id"]),
+                str(candidate["video_id"]),
+                int(candidate["source_frame_idx"]),
+            )
+            for candidate in candidates
+        }
+        snapshot_state = dict(st.session_state.get("qa_snapshot") or {})
+        candidate_failures = snapshot_state.get("failures", {})
+        if not isinstance(candidate_failures, dict):
+            state_value = snapshot_state.get("state", {})
+            candidate_failures = (
+                dict(state_value.get("failures", {}))
+                if isinstance(state_value, dict)
+                else {}
+            )
         retrieval_ms = float(
             dict(st.session_state.qa_snapshot or {})
             .get("stage_timings", {})
@@ -2449,14 +2479,12 @@ def _render_qa(context: RuntimeContext) -> None:
                         key=hud_container_key("qa-card", candidate["candidate_id"]),
                         border=True,
                     ):
-                        image = _source_frame_image(
-                            context,
-                            str(candidate["batch_id"]),
-                            str(candidate["video_id"]),
-                            int(candidate["source_frame_idx"]),
-                        )
+                        candidate_id = str(candidate["candidate_id"])
+                        image = candidate_images.get(candidate_id)
                         if image is not None:
                             st.image(image, width="stretch")
+                        else:
+                            st.warning("Ảnh canonical của candidate này hiện không khả dụng.")
                         is_selected = str(candidate["candidate_id"]) == str(selected)
                         st.markdown(
                             render_hud_readout(
@@ -2477,7 +2505,7 @@ def _render_qa(context: RuntimeContext) -> None:
                         if st.button(
                             "Chọn frame này" if not is_selected else "✓ Frame đang chọn",
                             key=hud_container_key("qa-select", candidate["candidate_id"]),
-                            disabled=is_selected,
+                            disabled=is_selected or image is None,
                             width="stretch",
                         ):
                             st.session_state.qa_selected_candidate_id = str(
@@ -2492,6 +2520,7 @@ def _render_qa(context: RuntimeContext) -> None:
                 (
                     f"#{value['retrieval_rank']} · {value['video_id']} · "
                     f"frame {value['source_frame_idx']} · {int(value['timestamp_ms']) / 1000:.2f}s"
+                    f"{' · ảnh không khả dụng' if candidate_images.get(str(value['candidate_id'])) is None else ''}"
                     for value in candidates
                     if value["candidate_id"] == candidate_id
                 ),
@@ -2560,8 +2589,15 @@ def _render_qa(context: RuntimeContext) -> None:
                         key="qa_florence_target_label",
                     )
 
+        selected_media_available = candidate_images.get(str(selected)) is not None
+        if not selected_media_available or candidate_failures.get(str(selected)) == "media_unavailable":
+            st.warning(
+                "Candidate đang chọn không có ảnh canonical khả dụng. "
+                "Hãy chủ động chọn candidate khác; hệ thống sẽ không tự thay frame."
+            )
         answer_disabled = (
             not question.strip()
+            or not selected_media_available
             or (reasoning_policy == "gemini_then_local" and not consent)
             or (answer_engine == "florence2" and florence_task == "object_count" and not str(target_label or "").strip())
         )
@@ -2613,8 +2649,15 @@ def _render_qa(context: RuntimeContext) -> None:
                         raise BackendError("backend_response_invalid")
                     _apply_qa_snapshot(snapshot)
                 except BackendError as error:
+                    if error.snapshot is not None:
+                        _apply_qa_snapshot(error.snapshot)
                     code = error.code
-                    if code == "florence_not_provisioned":
+                    if code == "qa_candidate_media_unavailable":
+                        st.warning(
+                            "Ảnh canonical của candidate này không còn khả dụng. "
+                            "Hãy chọn candidate khác để tiếp tục."
+                        )
+                    elif code == "florence_not_provisioned":
                         st.warning("Florence-2 chưa được provision offline trên máy này.")
                     else:
                         _report_ui_error(
@@ -3178,6 +3221,330 @@ def _render_trake(context: RuntimeContext) -> None:
                 st.success(f"Đã lưu `{target.name}`")
 
 
+def _codabench_row_count(data: bytes) -> int:
+    try:
+        text = data.decode("utf-8")
+        return sum(1 for _ in csv.reader(io.StringIO(text, newline=""), strict=True))
+    except (UnicodeDecodeError, csv.Error):
+        return 0
+
+
+def _codabench_current_entry(
+    workflow: str,
+) -> dict[str, Any] | None:
+    """Return the currently validated CSV cache as one stageable entry."""
+
+    cache_name = {
+        "kis": "kis_export_cache",
+        "qa": "qa_export_cache",
+        "trake": "trake_export_cache",
+    }[workflow]
+    cache = st.session_state.get(cache_name)
+    if not isinstance(cache, dict):
+        return None
+    data = cache.get("data")
+    fingerprint = cache.get("fingerprint")
+    if not isinstance(data, bytes) or not isinstance(fingerprint, str):
+        return None
+    source_rows = {
+        "kis": list(st.session_state.get("kis_pinned", ())),
+        "qa": list(st.session_state.get("qa_pinned", ())),
+        "trake": list(st.session_state.get("trake_results", ())),
+    }[workflow]
+    batch_ids = {
+        str(row.get("batch_id"))
+        for row in source_rows
+        if isinstance(row, dict) and isinstance(row.get("batch_id"), str)
+    }
+    if len(batch_ids) != 1:
+        return None
+    stage_count = None
+    if workflow == "trake":
+        value = st.session_state.get("trake_result_stage_count")
+        if isinstance(value, int) and not isinstance(value, bool):
+            stage_count = value
+        else:
+            return None
+    row_count = _codabench_row_count(data)
+    return {
+        "task": workflow,
+        "batch_id": next(iter(batch_ids)),
+        "data": data,
+        "source_fingerprint": fingerprint,
+        "stage_count": stage_count,
+        "row_count": row_count,
+        "source_ranks": (
+            tuple(
+                int(rank)
+                for rank in cache.get(
+                    "source_ranks", tuple(range(1, row_count + 1))
+                )
+            )
+            if workflow == "kis"
+            else None
+        ),
+    }
+
+
+def _codabench_filename(query_id: str, task: str) -> str:
+    return f"query-{query_id}-{task}.csv"
+
+
+def _codabench_entry_status(
+    entry: dict[str, Any],
+    current_by_task: dict[str, dict[str, Any] | None],
+) -> str:
+    filename = str(entry.get("filename", ""))
+    if filename in st.session_state.get("codabench_entry_errors", {}):
+        return "INVALID"
+    task = str(entry.get("task", ""))
+    query_id = str(entry.get("query_id", ""))
+    active_query_id = str(st.session_state.get(f"codabench_query_id_{task}", "")).strip()
+    if active_query_id != query_id:
+        return "READY"
+    current = current_by_task.get(task)
+    if not isinstance(current, dict) or current.get("source_fingerprint") != entry.get(
+        "source_fingerprint"
+    ):
+        return "STALE"
+    return "READY"
+
+
+def _render_codabench_submission_hub(context: RuntimeContext, active_workflow: str) -> None:
+    """Stage validated CSV bytes and request server-owned Codabench packaging."""
+
+    st.divider()
+    st.subheader("Codabench Submission Hub")
+    st.caption(
+        "Profile `codabench_10187_2025`: ZIP chỉ chứa thư mục `submission/`. "
+        "Không tự động tải dữ liệu lên Codabench."
+    )
+    columns = st.columns(3)
+    for column, task, label in zip(
+        columns,
+        ("kis", "qa", "trake"),
+        ("KIS", "Visual Q&A", "TRAKE"),
+    ):
+        with column:
+            st.text_input(
+                f"Query ID nộp bài · {label}",
+                key=f"codabench_query_id_{task}",
+                placeholder="Ví dụ: 01",
+            )
+
+    current_by_task = {
+        task: _codabench_current_entry(task) for task in ("kis", "qa", "trake")
+    }
+    query_id = str(
+        st.session_state.get(f"codabench_query_id_{active_workflow}", "")
+    ).strip()
+    current = current_by_task[active_workflow]
+    stage_disabled = not query_id.isdigit() or not 1 <= len(query_id) <= 32 or current is None
+    if st.button(
+        f"Thêm/cập nhật truy vấn {active_workflow.upper()} hiện tại",
+        key="codabench_stage_current",
+        disabled=stage_disabled,
+        width="stretch",
+    ):
+        assert current is not None
+        filename = _codabench_filename(query_id, active_workflow)
+        staging = dict(st.session_state.get("codabench_staging", {}))
+        duplicate = next(
+            (
+                item
+                for name, item in staging.items()
+                if name != filename and str(item.get("query_id")) == query_id
+            ),
+            None,
+        )
+        if duplicate is not None:
+            st.error("Query ID này đã được dùng cho một workflow khác trong bundle.")
+        else:
+            staging[filename] = {
+                **current,
+                "filename": filename,
+                "query_id": query_id,
+                "sha256": hashlib.sha256(current["data"]).hexdigest(),
+            }
+            st.session_state.codabench_staging = staging
+            errors = dict(st.session_state.get("codabench_entry_errors", {}))
+            errors.pop(filename, None)
+            st.session_state.codabench_entry_errors = errors
+            st.session_state.codabench_bundle_cache = None
+            st.rerun()
+    if stage_disabled:
+        st.caption(
+            "Nhập Query ID dạng số và chuẩn bị CSV hợp lệ trong workflow hiện tại trước khi stage."
+        )
+
+    staging = dict(st.session_state.get("codabench_staging", {}))
+    statuses = {
+        name: _codabench_entry_status(entry, current_by_task)
+        for name, entry in staging.items()
+    }
+    matrix_rows = [
+        {
+            "File": name,
+            "Workflow": str(entry.get("task", "")).upper(),
+            "Trạng thái": statuses[name],
+            "Số dòng": entry.get("row_count"),
+            "Số stage": entry.get("stage_count"),
+        }
+        for name, entry in sorted(
+            staging.items(), key=lambda item: (int(str(item[1]["query_id"])), item[0])
+        )
+    ]
+    for task in ("kis", "qa", "trake"):
+        task_query_id = str(st.session_state.get(f"codabench_query_id_{task}", "")).strip()
+        expected_name = (
+            _codabench_filename(task_query_id, task)
+            if task_query_id.isdigit()
+            else f"query-<id>-{task}.csv"
+        )
+        if expected_name in staging:
+            continue
+        current_task_entry = current_by_task[task]
+        matrix_rows.append(
+            {
+                "File": expected_name,
+                "Workflow": task.upper(),
+                "Trạng thái": "MISSING",
+                "Số dòng": (
+                    current_task_entry.get("row_count")
+                    if isinstance(current_task_entry, dict)
+                    else None
+                ),
+                "Số stage": (
+                    current_task_entry.get("stage_count")
+                    if isinstance(current_task_entry, dict)
+                    else None
+                ),
+            }
+        )
+    st.dataframe(matrix_rows, width="stretch", hide_index=True)
+    if staging:
+        remove_name = st.selectbox(
+            "Entry cần xóa khỏi staging",
+            tuple(sorted(staging)),
+            key="codabench_remove_entry",
+        )
+        if st.button("Xóa entry đã chọn", key="codabench_remove"):
+            staging.pop(remove_name, None)
+            st.session_state.codabench_staging = staging
+            errors = dict(st.session_state.get("codabench_entry_errors", {}))
+            errors.pop(remove_name, None)
+            st.session_state.codabench_entry_errors = errors
+            st.session_state.codabench_bundle_cache = None
+            st.rerun()
+    else:
+        st.info("Chưa có CSV nào trong staging.")
+
+    mode = st.radio(
+        "Phạm vi bundle",
+        ("all", "current"),
+        key="codabench_bundle_mode",
+        horizontal=True,
+        format_func=lambda value: (
+            "Bundle All · bắt buộc KIS + QA + TRAKE"
+            if value == "all"
+            else "Chỉ workflow hiện tại"
+        ),
+    )
+    selected: list[dict[str, Any]] = []
+    if mode == "all":
+        selected = list(staging.values())
+    elif query_id.isdigit():
+        selected_name = _codabench_filename(query_id, active_workflow)
+        if selected_name in staging:
+            selected = [staging[selected_name]]
+    tasks = {str(entry.get("task")) for entry in selected}
+    selected_names = {str(entry.get("filename")) for entry in selected}
+    can_build = bool(selected) and all(statuses.get(name) == "READY" for name in selected_names)
+    if mode == "all":
+        can_build = can_build and tasks == {"kis", "qa", "trake"}
+    batch_ids = {str(entry.get("batch_id")) for entry in selected}
+    can_build = can_build and len(batch_ids) == 1
+
+    if st.button(
+        "📦 Tạo gói nộp bài Codabench (.zip)",
+        key="codabench_build_bundle",
+        disabled=not can_build,
+        width="stretch",
+    ):
+        builder = getattr(context, "create_submission_bundle", None)
+        if not callable(builder):
+            st.error("Backend hiện tại chưa hỗ trợ tạo Codabench bundle.")
+        else:
+            payload_entries = [
+                {
+                    "task": entry["task"],
+                    "query_id": entry["query_id"],
+                    "csv_base64": base64.b64encode(entry["data"]).decode("ascii"),
+                    "source_fingerprint": entry["source_fingerprint"],
+                    "stage_count": entry.get("stage_count"),
+                    "source_ranks": entry.get("source_ranks"),
+                }
+                for entry in selected
+            ]
+            try:
+                with st.spinner("Đang kiểm tra CSV và tạo Codabench archive..."):
+                    result = builder(
+                        {
+                            "mode": mode,
+                            "batch_id": next(iter(batch_ids)),
+                            "entries": payload_entries,
+                        }
+                    )
+                st.session_state.codabench_bundle_cache = result
+                st.session_state.codabench_entry_errors = {}
+            except BackendError as error:
+                issues = error.detail.get("issues", [])
+                entry_errors: dict[str, list[dict[str, Any]]] = {}
+                for issue in issues if isinstance(issues, list) else ():
+                    if isinstance(issue, dict) and isinstance(issue.get("filename"), str):
+                        entry_errors.setdefault(issue["filename"], []).append(issue)
+                st.session_state.codabench_entry_errors = entry_errors
+                st.session_state.codabench_bundle_cache = None
+                st.error("Bundle không hợp lệ; chưa tạo file ZIP.")
+                for issue in issues if isinstance(issues, list) else ():
+                    if not isinstance(issue, dict):
+                        continue
+                    location = ""
+                    if issue.get("row") is not None:
+                        location = f" · dòng dữ liệu {issue['row']}"
+                    st.warning(
+                        f"{issue.get('filename', 'CSV')}{location}: "
+                        f"{issue.get('message', issue.get('code', 'không hợp lệ'))}. "
+                        f"{issue.get('suggestion', '')}".strip()
+                    )
+            except Exception as error:
+                _report_ui_error(
+                    error,
+                    workflow="submission",
+                    stage="bundle",
+                    batch_id=next(iter(batch_ids)),
+                )
+    if not can_build:
+        st.caption("Bundle chỉ được mở khóa khi mọi entry đã chọn ở trạng thái READY.")
+
+    bundle = st.session_state.get("codabench_bundle_cache")
+    if isinstance(bundle, dict) and isinstance(bundle.get("data"), bytes):
+        st.success("100% VALID · Bundle đã vượt qua pre-submission gate.")
+        st.download_button(
+            "Tải Codabench bundle",
+            data=bundle["data"],
+            file_name=str(bundle.get("filename", "AIC2026_submission.zip")),
+            mime="application/zip",
+            key="codabench_download_bundle",
+            width="stretch",
+        )
+        st.caption(
+            f"Kích thước: {int(bundle.get('byte_count', len(bundle['data']))):,} bytes · "
+            f"Số CSV: {int(bundle.get('file_count', 0))} · Trạng thái: 100% VALID"
+        )
+        st.code(str(bundle.get("sha256", "")), language=None)
+
+
 def render_app(context: RuntimeContext) -> None:
     """Render all three workflows over an injected, already-constructed runtime."""
 
@@ -3221,6 +3588,7 @@ def render_app(context: RuntimeContext) -> None:
             _render_trake(context)
         else:
             _render_kis(context)
+        _render_codabench_submission_hub(context, str(active or "kis"))
     except Exception as error:
         _report_ui_error(
             error,

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -21,6 +23,13 @@ from src.evaluation.trake import (
     evaluate_trake_query,
 )
 from src.evaluation.visual_qa import QAGroundTruthQuery, evaluate_qa_query
+from src.export.preflight import (
+    CODABENCH_SPEC_ID,
+    BundleEntry,
+    BundleValidationContext,
+    BundleValidationError,
+    validate_bundle_entries,
+)
 from src.ingest.artifacts import ArtifactRepository
 from src.ingest.ledger import JobLedger, LedgerError
 from src.official_submission import (
@@ -178,14 +187,59 @@ def main(argv: list[str] | None = None) -> int:
             frame = repository.get_source_frame(batch_id, video_id, frame_idx)
             return None if frame is None else frame.timestamp_ms
 
-        report = validate_parsed_submission(
-            parsed,
-            batch_id=args.batch_id,
-            is_batch_active=is_active,
-            is_canonical_source_frame=canonical,
-            get_canonical_timestamp_ms=timestamp,
-            ground_truth_supplied=args.ground_truth is not None,
-        ).to_dict()
+        if args.spec == CODABENCH_SPEC_ID:
+            match = re.fullmatch(r"query-([0-9]{1,32})-(kis|qa|trake)\.csv", parsed.filename)
+            if match is None:
+                raise OfficialSubmissionValidationError(
+                    "submission_filename_invalid",
+                    "Codabench filename does not match its task",
+                )
+            data = args.submission.read_bytes()
+            entry = BundleEntry(
+                task=args.task,
+                query_id=match.group(1),
+                csv_bytes=data,
+                batch_id=args.batch_id,
+                source_fingerprint=hashlib.sha256(data).hexdigest(),
+                stage_count=parsed.stage_count if args.task == "trake" else None,
+            )
+            try:
+                validated = validate_bundle_entries(
+                    (entry,),
+                    context=BundleValidationContext(
+                        is_batch_active=is_active,
+                        is_canonical_source_frame=canonical,
+                        get_canonical_timestamp_ms=timestamp,
+                    ),
+                    mode="current",
+                )
+            except BundleValidationError as error:
+                issue = error.issues[0]
+                raise OfficialSubmissionValidationError(
+                    issue.code,
+                    issue.message,
+                    row=issue.row,
+                    line=issue.line,
+                    suggestion=issue.suggestion,
+                ) from None
+            parsed = validated[0].parsed
+            report = validate_parsed_submission(
+                parsed,
+                batch_id=args.batch_id,
+                is_batch_active=is_active,
+                is_canonical_source_frame=canonical,
+                get_canonical_timestamp_ms=timestamp,
+                ground_truth_supplied=args.ground_truth is not None,
+            ).to_dict()
+        else:
+            report = validate_parsed_submission(
+                parsed,
+                batch_id=args.batch_id,
+                is_batch_active=is_active,
+                is_canonical_source_frame=canonical,
+                get_canonical_timestamp_ms=timestamp,
+                ground_truth_supplied=args.ground_truth is not None,
+            ).to_dict()
         if args.ground_truth is not None:
             report["ground_truth"] = {
                 "path_name": args.ground_truth.name,
@@ -200,11 +254,13 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0
     except OfficialSubmissionValidationError as exc:
+        error_payload = {"status": "invalid", "code": exc.code, "message": str(exc)}
+        for name in ("line", "row", "suggestion"):
+            value = getattr(exc, name, None)
+            if value is not None:
+                error_payload[name] = value
         print(
-            json.dumps(
-                {"status": "invalid", "code": exc.code, "message": str(exc)},
-                ensure_ascii=False,
-            ),
+            json.dumps(error_payload, ensure_ascii=False),
             file=sys.stderr,
         )
         return 2

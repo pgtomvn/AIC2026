@@ -20,7 +20,12 @@ readiness:
   batches:
     aic25-b1-reference:
       kind: reference
-      expected_frames: 177321
+      # Organizer maps/vectors retain every JPEG ordinal.  Adjacent ordinals
+      # share a submitted source frame in 614 cases, so canonical media uses
+      # the distinct source-frame identity count instead of the row count.
+      expected_mapping_rows: 177321
+      expected_canonical_frames: 176707
+      canonical_image_min_coverage: 0.99
       expected_videos: 873
       workflows:
         kis: [organizer_clip, metadata]

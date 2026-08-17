@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
@@ -39,6 +40,7 @@ def _safe_error(response: Any) -> BackendError:
             for name in (
                 "code",
                 "search_id",
+                "candidate_id",
                 "recoverable",
                 "status",
                 "reasoned_clusters",
@@ -54,6 +56,30 @@ def _safe_error(response: Any) -> BackendError:
                 value = detail.get(name)
                 if isinstance(value, (bool, int, float, str)) or value is None:
                     safe_detail[name] = value
+            issues = detail.get("issues")
+            if isinstance(issues, list):
+                safe_issues: list[dict[str, Any]] = []
+                for issue in issues[:32]:
+                    if not isinstance(issue, dict):
+                        continue
+                    sanitized: dict[str, Any] = {}
+                    for name in (
+                        "filename",
+                        "task",
+                        "code",
+                        "message",
+                        "suggestion",
+                        "row",
+                        "line",
+                    ):
+                        value = issue.get(name)
+                        if isinstance(value, str) and len(value) <= 256:
+                            sanitized[name] = value
+                        elif isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                            sanitized[name] = value
+                    if sanitized:
+                        safe_issues.append(sanitized)
+                safe_detail["issues"] = safe_issues
         elif isinstance(detail, str) and len(detail) <= 96:
             code = detail
     except Exception:
@@ -201,12 +227,21 @@ class _QAPipeline:
 
     def answer_candidate(self, search_id: str, request: Any) -> list[dict[str, Any]]:
         actual = self._actual(search_id)
-        value = self.client.json(
-            "POST",
-            f"/v1/qa/search/{actual}/answer",
-            payload=request.to_dict(),
-            timeout_seconds=75,
-        )
+        try:
+            value = self.client.json(
+                "POST",
+                f"/v1/qa/search/{actual}/answer",
+                payload=request.to_dict(),
+                timeout_seconds=75,
+            )
+        except BackendError as error:
+            if error.recoverable:
+                try:
+                    error.snapshot = self.get_search(actual)
+                    self.last_snapshot = error.snapshot
+                except BackendError:
+                    error.snapshot = None
+            raise
         normalized = self._normalize(value)
         self.last_snapshot = normalized
         return list(normalized.get("predictions", ()))
@@ -471,6 +506,36 @@ class HttpRuntimeContext:
                 timeout_seconds=75,
             )
         )
+
+    def create_submission_bundle(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Build a validated server-side bundle and fetch its immutable bytes."""
+
+        metadata = dict(
+            self.client.json(
+                "POST",
+                "/v1/submissions/bundles",
+                payload=payload,
+                timeout_seconds=30,
+            )
+        )
+        download_url = metadata.get("download_url")
+        if not isinstance(download_url, str) or not download_url.startswith(
+            "/v1/submissions/bundles/"
+        ):
+            raise BackendError("backend_response_invalid")
+        data = self.client.bytes(download_url)
+        digest = metadata.get("sha256")
+        byte_count = metadata.get("byte_count")
+        if (
+            not isinstance(digest, str)
+            or hashlib.sha256(data).hexdigest() != digest
+            or isinstance(byte_count, bool)
+            or not isinstance(byte_count, int)
+            or byte_count != len(data)
+        ):
+            raise BackendError("bundle_download_integrity_failed")
+        metadata["data"] = data
+        return metadata
 
 
 def build_http_runtime(base_url: str, *, http: Any | None = None) -> HttpRuntimeContext:

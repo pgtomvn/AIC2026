@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
+import io
 import os
 import sys
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -151,6 +154,24 @@ def _context(*, canonical: bool):
             raise ValueError("test context accepts only the selected batch")
         return result
 
+    bundle_requests = []
+
+    def create_submission_bundle(payload):
+        bundle_requests.append(payload)
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("submission/", b"")
+        data = buffer.getvalue()
+        return {
+            "run_id": "run_20260817T120000123456Z",
+            "filename": "AIC2026_submission_20260817T120000123456Z.zip",
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "byte_count": len(data),
+            "file_count": len(payload["entries"]),
+            "status": "valid",
+            "data": data,
+        }
+
     return SimpleNamespace(
         pipeline=pipeline,
         trake_pipeline=_TRAKEPipeline(),
@@ -175,6 +196,8 @@ def _context(*, canonical: bool):
             "retrieval": {"visual_qa": {}},
         },
         ledger=SimpleNamespace(is_batch_active=lambda _batch_id: True),
+        create_submission_bundle=create_submission_bundle,
+        bundle_requests=bundle_requests,
     )
 
 
@@ -308,6 +331,38 @@ def main() -> int:
         raise RuntimeError("TRAKE did not select the first stable candidate identity")
     if not app.download_button(key="trake_download"):
         raise RuntimeError("validated TRAKE results did not expose a CSV download")
+    app.text_input(key="codabench_query_id_trake").set_value("003")
+    app.run()
+    app.button(key="codabench_stage_current").click()
+    app.run()
+    if "query-003-trake.csv" not in app.session_state["codabench_staging"]:
+        raise RuntimeError("Codabench Hub did not persist the staged TRAKE entry")
+    if not app.button(key="codabench_build_bundle").disabled:
+        raise RuntimeError("full Codabench bundle unlocked without KIS and QA entries")
+    app.radio(key="codabench_bundle_mode").set_value("current")
+    app.run()
+    if app.button(key="codabench_build_bundle").disabled:
+        raise RuntimeError("current-tab Codabench bundle did not unlock for a ready entry")
+    app.button(key="codabench_build_bundle").click()
+    app.run()
+    if len(context.bundle_requests) != 1:
+        raise RuntimeError("Codabench Hub did not invoke the thin-client backend exactly once")
+    if not app.download_button(key="codabench_download_bundle"):
+        raise RuntimeError("Codabench bundle download did not persist after the build rerun")
+    app.run()
+    if not app.download_button(key="codabench_download_bundle"):
+        raise RuntimeError("Codabench bundle download was lost on an unrelated rerun")
+    changed_results = [dict(item) for item in app.session_state["trake_results"]]
+    changed_matches = [dict(item) for item in changed_results[0]["stage_matches"]]
+    changed_matches[0]["source_frame_idx"] = 11
+    changed_matches[0]["timestamp_ms"] = 1_100
+    changed_results[0]["stage_matches"] = changed_matches
+    app.session_state["trake_results"] = changed_results
+    app.run()
+    if not app.button(key="codabench_build_bundle").disabled:
+        raise RuntimeError("Codabench Hub did not mark a mutated source entry as stale")
+    if not app.download_button(key="codabench_download_bundle"):
+        raise RuntimeError("a prior immutable bundle download was lost after source mutation")
 
     app.segmented_control(key="active_workflow").set_value("kis")
     app.run()

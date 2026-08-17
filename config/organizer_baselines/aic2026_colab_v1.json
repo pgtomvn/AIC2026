@@ -26,6 +26,8 @@
   "verified_reference_pack": {
     "videos": 873,
     "map_rows": 177321,
+    "canonical_source_frames": 176707,
+    "duplicate_source_frame_alias_rows": 614,
     "feature_rows": 177321,
     "object_json_files": 177321,
     "feature_dimension": 512,

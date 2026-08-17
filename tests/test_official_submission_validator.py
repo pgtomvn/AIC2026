@@ -43,6 +43,103 @@ def test_official_2026_fails_closed(tmp_path) -> None:
     assert caught.value.code == OFFICIAL_2026_UNAVAILABLE
 
 
+def test_codabench_10187_accepts_lf_or_crlf_and_official_qa_quoting(tmp_path) -> None:
+    lf = parse_submission_csv(
+        _write(tmp_path, "query-1-kis.csv", b"L21_V001,10\n"),
+        task="kis",
+        spec_id="codabench_10187_2025",
+    )
+    crlf = parse_submission_csv(
+        _write(tmp_path, "query-2-kis.csv", b"L21_V001,10\r\n"),
+        task="kis",
+        spec_id="codabench_10187_2025",
+    )
+    qa = parse_submission_csv(
+        _write(
+            tmp_path,
+            "query-3-qa.csv",
+            'L21_V001,10,"Có 3 người, gồm nam và nữ"\n'.encode("utf-8"),
+        ),
+        task="qa",
+        spec_id="codabench_10187_2025",
+    )
+    assert lf.rows == crlf.rows == (("L21_V001", "10"),)
+    assert qa.rows[0][2] == "Có 3 người, gồm nam và nữ"
+
+
+def test_codabench_10187_rejects_wrong_filename_extension_and_long_answer(tmp_path) -> None:
+    with pytest.raises(OfficialSubmissionValidationError) as wrong_name:
+        parse_submission_csv(
+            _write(tmp_path, "kis.csv", b"L21_V001,10\n"),
+            task="kis",
+            spec_id="codabench_10187_2025",
+        )
+    assert wrong_name.value.code == "submission_filename_invalid"
+
+    with pytest.raises(OfficialSubmissionValidationError) as extension:
+        parse_submission_csv(
+            _write(tmp_path, "query-1-kis.csv", b"L21_V001.mp4,10\n"),
+            task="kis",
+            spec_id="codabench_10187_2025",
+        )
+    assert extension.value.code == "submission_video_extension_forbidden"
+    assert extension.value.row == 1
+
+    with pytest.raises(OfficialSubmissionValidationError) as long_answer:
+        parse_submission_csv(
+            _write(tmp_path, "query-2-qa.csv", f"L21_V001,10,{'a' * 101}\n".encode()),
+            task="qa",
+            spec_id="codabench_10187_2025",
+        )
+    assert long_answer.value.code == "submission_answer_too_long"
+
+
+@pytest.mark.parametrize(
+    ("name", "task", "data", "code"),
+    [
+        ("query-1-kis.csv", "kis", b"\xef\xbb\xbfL21_V001,10\n", "submission_bom_forbidden"),
+        ("query-1-kis.csv", "kis", b"video_id,frame_idx\n", "submission_header_forbidden"),
+        ("query-1-kis.csv", "kis", b"L21_V001;10\n", "submission_row_width_invalid"),
+        ("query-1-kis.csv", "kis", b" L21_V001,10\n", "submission_video_id_invalid"),
+        ("query-1-kis.csv", "kis", b"L21_V001, 10\n", "submission_integer_invalid"),
+        ("query-1-qa.csv", "qa", b"L21_V001,10,   \n", "submission_answer_empty"),
+        (
+            "query-1-kis.csv",
+            "kis",
+            b"L21_V001,10\r\nL21_V001,20\n",
+            "submission_newline_invalid",
+        ),
+    ],
+)
+def test_codabench_10187_strict_format_gate(tmp_path, name, task, data, code) -> None:
+    with pytest.raises(OfficialSubmissionValidationError) as caught:
+        parse_submission_csv(
+            _write(tmp_path, name, data),
+            task=task,
+            spec_id="codabench_10187_2025",
+        )
+    assert caught.value.code == code
+
+
+def test_codabench_10187_limits_rows_and_accepts_100_unicode_codepoints(tmp_path) -> None:
+    valid_answer = "đ" * 100
+    parsed = parse_submission_csv(
+        _write(tmp_path, "query-7-qa.csv", f"L21_V001,10,{valid_answer}\n".encode()),
+        task="qa",
+        spec_id="codabench_10187_2025",
+    )
+    assert len(parsed.rows[0][2]) == 100
+
+    too_many = b"".join(f"L21_V001,{index}\n".encode() for index in range(101))
+    with pytest.raises(OfficialSubmissionValidationError) as caught:
+        parse_submission_csv(
+            _write(tmp_path, "query-8-kis.csv", too_many),
+            task="kis",
+            spec_id="codabench_10187_2025",
+        )
+    assert caught.value.code == "submission_row_limit_exceeded"
+
+
 def test_kis_and_qa_validate_canonical_membership(tmp_path) -> None:
     kis = parse_submission_csv(
         _write(tmp_path, "kis.csv", b"L21_V001,10\n"),

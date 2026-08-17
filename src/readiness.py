@@ -1019,39 +1019,34 @@ class ReadinessService:
                 "canonical_artifacts_unavailable",
                 "import_or_ingest_batch",
             )
-        expected = int(specification.get("expected_frames", 0) or 0)
+        expected = int(
+            specification.get(
+                "expected_canonical_frames",
+                specification.get("expected_frames", 0),
+            )
+            or 0
+        )
         expected_videos = int(specification.get("expected_videos", 0) or 0)
         coverage = min(1.0, count / expected) if expected else None
-        incomplete = (expected and count < expected) or (
-            expected_videos and video_count < expected_videos
-        )
-        resolvable = True
-        if count > 0 and not incomplete:
+        threshold_value = specification.get("canonical_image_min_coverage")
+        if threshold_value is None:
+            coverage_sufficient = (not expected or count >= expected) and (
+                not expected_videos or video_count >= expected_videos
+            )
+        else:
             try:
-                with sqlite3.connect(uri, uri=True, timeout=1) as connection:
-                    resolvable = self.image_resolver.source_uris_resolvable(
-                        str(row[0])
-                        for row in connection.execute(
-                            """
-                            SELECT image_uri
-                            FROM canonical_frames
-                            WHERE batch_id = ?
-                            ORDER BY image_uri
-                            """,
-                            (batch_id,),
-                        )
-                    )
-            except (OSError, sqlite3.Error, TypeError, ValueError):
-                resolvable = False
+                threshold = float(threshold_value)
+            except (TypeError, ValueError):
+                threshold = 1.0
+            if not 0.0 <= threshold < 1.0:
+                threshold = 1.0
+            coverage_sufficient = coverage is not None and coverage > threshold
         if count <= 0:
             state = ChannelState.NOT_PROVISIONED
             reason = "no_canonical_images_for_batch"
-        elif incomplete:
+        elif not coverage_sufficient:
             state = ChannelState.NOT_PROVISIONED
             reason = "canonical_image_coverage_incomplete"
-        elif not resolvable:
-            state = ChannelState.NOT_PROVISIONED
-            reason = "canonical_image_uri_unresolvable"
         else:
             state = ChannelState.READY
             reason = None

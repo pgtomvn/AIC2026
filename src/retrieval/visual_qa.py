@@ -39,6 +39,14 @@ class QAReasoner(Protocol):
     def reason(self, request: Any, images: Sequence[Any], spec: Any) -> Any: ...
 
 
+class QACandidateMediaUnavailableError(RuntimeError):
+    """Raised when one persisted QA candidate cannot resolve its image safely."""
+
+    def __init__(self, candidate_id: str) -> None:
+        super().__init__("qa_candidate_media_unavailable")
+        self.candidate_id = str(candidate_id)
+
+
 _OUTCOME_STATUSES = frozenset(
     {
         "pending",
@@ -694,6 +702,8 @@ class VisualQAPipeline:
 
     @staticmethod
     def _failure(exc: Exception, stage: str) -> tuple[str, str, str]:
+        if isinstance(exc, QACandidateMediaUnavailableError):
+            return "media_failed", "media_unavailable", "media"
         if isinstance(exc, CanonicalImageTooLargeError):
             return "media_failed", "media_window_too_large", "media"
         if isinstance(exc, CanonicalImageError):
@@ -716,6 +726,35 @@ class VisualQAPipeline:
         if stage == "response":
             return "provider_failed", "provider_response_invalid", "provider"
         return "internal_failed", "internal_reasoning_error", stage
+
+    def _persist_candidate_failure(
+        self,
+        search_id: str,
+        candidate_id: str,
+        error: Exception,
+    ) -> None:
+        if self.session_store is None:
+            return
+        session = self.session_store.get_session(search_id)
+        if session is None:
+            return
+        state = dict(session.state)
+        failures = dict(state.get("failures", {}))
+        failures[candidate_id] = self._failure(error, "provider")[1]
+        state.update(
+            {
+                "state_version": 3,
+                "status": "failed",
+                "selected_candidate_id": candidate_id,
+                "failures": failures,
+            }
+        )
+        try:
+            self.session_store.update_state(
+                search_id, state, expected_revision=session.revision
+            )
+        except QASessionStoreError:
+            return
 
     @staticmethod
     def _provider_failure_metadata(exc: Exception) -> dict[str, Any]:
@@ -1140,9 +1179,20 @@ class VisualQAPipeline:
                 if request.answer_engine == "florence2"
                 else "qa_reasoner_unavailable"
             )
-        resolved = self.image_resolver.resolve(frame) if self.image_resolver is not None else None
+        try:
+            resolved = (
+                self.image_resolver.resolve(frame)
+                if self.image_resolver is not None
+                else None
+            )
+        except CanonicalImageError:
+            error = QACandidateMediaUnavailableError(candidate.candidate_id)
+            self._persist_candidate_failure(search_id, candidate.candidate_id, error)
+            raise error from None
         if resolved is None:
-            raise RuntimeError("media_unavailable")
+            error = QACandidateMediaUnavailableError(candidate.candidate_id)
+            self._persist_candidate_failure(search_id, candidate.candidate_id, error)
+            raise error
         request_payload = {
             "version": "qa-single-frame-answer-v3",
             "event_description": unicodedata.normalize("NFC", event_description.strip()),
@@ -1295,22 +1345,9 @@ class VisualQAPipeline:
             )
             return answers[candidate.candidate_id]
         except Exception as error:
-            session = self.session_store.get_session(search_id)
-            if session is not None:
-                state = dict(session.state)
-                failures = dict(state.get("failures", {}))
-                failures[candidate.candidate_id] = self._failure(error, "provider")[1]
-                state.update(
-                    {
-                        "state_version": 3,
-                        "status": "failed",
-                        "selected_candidate_id": candidate.candidate_id,
-                        "failures": failures,
-                    }
-                )
-                self.session_store.update_state(
-                    search_id, state, expected_revision=session.revision
-                )
+            self._persist_candidate_failure(
+                search_id, candidate.candidate_id, error
+            )
             raise
 
     def answer(
@@ -2056,6 +2093,7 @@ class VisualQAPipeline:
 QACandidateWindow = QACandidateCluster
 
 __all__ = [
+    "QACandidateMediaUnavailableError",
     "QACandidateWindow",
     "QAReasoner",
     "QAWindowFrameRef",

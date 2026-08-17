@@ -59,6 +59,7 @@ def render_export_panel(
             "filename": f"textual-kis-{datetime.now():%Y%m%d-%H%M%S}.csv",
             "data": data,
             "sha256": hashlib.sha256(data).hexdigest(),
+            "source_ranks": tuple(int(item["rank"]) for item in results),
         }
         st.session_state[session_cache_key] = cached
     data = cached["data"]

@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from app.http_backend import BackendError, build_http_runtime
-from src.contracts import QACompetitionSpec, QAQueryRequest, QueryRequest
+from app.http_backend import BackendError, _safe_error, build_http_runtime
+from src.contracts import (
+    QACompetitionSpec,
+    QAQueryRequest,
+    QASingleFrameAnswerRequest,
+    QueryRequest,
+)
 
 
 class _Response:
@@ -189,6 +195,56 @@ def test_recoverable_503_keeps_authoritative_search_id_and_restores_snapshot() -
     assert not any("correlation-only/expand" in call[1] for call in http.calls)
 
 
+class _MissingCandidateHTTP(_HTTP):
+    def request(self, method: str, url: str, **kwargs: Any) -> _Response:
+        self.calls.append((method, url, kwargs))
+        if url.endswith("/v1/qa/search/s1/answer") and method == "POST":
+            return _Response(
+                {
+                    "detail": {
+                        "code": "qa_candidate_media_unavailable",
+                        "candidate_id": "b1:L21_V001:10",
+                        "recoverable": True,
+                    }
+                },
+                409,
+            )
+        if url.endswith("/v1/qa/search/s1") and method == "GET":
+            return _Response(
+                {
+                    "search_id": "s1",
+                    "state_version": 3,
+                    "status": "failed",
+                    "candidates": [],
+                    "predictions": [],
+                    "failures": {"b1:L21_V001:10": "media_unavailable"},
+                }
+            )
+        return super().request(method, url, **kwargs)
+
+
+def test_answer_media_failure_restores_persisted_candidate_state() -> None:
+    context = build_http_runtime(
+        "http://127.0.0.1:8080", http=_MissingCandidateHTTP()
+    )
+
+    with pytest.raises(BackendError) as captured:
+        context.qa_pipeline.answer_candidate(
+            "s1",
+            QASingleFrameAnswerRequest(
+                candidate_id="b1:L21_V001:10",
+                question="How many apples?",
+                reasoning_policy="local_only",
+            ),
+        )
+
+    error = captured.value
+    assert error.status_code == 409
+    assert error.detail["candidate_id"] == "b1:L21_V001:10"
+    assert error.snapshot is not None
+    assert error.snapshot["failures"] == {"b1:L21_V001:10": "media_unavailable"}
+
+
 def test_thin_client_refreshes_capabilities_and_uses_warmup_trake_readiness() -> None:
     http = _HTTP()
     context = build_http_runtime("http://127.0.0.1:8080", http=http)
@@ -199,3 +255,88 @@ def test_thin_client_refreshes_capabilities_and_uses_warmup_trake_readiness() ->
 
     assert capabilities["qa"]["local"]["status"]["state"] == "ready"
     assert trake.to_dict() == {"state": "ready", "usable": True}
+
+
+class _BundleHTTP(_HTTP):
+    def request(self, method: str, url: str, **kwargs: Any) -> _Response:
+        if url.endswith("/v1/submissions/bundles") and method == "POST":
+            self.calls.append((method, url, kwargs))
+            return _Response(
+                {
+                    "run_id": "run_20260817T120000123456Z",
+                    "filename": "AIC2026_submission_20260817T120000123456Z.zip",
+                    "sha256": hashlib.sha256(b"zip-bytes").hexdigest(),
+                    "file_count": 3,
+                    "byte_count": 9,
+                    "download_url": (
+                        "/v1/submissions/bundles/run_20260817T120000123456Z/download"
+                    ),
+                }
+            )
+        return super().request(method, url, **kwargs)
+
+    def get(self, url: str, **kwargs: Any) -> _Response:
+        self.calls.append(("GET", url, kwargs))
+        response = _Response({}, 200)
+        response.content = b"zip-bytes"
+        return response
+
+
+def test_thin_client_builds_then_downloads_bundle_bytes() -> None:
+    http = _BundleHTTP()
+    context = build_http_runtime("http://127.0.0.1:8080", http=http)
+
+    result = context.create_submission_bundle(
+        {"mode": "all", "batch_id": "b1", "entries": []}
+    )
+
+    assert result["data"] == b"zip-bytes"
+    assert http.calls[-2][0] == "POST"
+    assert http.calls[-1][1].endswith(
+        "/v1/submissions/bundles/run_20260817T120000123456Z/download"
+    )
+
+
+def test_bundle_validation_error_keeps_only_sanitized_issues() -> None:
+    response = _Response(
+        {
+            "detail": {
+                "code": "bundle_validation_failed",
+                "issues": [
+                    {
+                        "filename": "query-1-kis.csv",
+                        "task": "kis",
+                        "code": "submission_frame_not_canonical",
+                        "message": "frame is invalid",
+                        "row": 2,
+                        "line": 2,
+                        "suggestion": "select another frame",
+                        "path": "D:/secret",
+                    }
+                ],
+            }
+        },
+        422,
+    )
+
+    error = _safe_error(response)
+
+    assert error.detail["issues"][0]["row"] == 2
+    assert "path" not in error.detail["issues"][0]
+
+
+def test_thin_client_rejects_bundle_download_hash_mismatch() -> None:
+    http = _BundleHTTP()
+    original_request = http.request
+
+    def mismatched(method: str, url: str, **kwargs: Any) -> _Response:
+        response = original_request(method, url, **kwargs)
+        if url.endswith("/v1/submissions/bundles"):
+            response.payload["sha256"] = "0" * 64
+        return response
+
+    http.request = mismatched  # type: ignore[method-assign]
+    context = build_http_runtime("http://127.0.0.1:8080", http=http)
+    with pytest.raises(BackendError) as caught:
+        context.create_submission_bundle({"mode": "current", "entries": [{}]})
+    assert caught.value.code == "bundle_download_integrity_failed"

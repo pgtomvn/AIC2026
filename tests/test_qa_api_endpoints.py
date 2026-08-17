@@ -22,7 +22,10 @@ from src.contracts import (
     QAReasoningResult,
     QASingleFrameAnswerRequest,
 )
-from src.retrieval.visual_qa import VisualQATotalFailureError
+from src.retrieval.visual_qa import (
+    QACandidateMediaUnavailableError,
+    VisualQATotalFailureError,
+)
 
 
 def _prediction(rank: int = 1, frame: int = 10) -> dict[str, Any]:
@@ -484,6 +487,44 @@ def test_qa_answer_runs_only_for_a_persisted_candidate(tmp_path: Path) -> None:
             },
         )
     assert outsider.value.status_code == 422
+
+
+def test_qa_answer_returns_candidate_scoped_media_failure(tmp_path: Path) -> None:
+    class MissingMediaPipeline(_QAPipeline):
+        def answer_candidate(self, search_id, request):
+            snapshot = self.snapshots[search_id]
+            snapshot["selected_candidate_id"] = request.candidate_id
+            snapshot["failures"] = {request.candidate_id: "media_unavailable"}
+            raise QACandidateMediaUnavailableError(request.candidate_id)
+
+    pipeline = MissingMediaPipeline()
+    app = create_app(_context(tmp_path, pipeline))
+    retrieved = _route(app, "/v1/qa/retrieve", "POST").endpoint(
+        {
+            "query_id": "qa-media",
+            "event_description": "A person holds three apples.",
+            "batch_filters": ["b1"],
+            "top_k": 5,
+        }
+    )
+    answer = _route(app, "/v1/qa/search/{search_id}/answer", "POST").endpoint
+
+    with pytest.raises(HTTPException) as raised:
+        answer(
+            retrieved["search_id"],
+            {
+                "candidate_id": "b1:L21_V001:10",
+                "question": "How many apples?",
+                "reasoning_policy": "local_only",
+            },
+        )
+
+    assert raised.value.status_code == 409
+    assert raised.value.detail == {
+        "code": "qa_candidate_media_unavailable",
+        "recoverable": True,
+        "candidate_id": "b1:L21_V001:10",
+    }
 
 
 def test_qa_restore_and_total_failure_are_safe(tmp_path: Path) -> None:

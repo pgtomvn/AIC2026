@@ -318,7 +318,7 @@ def test_trake_is_degraded_but_dense_retrieval_remains_usable_when_thumbnails_in
     assert trake.unavailable_channels == ("canonical_images",)
 
 
-def test_trake_is_degraded_for_nonempty_but_unresolvable_thumbnail_uri(
+def test_global_readiness_defers_unresolvable_media_to_candidate_gate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     database = tmp_path / "artifacts.sqlite3"
@@ -338,39 +338,62 @@ def test_trake_is_degraded_for_nonempty_but_unresolvable_thumbnail_uri(
     trake = service.workflow_readiness(report, "trake")
 
     assert channels["organizer_clip"].usable is True
-    assert channels["canonical_images"].reason_code == "canonical_image_uri_unresolvable"
-    assert trake.state is WorkflowState.DEGRADED
-    assert trake.unavailable_channels == ("canonical_images",)
+    assert channels["canonical_images"].state is ChannelState.READY
+    assert channels["canonical_images"].reason_code is None
+    assert trake.state is WorkflowState.READY
+    assert trake.unavailable_channels == ()
     assert "private-secret-thumbnail" not in str(report.to_dict())
 
 
-def test_canonical_image_readiness_checks_every_uri_in_sorted_stream(
+def test_canonical_image_readiness_uses_strict_configured_coverage_threshold(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     database = tmp_path / "artifacts.sqlite3"
     _artifact_database(database)
-    missing_last = tmp_path / "zz-last-missing-thumbnail.jpg"
     with sqlite3.connect(database) as connection:
-        connection.execute(
+        connection.executemany(
             "INSERT INTO canonical_frames VALUES (?, ?, ?)",
-            ("aic25-b1-reference", "L01_V001", str(missing_last)),
+            (
+                ("aic25-b1-reference", "L01_V001", str(tmp_path / f"frame-{i}.jpg"))
+                for i in range(3, 100)
+            ),
         )
     config = _config(tmp_path)
-    config["readiness"]["batches"]["aic25-b1-reference"]["expected_frames"] = 3
+    specification = config["readiness"]["batches"]["aic25-b1-reference"]
+    specification.pop("expected_frames")
+    specification["expected_canonical_frames"] = 100
+    specification["canonical_image_min_coverage"] = 0.99
     monkeypatch.setattr(readiness_module, "_module_available", lambda _name: True)
     monkeypatch.setattr(
         readiness_module, "organizer_verification_passed", lambda *_a, **_k: True
     )
-    service = ReadinessService(config, project_root=tmp_path, http_client=_HTTP())
-
-    report = service.check("aic25-b1-reference")
+    exactly_99 = ReadinessService(config, project_root=tmp_path, http_client=_HTTP())
+    report = exactly_99.check("aic25-b1-reference")
     channels = {item.name: item for item in report.channels}
 
-    assert channels["canonical_images"].count == 3
-    assert channels["canonical_images"].reason_code == (
-        "canonical_image_uri_unresolvable"
-    )
-    assert service.workflow_readiness(report, "trake").state is WorkflowState.DEGRADED
+    assert channels["canonical_images"].count == 99
+    assert channels["canonical_images"].coverage == pytest.approx(0.99)
+    assert channels["canonical_images"].reason_code == "canonical_image_coverage_incomplete"
+
+    specification["expected_canonical_frames"] = 100
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO canonical_frames VALUES (?, ?, ?)",
+            ("aic25-b1-reference", "L01_V001", str(tmp_path / "frame-100.jpg")),
+        )
+    complete = ReadinessService(config, project_root=tmp_path, http_client=_HTTP())
+    channels = {
+        item.name: item for item in complete.check("aic25-b1-reference").channels
+    }
+    assert channels["canonical_images"].state is ChannelState.READY
+
+    specification["expected_canonical_frames"] = 101
+    above_99 = ReadinessService(config, project_root=tmp_path, http_client=_HTTP())
+    channels = {
+        item.name: item for item in above_99.check("aic25-b1-reference").channels
+    }
+    assert channels["canonical_images"].coverage == pytest.approx(100 / 101)
+    assert channels["canonical_images"].state is ChannelState.READY
 
 
 def test_readiness_never_exposes_raw_service_errors_or_credentials(tmp_path: Path) -> None:

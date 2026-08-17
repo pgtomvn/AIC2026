@@ -18,9 +18,10 @@ from src.contracts import (
     QAReasoningResult,
     QASingleFrameAnswerRequest,
 )
+from src.retrieval.qa_media import CanonicalImageError
 from src.retrieval.qa_retrieval import VisualQARetriever
 from src.retrieval.qa_session import QASessionStore
-from src.retrieval.visual_qa import VisualQAPipeline
+from src.retrieval.visual_qa import QACandidateMediaUnavailableError, VisualQAPipeline
 from src.vlm.florence2 import Florence2TaskReasoner
 from src.vlm.gpu_coordinator import GPUModelCoordinator
 from src.vlm.qa_reasoner import QAProviderRequestError, QAProviderUnavailableError
@@ -209,6 +210,36 @@ def test_answer_stage_accepts_only_session_candidate_and_exactly_one_image(
     with pytest.raises(ValueError, match="not part"):
         pipeline.answer_candidate("answer-session", outsider)
     assert reasoner.calls == 1
+
+
+def test_missing_candidate_media_is_persisted_without_calling_provider(
+    tmp_path: Path,
+) -> None:
+    pipeline, _sessions, _textual, _resolver, reasoner = _pipeline(tmp_path)
+    pipeline.start_candidate_search(
+        QACandidateRequest("q-media", "a news presenter", ("b1",), 5),
+        session_id="missing-media",
+    )
+
+    class MissingResolver:
+        def resolve(self, _frame):
+            raise CanonicalImageError("C:/private/missing-frame.jpg")
+
+    pipeline.image_resolver = MissingResolver()
+    request = QASingleFrameAnswerRequest(
+        candidate_id="b1:V001:10",
+        question="Does the man wear glasses?",
+        reasoning_policy="local_only",
+    )
+
+    with pytest.raises(QACandidateMediaUnavailableError) as raised:
+        pipeline.answer_candidate("missing-media", request)
+
+    assert raised.value.candidate_id == "b1:V001:10"
+    assert reasoner.calls == 0
+    snapshot = pipeline.get_search("missing-media")
+    assert snapshot["failures"] == {"b1:V001:10": "media_unavailable"}
+    assert "private" not in str(snapshot)
 
 
 def test_local_fallback_is_session_only_and_does_not_mask_gemini_recovery(

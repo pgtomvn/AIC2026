@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 import io
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Literal, Sequence
@@ -23,6 +24,7 @@ SubmissionTask = Literal["kis", "qa", "trake"]
 OFFICIAL_2026_UNAVAILABLE = "official_2026_spec_unavailable"
 SUPPORTED_SPECS = frozenset(
     {
+        "codabench_10187_2025",
         "historical_2025",
         "historical_qa_numeric",
         "historical_2025_provisional_trake",
@@ -33,9 +35,20 @@ SUPPORTED_SPECS = frozenset(
 class OfficialSubmissionValidationError(ValueError):
     """A stable-code validation failure suitable for CLI/API boundaries."""
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        line: int | None = None,
+        row: int | None = None,
+        suggestion: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
+        self.line = line
+        self.row = row
+        self.suggestion = suggestion
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +61,7 @@ class ParsedSubmission:
     byte_count: int
     line_count: int
     stage_count: int | None = None
+    physical_lines: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +99,12 @@ def _spec_for(task: SubmissionTask, spec_id: str) -> object:
             OFFICIAL_2026_UNAVAILABLE,
             "the organizer has not published an AIC 2026 submission rule pack",
         )
+    if spec_id == "codabench_10187_2025":
+        if task == "kis":
+            return CompetitionSpec.historical_2025()
+        if task == "qa":
+            return QACompetitionSpec.conservative_general_text()
+        return TRAKECompetitionSpec.historical_2025_provisional()
     expected = {
         "kis": "historical_2025",
         "qa": "historical_qa_numeric",
@@ -102,36 +122,62 @@ def _spec_for(task: SubmissionTask, spec_id: str) -> object:
     return TRAKECompetitionSpec.historical_2025_provisional()
 
 
-def parse_submission_csv(
-    path: str | Path,
+_CODABENCH_FILENAME = re.compile(r"^query-([0-9]+)-(kis|qa|trake)\.csv$")
+_VIDEO_ID = re.compile(r"^L[0-9]{2}_V[0-9]{3}$")
+_FRAME_INDEX = re.compile(r"^[0-9]+$")
+
+
+def parse_submission_bytes(
+    data: bytes,
     *,
+    filename: str,
     task: SubmissionTask,
     spec_id: str,
 ) -> ParsedSubmission:
-    """Read a canonical UTF-8/LF/no-header historical submission."""
+    """Parse one submission payload under an explicit versioned rule pack."""
 
     if task not in {"kis", "qa", "trake"}:
         raise OfficialSubmissionValidationError("submission_task_invalid", "unknown task")
     _spec_for(task, spec_id)
-    source = Path(path)
-    if source.suffix.casefold() != ".csv" or source.name != source.name.strip():
+    source = Path(filename)
+    if source.name != filename or source.suffix.casefold() != ".csv" or filename != filename.strip():
         raise OfficialSubmissionValidationError(
             "submission_filename_invalid", "submission filename must be a safe .csv name"
         )
-    if task == "trake" and not source.name.endswith("-trake-submission.csv"):
+    codabench = spec_id == "codabench_10187_2025"
+    if codabench:
+        match = _CODABENCH_FILENAME.fullmatch(filename)
+        if match is None or match.group(2) != task:
+            raise OfficialSubmissionValidationError(
+                "submission_filename_invalid",
+                "filename must match query-<id>-<task>.csv",
+                suggestion=f"Use query-<id>-{task}.csv",
+            )
+    elif task == "trake" and not source.name.endswith("-trake-submission.csv"):
         raise OfficialSubmissionValidationError(
             "submission_filename_invalid",
             "TRAKE filename must end with -trake-submission.csv",
         )
-    data = source.read_bytes()
     if data.startswith(b"\xef\xbb\xbf"):
         raise OfficialSubmissionValidationError(
             "submission_bom_forbidden", "UTF-8 BOM is not allowed"
         )
-    if b"\r" in data:
+    if not codabench and b"\r" in data:
         raise OfficialSubmissionValidationError(
             "submission_newline_invalid", "submission must use LF newlines"
         )
+    if codabench:
+        without_crlf = data.replace(b"\r\n", b"")
+        if b"\r" in without_crlf:
+            raise OfficialSubmissionValidationError(
+                "submission_newline_invalid", "submission contains a bare carriage return"
+            )
+        has_crlf = b"\r\n" in data
+        has_lf = b"\n" in data.replace(b"\r\n", b"")
+        if has_crlf and has_lf:
+            raise OfficialSubmissionValidationError(
+                "submission_newline_invalid", "submission mixes LF and CRLF newlines"
+            )
     if data and not data.endswith(b"\n"):
         raise OfficialSubmissionValidationError(
             "submission_newline_invalid", "submission must end with LF"
@@ -142,11 +188,19 @@ def parse_submission_csv(
         raise OfficialSubmissionValidationError(
             "submission_encoding_invalid", "submission must be valid UTF-8"
         ) from exc
+    reader = csv.reader(io.StringIO(text, newline=""), strict=True)
     try:
-        rows = tuple(tuple(row) for row in csv.reader(io.StringIO(text), strict=True))
+        rows_list: list[tuple[str, ...]] = []
+        physical_lines: list[int] = []
+        for row in reader:
+            rows_list.append(tuple(row))
+            physical_lines.append(reader.line_num)
+        rows = tuple(rows_list)
     except csv.Error as exc:
         raise OfficialSubmissionValidationError(
-            "submission_csv_invalid", "submission is not canonical CSV"
+            "submission_csv_invalid",
+            "submission is not valid CSV",
+            line=max(1, reader.line_num),
         ) from exc
     if not rows or any(not row for row in rows):
         raise OfficialSubmissionValidationError(
@@ -163,17 +217,70 @@ def parse_submission_csv(
             "submission_row_width_invalid", "TRAKE rows require one video and 2-20 frames"
         )
     if any(len(row) != expected_width for row in rows):
+        bad_index = next(index for index, row in enumerate(rows) if len(row) != expected_width)
         raise OfficialSubmissionValidationError(
-            "submission_row_width_invalid", "submission rows have inconsistent width"
+            "submission_row_width_invalid",
+            "submission rows have inconsistent width",
+            row=bad_index + 1,
+            line=physical_lines[bad_index],
         )
-    canonical = io.StringIO(newline="")
-    writer = csv.writer(canonical, lineterminator="\n")
-    writer.writerows(rows)
-    if canonical.getvalue().encode("utf-8") != data:
-        raise OfficialSubmissionValidationError(
-            "submission_csv_noncanonical",
-            "delimiter, quoting, or whitespace does not match canonical CSV",
-        )
+    if codabench:
+        if len(rows) > 100:
+            raise OfficialSubmissionValidationError(
+                "submission_row_limit_exceeded", "submission may contain at most 100 rows"
+            )
+        for index, row in enumerate(rows):
+            line = physical_lines[index]
+            video_id = row[0]
+            if video_id.casefold().endswith(".mp4"):
+                raise OfficialSubmissionValidationError(
+                    "submission_video_extension_forbidden",
+                    "video ID must not contain the .mp4 extension",
+                    row=index + 1,
+                    line=line,
+                    suggestion="Remove the .mp4 suffix from the video ID",
+                )
+            if _VIDEO_ID.fullmatch(video_id) is None:
+                raise OfficialSubmissionValidationError(
+                    "submission_video_id_invalid",
+                    "video ID must match L00_V000 without surrounding whitespace",
+                    row=index + 1,
+                    line=line,
+                )
+            frame_values = row[1:-1] if task == "qa" else row[1:]
+            if any(_FRAME_INDEX.fullmatch(value) is None for value in frame_values):
+                raise OfficialSubmissionValidationError(
+                    "submission_integer_invalid",
+                    "frame fields must be base-10 integers without whitespace",
+                    row=index + 1,
+                    line=line,
+                )
+            if task == "qa":
+                answer = row[2]
+                if not answer.strip():
+                    raise OfficialSubmissionValidationError(
+                        "submission_answer_empty",
+                        "QA answer must not be empty",
+                        row=index + 1,
+                        line=line,
+                    )
+                if len(answer) > 100:
+                    raise OfficialSubmissionValidationError(
+                        "submission_answer_too_long",
+                        "QA answer must contain at most 100 characters",
+                        row=index + 1,
+                        line=line,
+                        suggestion="Shorten the answer to 100 characters or fewer",
+                    )
+    else:
+        canonical = io.StringIO(newline="")
+        writer = csv.writer(canonical, lineterminator="\n")
+        writer.writerows(rows)
+        if canonical.getvalue().encode("utf-8") != data:
+            raise OfficialSubmissionValidationError(
+                "submission_csv_noncanonical",
+                "delimiter, quoting, or whitespace does not match canonical CSV",
+            )
     return ParsedSubmission(
         task=task,
         spec_id=spec_id,
@@ -181,6 +288,24 @@ def parse_submission_csv(
         byte_count=len(data),
         line_count=len(rows),
         stage_count=expected_width - 1 if task == "trake" else None,
+        physical_lines=tuple(physical_lines),
+    )
+
+
+def parse_submission_csv(
+    path: str | Path,
+    *,
+    task: SubmissionTask,
+    spec_id: str,
+) -> ParsedSubmission:
+    """Read and parse a submission file without changing its bytes."""
+
+    source = Path(path)
+    return parse_submission_bytes(
+        source.read_bytes(),
+        filename=source.name,
+        task=task,
+        spec_id=spec_id,
     )
 
 
@@ -301,6 +426,7 @@ __all__ = [
     "SUPPORTED_SPECS",
     "SubmissionValidationReport",
     "parse_submission_csv",
+    "parse_submission_bytes",
     "prediction_rows",
     "validate_parsed_submission",
 ]

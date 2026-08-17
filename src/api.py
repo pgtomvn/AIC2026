@@ -34,10 +34,22 @@ from src.contracts import (
     TRAKECompetitionSpec,
     TRAKEQueryRequest,
 )
+from src.export.bundle_builder import (
+    BundleBuildError,
+    build_codabench_bundle,
+    load_bundle_manifest,
+    re_fullmatch_run_id,
+)
+from src.export.preflight import (
+    BundleEntry,
+    BundleValidationContext,
+    BundleValidationError,
+)
 from src.qa_submission import QASubmissionValidationError, export_qa_submission
 from src.readiness import aggregate_channel_health
 from src.retrieval.qa_session import QASessionStoreError
 from src.retrieval.trake_router import TRAKENotReadyError
+from src.retrieval.visual_qa import QACandidateMediaUnavailableError
 from src.runtime import RuntimeContext, build_runtime
 from src.submission import FrameIndexEvidence, SubmissionValidationError, export_submission
 from src.trake_submission import (
@@ -1983,6 +1995,19 @@ def create_app(context: RuntimeContext) -> FastAPI:
                     },
                 },
             ) from None
+        except QACandidateMediaUnavailableError as error:
+            candidate_id = (
+                error.candidate_id
+                if _SAFE_OPERATIONAL_IDENTIFIER.fullmatch(error.candidate_id)
+                else None
+            )
+            detail: dict[str, Any] = {
+                "code": "qa_candidate_media_unavailable",
+                "recoverable": True,
+            }
+            if candidate_id is not None:
+                detail["candidate_id"] = candidate_id
+            raise HTTPException(status_code=409, detail=detail) from None
         except RuntimeError as error:
             code = str(error)
             if code == "legacy_qa_session_read_only":
@@ -2478,6 +2503,158 @@ def create_app(context: RuntimeContext) -> FastAPI:
                 status_code=422, detail="TRAKE submission export is invalid"
             ) from None
         return FileResponse(target, media_type="text/csv", filename=target.name)
+
+    def _bundle_output_dir() -> Path:
+        return _project_path(str(context.config["competition"]["output_dir"]))
+
+    @app.post("/v1/submissions/bundles")
+    def create_submission_bundle(payload: dict[str, Any]) -> dict[str, Any]:
+        mode = payload.get("mode", "all")
+        batch_id = payload.get("batch_id")
+        raw_entries = payload.get("entries")
+        if mode not in {"all", "current"}:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "bundle_mode_invalid", "issues": []},
+            )
+        if not isinstance(batch_id, str) or not batch_id.strip():
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "bundle_batch_invalid", "issues": []},
+            )
+        if not isinstance(raw_entries, list) or not 1 <= len(raw_entries) <= 256:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "bundle_entries_invalid", "issues": []},
+            )
+        try:
+            batch_id = _runtime_batch_filters(context, (batch_id.strip(),))[0]
+        except (IndexError, TypeError, ValueError):
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "bundle_batch_invalid", "issues": []},
+            ) from None
+
+        entries: list[BundleEntry] = []
+        total_bytes = 0
+        try:
+            for raw in raw_entries:
+                if not isinstance(raw, Mapping):
+                    raise ValueError("entry must be a mapping")
+                encoded = raw.get("csv_base64")
+                if not isinstance(encoded, str) or len(encoded) > 2_000_000:
+                    raise ValueError("csv payload is invalid")
+                try:
+                    csv_bytes = base64.b64decode(encoded, validate=True)
+                except (ValueError, TypeError):
+                    raise ValueError("csv payload is invalid") from None
+                if not csv_bytes or len(csv_bytes) > 1_000_000:
+                    raise ValueError("csv payload is invalid")
+                total_bytes += len(csv_bytes)
+                if total_bytes > 8_000_000:
+                    raise ValueError("bundle payload is too large")
+                entries.append(
+                    BundleEntry(
+                        task=str(raw.get("task", "")),  # type: ignore[arg-type]
+                        query_id=str(raw.get("query_id", "")),
+                        csv_bytes=csv_bytes,
+                        batch_id=batch_id,
+                        source_fingerprint=str(raw.get("source_fingerprint", "")),
+                        stage_count=raw.get("stage_count"),  # type: ignore[arg-type]
+                        source_ranks=(
+                            tuple(raw.get("source_ranks", ()))
+                            if raw.get("source_ranks") is not None
+                            else None
+                        ),
+                    )
+                )
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "bundle_entries_invalid", "issues": []},
+            ) from None
+
+        repository = context.artifact_repository
+        if repository is None:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "bundle_build_unavailable"},
+            )
+        frame_cache: dict[tuple[str, int], Any] = {}
+
+        def source_frame(video_id: str, frame_idx: int) -> Any:
+            key = (video_id, frame_idx)
+            if key not in frame_cache:
+                getter = getattr(repository, "get_source_frame", None)
+                if not callable(getter):
+                    getter = repository.get_frame
+                frame_cache[key] = getter(batch_id, video_id, frame_idx)
+            return frame_cache[key]
+
+        validation_context = BundleValidationContext(
+            is_batch_active=lambda candidate: (
+                candidate == batch_id and bool(context.ledger.is_batch_active(candidate))
+            ),
+            is_canonical_source_frame=lambda candidate, video, frame: (
+                candidate == batch_id and source_frame(video, frame) is not None
+            ),
+            get_canonical_timestamp_ms=lambda candidate, video, frame: (
+                None
+                if candidate != batch_id or source_frame(video, frame) is None
+                else int(source_frame(video, frame).timestamp_ms)
+            ),
+        )
+        try:
+            artifact = build_codabench_bundle(
+                entries,
+                _bundle_output_dir(),
+                validation_context=validation_context,
+                mode=mode,
+            )
+        except BundleValidationError as error:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "bundle_validation_failed",
+                    "issues": [issue.to_dict() for issue in error.issues],
+                },
+            ) from None
+        except (BundleBuildError, OSError):
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "bundle_build_unavailable"},
+            ) from None
+        result = artifact.to_dict()
+        result["download_url"] = f"/v1/submissions/bundles/{result['run_id']}/download"
+        return result
+
+    @app.get("/v1/submissions/bundles/{run_id}")
+    def submission_bundle_metadata(run_id: str) -> dict[str, Any]:
+        if not re_fullmatch_run_id(run_id):
+            raise HTTPException(status_code=404, detail={"code": "bundle_not_found"})
+        manifest = load_bundle_manifest(_bundle_output_dir(), run_id)
+        if manifest is None:
+            raise HTTPException(status_code=404, detail={"code": "bundle_not_found"})
+        result = dict(manifest)
+        result["download_url"] = f"/v1/submissions/bundles/{run_id}/download"
+        return result
+
+    @app.get("/v1/submissions/bundles/{run_id}/download")
+    def download_submission_bundle(run_id: str) -> FileResponse:
+        if not re_fullmatch_run_id(run_id):
+            raise HTTPException(status_code=404, detail={"code": "bundle_not_found"})
+        manifest = load_bundle_manifest(_bundle_output_dir(), run_id)
+        filename = None if manifest is None else manifest.get("filename")
+        if (
+            not isinstance(filename, str)
+            or _SAFE_FILENAME.fullmatch(filename) is None
+            or not filename.casefold().endswith(".zip")
+        ):
+            raise HTTPException(status_code=404, detail={"code": "bundle_not_found"})
+        target = _bundle_output_dir() / run_id / filename
+        if not target.is_file():
+            raise HTTPException(status_code=404, detail={"code": "bundle_not_found"})
+        return FileResponse(target, media_type="application/zip", filename=filename)
 
     @app.get("/v1/ingest/status")
     def ingest_status(
