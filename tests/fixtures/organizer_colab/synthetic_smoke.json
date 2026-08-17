@@ -1,0 +1,8 @@
+{
+  "fixture_kind": "synthetic_smoke_not_official",
+  "queries": [
+    {"query_id": "smoke-001", "text": "a person reading television news"},
+    {"query_id": "smoke-002", "text": "a busy city street at night"},
+    {"query_id": "smoke-003", "text": "an ambulance driving on the road"}
+  ]
+}

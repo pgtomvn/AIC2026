@@ -418,8 +418,14 @@ class VectorStore:
         query_vector: np.ndarray,
         top_k: int = 100,
         filters: Optional[dict] = None,
+        *,
+        exact: bool = False,
     ) -> list[dict]:
-        """Return nearest neighbors as ``id``, ``score``, and ``payload`` mappings."""
+        """Return nearest neighbors as ``id``, ``score``, and ``payload`` mappings.
+
+        ``exact`` is reserved for parity/verification tools. Production retrieval keeps the
+        configured ANN path unless a caller explicitly requests an exhaustive search.
+        """
         if top_k <= 0:
             raise ValueError("top_k must be positive")
         vector = np.asarray(query_vector)
@@ -438,9 +444,15 @@ class VectorStore:
         query_filter = self._build_filter(filters)
         query = vector.astype(np.float32, copy=False).tolist()
 
+        search_params = None
+        if exact:
+            from qdrant_client import models
+
+            search_params = models.SearchParams(exact=True)
+
         query_points = getattr(client, "query_points", None)
         if callable(query_points):
-            response = query_points(
+            query_kwargs = dict(
                 collection_name=self.collection_name,
                 query=query,
                 query_filter=query_filter,
@@ -448,12 +460,15 @@ class VectorStore:
                 with_payload=True,
                 with_vectors=False,
             )
+            if search_params is not None:
+                query_kwargs["search_params"] = search_params
+            response = query_points(**query_kwargs)
             hits = getattr(response, "points", response)
         else:
             legacy_search = getattr(client, "search", None)
             if not callable(legacy_search):
                 raise RuntimeError("the installed Qdrant client has no supported search method")
-            hits = legacy_search(
+            search_kwargs = dict(
                 collection_name=self.collection_name,
                 query_vector=query,
                 query_filter=query_filter,
@@ -461,6 +476,9 @@ class VectorStore:
                 with_payload=True,
                 with_vectors=False,
             )
+            if search_params is not None:
+                search_kwargs["search_params"] = search_params
+            hits = legacy_search(**search_kwargs)
 
         results = []
         for hit in hits:

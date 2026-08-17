@@ -20,7 +20,7 @@ readiness:
   batches:
     aic25-b1-reference:
       kind: reference
-      expected_frames: 176707
+      expected_frames: 177321
       expected_videos: 873
       workflows:
         kis: [organizer_clip, metadata]

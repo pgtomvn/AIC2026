@@ -1,0 +1,47 @@
+{
+  "spec_id": "aic2026_colab_fiftyone_baseline_v1",
+  "source_url": "https://colab.research.google.com/drive/1kwhlNPBSVL5gVqt2YV5iazGgfHD-dqJz",
+  "drive_file_id": "1kwhlNPBSVL5gVqt2YV5iazGgfHD-dqJz",
+  "notebook_filename": "AIC-2026-Baseline-v1.ipynb",
+  "notebook_sha256": "8cbcfae98ff904632875500b1f7282a0e11769393509a2c26c4554cce1fda11d",
+  "nbformat": "4.5",
+  "cell_counts": {
+    "total": 33,
+    "code": 16,
+    "markdown": 17,
+    "executed": 0
+  },
+  "artifact_contract": {
+    "keyframe_pattern": "keyframes/<video>/<frameid>.jpg",
+    "object_pattern": "objects/<video>/<frameid>.json",
+    "feature_pattern": "clip-features/<video>.npy",
+    "object_box_input_order": ["ymin", "xmin", "ymax", "xmax"],
+    "object_score_operator": ">",
+    "object_score_threshold": 0.4,
+    "keyframe_ordering": "lexicographic_jpeg_stem",
+    "feature_model_label": "CLIP ViT-B/32",
+    "fiftyone_model_id": "clip-vit-base32-torch",
+    "brain_key": "img_sim"
+  },
+  "verified_reference_pack": {
+    "videos": 873,
+    "map_rows": 177321,
+    "feature_rows": 177321,
+    "object_json_files": 177321,
+    "feature_dimension": 512,
+    "feature_dtype": "float16",
+    "normalization": "empirically_near_unit_norm"
+  },
+  "notebook_absences": [
+    "asr",
+    "ocr",
+    "query_examples",
+    "query_preprocessing",
+    "top_k",
+    "visual_qa",
+    "trake",
+    "submission_csv_contract",
+    "ground_truth",
+    "evaluation_logic"
+  ]
+}
