@@ -6,13 +6,17 @@ from pathlib import Path
 from typing import Any
 
 from src import PROJECT_ROOT
+from src.embedding.clip_encoder import CLIPEncoder
 from src.embedding.text_encoder import VietnameseTextEncoder
 from src.extraction.asr_engine import ASREngine
 from src.extraction.audio import AudioExtractor
 from src.extraction.calibration import load_calibration_selection
 from src.extraction.keyframe_extractor import KeyframeExtractor
 from src.extraction.ocr_engine import OCREngine
+from src.indexing.vector_store import BatchVectorStore
+from src.ingest.batch_lock import BatchIngestLock
 from src.ingest.native_pipeline import NativeIngestor, ScratchManager
+from src.organizer_verification import organizer_verification_passed
 from src.runtime import build_runtime
 from src.tooling.ffmpeg import verify_ffmpeg_manifest
 
@@ -22,12 +26,26 @@ def _path(value: str) -> Path:
     return path if path.is_absolute() else PROJECT_ROOT / path
 
 
+def _organizer_compatible_enabled(
+    config: dict[str, Any], *, explicit: bool = False
+) -> bool:
+    model = config.get("models", {}).get("organizer_compatible_visual", {})
+    profiles = tuple(str(value) for value in model.get("enabled_profiles", ()))
+    return bool(explicit) or (
+        bool(model.get("enabled", False))
+        and str(config.get("profile", "laptop")) in profiles
+    )
+
+
 def build_native_ingestor(
     config: dict[str, Any],
     *,
     batch_id: str,
     competition: str = "aic2026",
     enrichment: bool = True,
+    organizer_compatible_visual: bool = False,
+    reprocess_stages: tuple[str, ...] = (),
+    reprocess_videos: tuple[str, ...] = (),
 ) -> NativeIngestor:
     """Compose ingestion stages without connecting to services or loading models."""
 
@@ -66,6 +84,11 @@ def build_native_ingestor(
         _path(data["scratch"]),
         limit_bytes=int(float(data["scratch_limit_gib"]) * 1024**3),
         reserve_bytes=int(float(data["free_space_reserve_gib"]) * 1024**3),
+        archive_materializers=int(
+            ingestion.get("worker_profiles", {})
+            .get(str(config.get("profile", "laptop")), {})
+            .get("archive_materializers", 1)
+        ),
     )
     ocr_engine = asr_engine = audio_extractor = text_encoder = text_store = None
     if enrichment:
@@ -111,7 +134,43 @@ def build_native_ingestor(
         )
         text_store = semantic_channel.store.for_batch(batch_id)
     primary = context.pipeline.dense_channels[0]
-    return NativeIngestor(
+    additional_channels = [
+        (channel.name, channel.encoder, channel.store.for_batch(batch_id))
+        for channel in context.pipeline.dense_channels[1:]
+        if channel.name == "accelerated_visual"
+    ]
+    compatible = models.get("organizer_compatible_visual", {})
+    enable_compatible = _organizer_compatible_enabled(
+        config,
+        explicit=organizer_compatible_visual,
+    )
+    if enable_compatible:
+        encoder = CLIPEncoder(
+            compatible["model_name"],
+            compatible["pretrained"],
+            device=compatible.get("device", "cuda"),
+            batch_size=int(compatible.get("batch_size", 8)),
+            cache_dir=_path(compatible.get("cache_dir", "models/open_clip")),
+            local_files_only=bool(compatible.get("local_files_only", True)),
+        )
+        if not organizer_verification_passed(
+            compatible,
+            expected_fingerprint=encoder.fingerprint,
+            project_root=PROJECT_ROOT,
+        ):
+            raise RuntimeError("organizer-compatible OpenCLIP verification has not passed")
+        qdrant = config["services"]["qdrant"]
+        store = BatchVectorStore(
+            url=qdrant["url"],
+            api_key=qdrant.get("api_key"),
+            collection_template=qdrant["collections"]["organizer_compatible_frames"],
+            vector_size=int(compatible["embedding_dim"]),
+            distance=qdrant["distance"],
+            prefer_grpc=bool(qdrant.get("prefer_grpc", False)),
+            grpc_port=int(qdrant["grpc_port"]) if qdrant.get("grpc_port") else None,
+        ).for_batch(batch_id)
+        additional_channels.append(("organizer_compatible_visual", encoder, store))
+    ingestor = NativeIngestor(
         batch_id=batch_id,
         competition=competition,
         ledger=context.ledger,
@@ -129,9 +188,14 @@ def build_native_ingestor(
         asr_store=channels.get("asr").store if enrichment and "asr" in channels else None,
         text_encoder=text_encoder,
         text_vector_store=text_store,
-        additional_visual_channels=(
-            (channel.name, channel.encoder, channel.store.for_batch(batch_id))
-            for channel in context.pipeline.dense_channels[1:]
-            if channel.name == "accelerated_visual"
-        ),
+        additional_visual_channels=additional_channels,
+        visual_queue_size=int(ingestion.get("visual_queue_size", 64)),
+        index_batch_size=int(ingestion.get("index_batch_size", 256)),
+        reprocess_stages=reprocess_stages,
+        reprocess_videos=reprocess_videos,
     )
+    ingestor.batch_lock = BatchIngestLock(
+        context.ledger.path.parent / "ingest-locks",
+        batch_id,
+    )
+    return ingestor

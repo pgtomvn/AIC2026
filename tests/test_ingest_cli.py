@@ -72,6 +72,53 @@ def test_parallel_workers_is_cpu_alias_and_accelerated_defaults_are_bounded(
     assert payload["queue_size"] == 8
 
 
+def test_dry_run_reports_index_queues_and_scoped_reprocess(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    (tmp_path / "B2_V001.mp4").write_bytes(b"")
+    config = _config()
+    config["ingestion"].update({"visual_queue_size": 7, "index_batch_size": 19})
+    monkeypatch.setattr(cli, "load_config", lambda: config)
+
+    assert cli.main(
+        [
+            str(tmp_path),
+            "--batch-id",
+            "AIC26-B2",
+            "--organizer-compatible-visual",
+            "--reprocess-stage",
+            "visual",
+            "--reprocess-video",
+            "B2_V001",
+            "--dry-run",
+        ]
+    ) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["visual_queue_size"] == 7
+    assert payload["index_batch_size"] == 19
+    assert payload["organizer_compatible_visual"] is True
+    assert payload["reprocess_stages"] == ["visual"]
+
+
+def test_reprocess_scope_requires_stage_and_video_together(
+    tmp_path, monkeypatch
+) -> None:
+    (tmp_path / "B2_V001.mp4").write_bytes(b"")
+    monkeypatch.setattr(cli, "load_config", lambda: _config())
+
+    with pytest.raises(SystemExit):
+        cli.main(
+            [
+                str(tmp_path),
+                "--batch-id",
+                "AIC26-B2",
+                "--reprocess-stage",
+                "visual",
+                "--dry-run",
+            ]
+        )
+
+
 def test_requested_enrichment_failure_returns_nonzero(
     tmp_path, monkeypatch, capsys
 ) -> None:

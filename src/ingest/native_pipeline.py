@@ -12,10 +12,10 @@ import tempfile
 import threading
 import zipfile
 from collections.abc import Iterable, Iterator
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
+from queue import Queue
 from typing import Any
 
 from src.contracts import FrameRecord, TextSegment
@@ -128,11 +128,17 @@ class ScratchManager:
         *,
         limit_bytes: int = 12 * 1024**3,
         reserve_bytes: int = 30 * 1024**3,
+        archive_materializers: int = 1,
     ) -> None:
+        if archive_materializers not in (1, 2):
+            raise ValueError("archive_materializers must be 1 or 2")
         self.root = Path(root)
         self.limit_bytes = limit_bytes
         self.reserve_bytes = reserve_bytes
-        self._archive_lock = threading.Lock()
+        self.archive_materializers = archive_materializers
+        self._archive_slots = threading.BoundedSemaphore(archive_materializers)
+        self._lease_lock = threading.Lock()
+        self._leased_bytes = 0
 
     def _available(self) -> int:
         probe = self.root
@@ -149,7 +155,32 @@ class ScratchManager:
     def _usage(self) -> int:
         if not self.root.exists():
             return 0
-        return sum(path.stat().st_size for path in self.root.rglob("*") if path.is_file())
+        total = 0
+        for path in self.root.rglob("*"):
+            try:
+                if path.is_file():
+                    total += path.stat().st_size
+            except FileNotFoundError:
+                # A concurrent materializer may have completed cleanup between
+                # directory enumeration and stat.
+                continue
+        return total
+
+    @contextmanager
+    def _byte_lease(self, required_bytes: int) -> Iterator[None]:
+        if required_bytes < 0:
+            raise ValueError("required scratch bytes cannot be negative")
+        with self._lease_lock:
+            if self._usage() + self._leased_bytes + required_bytes > self.limit_bytes:
+                raise OSError("scratch workspace would violate the configured scratch limit")
+            if self._available() - self._leased_bytes - required_bytes < self.reserve_bytes:
+                raise OSError("scratch workspace would violate the free-space reserve")
+            self._leased_bytes += required_bytes
+        try:
+            yield
+        finally:
+            with self._lease_lock:
+                self._leased_bytes -= required_bytes
 
     @contextmanager
     def workspace(
@@ -163,53 +194,45 @@ class ScratchManager:
 
         video_id = self._safe_component(video_id)
         purpose = self._safe_component(purpose)
-        if required_bytes < 0:
-            raise ValueError("required scratch bytes cannot be negative")
-        if self._usage() + required_bytes > self.limit_bytes:
-            raise OSError("scratch workspace would violate the configured scratch limit")
-        if self._available() - required_bytes < self.reserve_bytes:
-            raise OSError("scratch workspace would violate the free-space reserve")
-        parent = self.root / video_id
-        parent.mkdir(parents=True, exist_ok=True)
-        workspace = Path(tempfile.mkdtemp(prefix=f"{purpose}-", dir=parent))
-        try:
-            yield workspace
-        finally:
-            shutil.rmtree(workspace, ignore_errors=True)
+        with self._byte_lease(required_bytes):
+            parent = self.root / video_id
+            parent.mkdir(parents=True, exist_ok=True)
+            workspace = Path(tempfile.mkdtemp(prefix=f"{purpose}-", dir=parent))
             try:
-                parent.rmdir()
-            except OSError:
-                pass
+                yield workspace
+            finally:
+                shutil.rmtree(workspace, ignore_errors=True)
+                try:
+                    parent.rmdir()
+                except OSError:
+                    pass
 
     @contextmanager
     def materialize(self, source: VideoSource) -> Iterator[Path]:
         if source.member is None:
             yield source.path
             return
-        with self._archive_lock:
-            video_id = self._safe_component(source.video_id)
-            size = int(source.size_bytes or 0)
-            if size <= 0 or size > self.limit_bytes:
-                raise OSError(f"archive member size {size} violates the scratch limit")
-            free = self._available()
-            if free - size < self.reserve_bytes:
-                raise OSError(
-                    f"materializing {source.video_id} would violate the "
-                    f"{self.reserve_bytes}-byte reserve"
-                )
+        video_id = self._safe_component(source.video_id)
+        size = int(source.size_bytes or 0)
+        if size <= 0 or size > self.limit_bytes:
+            raise OSError(f"archive member size {size} violates the scratch limit")
+        with self._byte_lease(size):
             target_dir = self.root / video_id
             target_dir.mkdir(parents=True, exist_ok=True)
             suffix = PurePosixPath(source.member).suffix
             target = target_dir / f"source{suffix}"
             temporary = target_dir / f".{target.name}.tmp"
             try:
-                with zipfile.ZipFile(source.path) as archive:
-                    info = archive.getinfo(source.member)
-                    _safe_zip_member(info.filename)
-                    with archive.open(info) as raw, temporary.open("wb") as output:
-                        shutil.copyfileobj(raw, output, length=8 * 1024 * 1024)
-                        output.flush()
-                        os.fsync(output.fileno())
+                # Limit archive readers only while bytes are copied. Probe and
+                # decode proceed after the slot is released.
+                with self._archive_slots:
+                    with zipfile.ZipFile(source.path) as archive:
+                        info = archive.getinfo(source.member)
+                        _safe_zip_member(info.filename)
+                        with archive.open(info) as raw, temporary.open("wb") as output:
+                            shutil.copyfileobj(raw, output, length=8 * 1024 * 1024)
+                            output.flush()
+                            os.fsync(output.fileno())
                 if temporary.stat().st_size != size:
                     raise OSError(f"scratch size mismatch for {source.video_id}")
                 os.replace(temporary, target)
@@ -254,7 +277,13 @@ class NativeIngestor:
         text_encoder: Any = None,
         text_vector_store: Any = None,
         additional_visual_channels: Iterable[tuple[str, Any, Any]] = (),
+        visual_queue_size: int = 64,
+        index_batch_size: int = 256,
+        reprocess_stages: Iterable[str] = (),
+        reprocess_videos: Iterable[str] = (),
     ) -> None:
+        if visual_queue_size < 1 or index_batch_size < 1:
+            raise ValueError("visual_queue_size and index_batch_size must be positive")
         self.batch_id = batch_id
         self.competition = competition
         self.ledger = ledger
@@ -273,6 +302,12 @@ class NativeIngestor:
         self.text_encoder = text_encoder
         self.text_vector_store = text_vector_store
         self.additional_visual_channels = tuple(additional_visual_channels)
+        self.visual_queue_size = int(visual_queue_size)
+        self.index_batch_size = int(index_batch_size)
+        self.reprocess_stages = frozenset(str(value) for value in reprocess_stages)
+        self.reprocess_videos = frozenset(str(value) for value in reprocess_videos)
+    def _explicit_reprocess(self, source: VideoSource, stage_name: str) -> bool:
+        return stage_name in self.reprocess_stages and source.video_id in self.reprocess_videos
 
     @staticmethod
     def _unload_model(model: Any) -> None:
@@ -324,7 +359,7 @@ class NativeIngestor:
             source.video_id,
             stage_name,
             stage_fingerprint,
-            allow_reprocess=allow_reprocess,
+            allow_reprocess=allow_reprocess or self._explicit_reprocess(source, stage_name),
         )
         if not transition.changed:
             if transition.state is StageState.COMPLETED:
@@ -424,6 +459,7 @@ class NativeIngestor:
         return PreparedVideo(source, probe, frames)
 
     def _index_visual(self, prepared: PreparedVideo) -> None:
+        explicitly_reprocessed = self._explicit_reprocess(prepared.source, "visual")
         stage_fingerprint = fingerprint(
             {
                 "encoder": self.visual_encoder.fingerprint,
@@ -451,7 +487,12 @@ class NativeIngestor:
             payloads = [frame.to_dict() for frame in prepared.frames]
             for payload in payloads:
                 payload["model_fingerprint"] = self.visual_encoder.fingerprint
-            self.visual_store.upsert(ids, vectors, payloads)
+            self.visual_store.upsert(
+                ids,
+                vectors,
+                payloads,
+                batch_size=self.index_batch_size,
+            )
             indexed_count = self.visual_store.count(
                 filters={
                     "batch_id": self.batch_id,
@@ -533,7 +574,7 @@ class NativeIngestor:
             required_stages=("probe", "frames", "visual"),
             required_artifacts={"frames_manifest": 1, "visual_vectors": 1},
         )
-        if activated:
+        if activated or explicitly_reprocessed:
             self.ledger.bump_retrieval_generation(self.batch_id)
 
     def _index_additional_visuals(self, prepared: PreparedVideo) -> None:
@@ -560,7 +601,7 @@ class NativeIngestor:
                 payloads = [frame.to_dict() for frame in prepared.frames]
                 for payload in payloads:
                     payload["model_fingerprint"] = encoder.fingerprint
-                store.upsert(ids, vectors, payloads)
+                store.upsert(ids, vectors, payloads, batch_size=self.index_batch_size)
                 return None, [
                     ArtifactSpec(
                         f"{name}_vectors",
@@ -585,35 +626,73 @@ class NativeIngestor:
 
         if cpu_workers < 1 or queue_size < 1:
             raise ValueError("cpu_workers and queue_size must be positive")
+        if self.visual_queue_size < 1:
+            raise ValueError("visual_queue_size must be positive")
         # A reused ingestor may still own a Whisper model from an earlier run.
         # Release it before any visual encoder is allowed to load on CUDA.
         if self.asr_engine is not None:
             self._unload_model(self.asr_engine)
-        source_iter = iter(sources)
+        source_values = tuple(sources)
         outcomes: dict[str, str] = {}
         prepared_videos: list[PreparedVideo] = []
-        with ThreadPoolExecutor(max_workers=cpu_workers, thread_name_prefix="aic-decode") as pool:
-            pending: dict[Future[PreparedVideo], VideoSource] = {}
+        source_queue: Queue[VideoSource | None] = Queue(maxsize=queue_size)
+        prepared_queue: Queue[tuple[VideoSource | None, PreparedVideo | None, Exception | None]] = (
+            Queue(maxsize=self.visual_queue_size)
+        )
+
+        def feed() -> None:
+            for source in source_values:
+                source_queue.put(source)
+            for _ in range(cpu_workers):
+                source_queue.put(None)
+
+        def prepare_worker() -> None:
             while True:
-                while len(pending) < queue_size:
+                source = source_queue.get()
+                try:
+                    if source is None:
+                        prepared_queue.put((None, None, None))
+                        return
                     try:
-                        source = next(source_iter)
-                    except StopIteration:
-                        break
-                    pending[pool.submit(self._prepare, source)] = source
-                if not pending:
-                    break
-                done, _ = wait(pending, return_when=FIRST_COMPLETED)
-                for future in done:
-                    source = pending.pop(future)
-                    try:
-                        prepared = future.result()
-                        self._index_visual(prepared)
-                        self._index_additional_visuals(prepared)
-                        prepared_videos.append(prepared)
-                        outcomes[source.video_id] = "active"
+                        prepared_queue.put((source, self._prepare(source), None))
                     except Exception as error:
-                        outcomes[source.video_id] = f"failed: {type(error).__name__}: {error}"
+                        prepared_queue.put((source, None, error))
+                finally:
+                    source_queue.task_done()
+
+        feeder = threading.Thread(target=feed, name="aic-source-feeder")
+        workers = [
+            threading.Thread(target=prepare_worker, name=f"aic-decode-{index + 1}")
+            for index in range(cpu_workers)
+        ]
+        feeder.start()
+        for worker in workers:
+            worker.start()
+        completed_workers = 0
+        while completed_workers < cpu_workers:
+            source, prepared, error = prepared_queue.get()
+            try:
+                if source is None:
+                    completed_workers += 1
+                    continue
+                if error is not None:
+                    outcomes[source.video_id] = f"failed: {type(error).__name__}: {error}"
+                    continue
+                assert prepared is not None
+                try:
+                    self._index_visual(prepared)
+                    self._index_additional_visuals(prepared)
+                    prepared_videos.append(prepared)
+                    outcomes[source.video_id] = "active"
+                except Exception as indexing_error:
+                    outcomes[source.video_id] = (
+                        f"failed: {type(indexing_error).__name__}: {indexing_error}"
+                    )
+            finally:
+                prepared_queue.task_done()
+        feeder.join()
+        for worker in workers:
+            worker.join()
         # Core search is ready before GPU-heavy ASR begins.  Explicit unloading
         # is required on the 4 GiB profile; garbage collection timing is not a
         # safe GPU scheduling primitive.
@@ -811,6 +890,7 @@ class NativeIngestor:
                 [item.segment_id for item in segments],
                 vectors,
                 [item.to_dict() for item in segments],
+                batch_size=self.index_batch_size,
             )
             return None, [
                 ArtifactSpec(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import threading
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ import pytest
 import src.ingest.native_pipeline as native_pipeline_module
 from src.extraction.media_probe import MediaProbe
 from src.ingest.artifacts import ArtifactRepository
+from src.ingest.batch_lock import BatchIngestLock, BatchIngestLockError
 from src.ingest.ledger import JobLedger
 from src.ingest.native_pipeline import (
     NativeIngestor,
@@ -213,6 +215,7 @@ class _FakeVisualStore:
         self.create_calls: list[bool] = []
         self.upsert_calls = 0
         self.fail_upserts = fail_upserts
+        self.batch_sizes: list[int] = []
         self.points: dict[str, tuple[np.ndarray, dict[str, Any]]] = {}
 
     def create_collection(self, *, recreate: bool = False) -> None:
@@ -223,7 +226,10 @@ class _FakeVisualStore:
         ids: list[str],
         vectors: np.ndarray,
         payloads: list[dict[str, Any]],
+        batch_size: int = 256,
     ) -> None:
+        assert batch_size > 0
+        self.batch_sizes.append(batch_size)
         self.upsert_calls += 1
         for identifier, vector, payload in zip(ids, vectors, payloads, strict=True):
             self.points[identifier] = (vector.copy(), dict(payload))
@@ -329,6 +335,7 @@ def test_native_ingestor_is_idempotent_across_completed_resume(
     assert extractor.calls == 1
     assert encoder.calls == 1
     assert store.upsert_calls == 1
+    assert store.batch_sizes == [256]
     assert len(store.points) == 2
     assert store.create_calls == [False]
     assert ledger.status_summary("b2").active_videos == 1
@@ -338,6 +345,89 @@ def test_native_ingestor_is_idempotent_across_completed_resume(
     assert ledger.retrieval_generation("b2") == 1
     assert (ingestor.state_root / "b2" / "L99_V001.probe.json").is_file()
     assert (ingestor.state_root / "b2" / "L99_V001.frames.json").is_file()
+
+
+def test_index_batch_size_is_wired_to_vector_upsert(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ingestor, source, _ledger, _artifacts, _extractor, _encoder, store = _native_fixture(
+        tmp_path,
+        monkeypatch,
+    )
+    ingestor.index_batch_size = 1
+    ingestor.initialize()
+
+    assert ingestor.ingest_many((source,), cpu_workers=1, queue_size=1, enrich=False) == {
+        "L99_V001": "active"
+    }
+    assert store.batch_sizes == [1]
+
+
+def test_scoped_reprocess_reruns_only_requested_video_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ingestor, source, ledger, _artifacts, extractor, encoder, _store = _native_fixture(
+        tmp_path,
+        monkeypatch,
+    )
+    ingestor.initialize()
+    ingestor.ingest_many((source,), cpu_workers=1, queue_size=1, enrich=False)
+    ingestor.reprocess_stages = frozenset({"visual"})
+    ingestor.reprocess_videos = frozenset({source.video_id})
+
+    assert ingestor.ingest_many((source,), cpu_workers=1, queue_size=1, enrich=False) == {
+        source.video_id: "active"
+    }
+    assert extractor.calls == 1
+    assert encoder.calls == 2
+    assert ledger.get_stage("b2", source.video_id, "visual")["attempts"] == 2
+    assert ledger.retrieval_generation("b2") == 2
+
+
+def test_archive_slot_is_released_before_consumer_finishes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = _write_zip(
+        tmp_path / "videos.zip",
+        {"L99_V001.mp4": b"one", "L99_V002.mp4": b"two"},
+    )
+    sources = discover_video_sources((archive,))
+    manager = ScratchManager(
+        tmp_path / "scratch",
+        limit_bytes=10_000,
+        reserve_bytes=0,
+        archive_materializers=1,
+    )
+    monkeypatch.setattr(manager, "_available", lambda: 100_000)
+    second_materialized = threading.Event()
+
+    def consume_second() -> None:
+        with manager.materialize(sources[1]) as path:
+            assert path.read_bytes() == b"two"
+            second_materialized.set()
+
+    with manager.materialize(sources[0]) as first:
+        thread = threading.Thread(target=consume_second)
+        thread.start()
+        assert first.read_bytes() == b"one"
+        assert second_materialized.wait(timeout=2)
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+
+
+def test_batch_ingest_lock_is_cross_instance_single_writer(tmp_path: Path) -> None:
+    first = BatchIngestLock(tmp_path, "AIC26-B2")
+    second = BatchIngestLock(tmp_path, "AIC26-B2")
+
+    with first:
+        with pytest.raises(BatchIngestLockError, match="batch_ingest_lock_unavailable"):
+            with second:
+                pytest.fail("a second writer must not enter")
+    with second:
+        assert second.path.is_file()
 
 
 def test_native_ingestor_retries_failed_visual_stage_without_reextracting(

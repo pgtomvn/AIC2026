@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +45,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--max-videos", type=int)
     parser.add_argument("--recreate-indexes", action="store_true")
+    parser.add_argument(
+        "--organizer-compatible-visual",
+        action="store_true",
+        help="Explicitly compute verified OpenCLIP B/32 vectors in an isolated collection",
+    )
+    parser.add_argument(
+        "--reprocess-stage",
+        action="append",
+        choices=("visual", "ocr", "asr", "text", "visual_accelerated_visual", "visual_organizer_compatible_visual"),
+        default=[],
+    )
+    parser.add_argument("--reprocess-video", action="append", default=[])
     parser.add_argument(
         "--no-recover", action="store_true", help="Do not reclaim interrupted stages"
     )
@@ -88,6 +101,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("worker and queue sizes must be positive")
     if args.max_videos is not None and args.max_videos < 1:
         parser.error("--max-videos must be positive")
+    if bool(args.reprocess_stage) != bool(args.reprocess_video):
+        parser.error("--reprocess-stage and --reprocess-video must be supplied together")
     inputs = [*args.inputs, *args.input_dir]
     if not inputs:
         parser.error("at least one positional input or --input-dir is required")
@@ -107,6 +122,17 @@ def main(argv: list[str] | None = None) -> int:
                     "channels": "all" if enrich else "core",
                     "cpu_workers": cpu_workers,
                     "queue_size": queue_size,
+                    "visual_queue_size": int(
+                        config.get("ingestion", {}).get("visual_queue_size", 64)
+                    ),
+                    "index_batch_size": int(
+                        config.get("ingestion", {}).get("index_batch_size", 256)
+                    ),
+                    "organizer_compatible_visual": bool(
+                        args.organizer_compatible_visual
+                    ),
+                    "reprocess_stages": list(args.reprocess_stage),
+                    "reprocess_videos": list(args.reprocess_video),
                     "video_count": len(sources),
                     "videos": [source.video_id for source in sources],
                 },
@@ -116,11 +142,17 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
+    build_kwargs: dict[str, Any] = {"enrichment": enrich}
+    if args.organizer_compatible_visual:
+        build_kwargs["organizer_compatible_visual"] = True
+    if args.reprocess_stage:
+        build_kwargs["reprocess_stages"] = tuple(args.reprocess_stage)
+        build_kwargs["reprocess_videos"] = tuple(args.reprocess_video)
     ingestor = build_native_ingestor(
         config,
         batch_id=args.batch_id,
         competition=args.competition,
-        enrichment=enrich,
+        **build_kwargs,
     )
     archives = sorted({source.path.resolve() for source in sources if source.member})
     if archives:
@@ -131,16 +163,18 @@ def main(argv: list[str] | None = None) -> int:
         ingestor.ledger.initialize()
     for archive in archives:
         ingestor.ledger.assert_archive_ready(archive)
-    ingestor.initialize(
-        recreate_indexes=args.recreate_indexes,
-        recover_interrupted=not args.no_recover,
-    )
-    outcomes = ingestor.ingest_many(
-        sources,
-        cpu_workers=cpu_workers,
-        queue_size=queue_size,
-        enrich=enrich,
-    )
+    lock = getattr(ingestor, "batch_lock", nullcontext())
+    with lock:
+        ingestor.initialize(
+            recreate_indexes=args.recreate_indexes,
+            recover_interrupted=not args.no_recover,
+        )
+        outcomes = ingestor.ingest_many(
+            sources,
+            cpu_workers=cpu_workers,
+            queue_size=queue_size,
+            enrich=enrich,
+        )
     result = _summary(outcomes)
     result["status"] = ingestor.ledger.status_summary(args.batch_id).as_dict()
     print(json.dumps(result, ensure_ascii=False, indent=2))

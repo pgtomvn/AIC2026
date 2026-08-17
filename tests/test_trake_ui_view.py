@@ -124,7 +124,7 @@ class _Repository:
             and video_id == "L21_V001"
             and source_frame_idx in {10, 20}
         ):
-            return SimpleNamespace()
+            return SimpleNamespace(timestamp_ms=source_frame_idx * 100)
         return None
 
 

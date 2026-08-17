@@ -86,9 +86,11 @@ ingestion:
     laptop:
       cpu_workers: 2
       queue_size: 4
+      archive_materializers: 1
     accelerated:
       cpu_workers: 8
       queue_size: 8
+      archive_materializers: 2
   scene_threshold: 0.30
   scene_threshold_grid: [0.25, 0.30, 0.35, 0.40]
   max_gap_seconds: 2
@@ -146,6 +148,18 @@ models:
     verification_device: cuda
     verification_record: data/state/organizer-clip-verification.json
     verification_sample_size: 16
+    verification_median_cosine: 0.999
+    cache_dir: models/open_clip
+    local_files_only: true
+  organizer_compatible_visual:
+    enabled: true
+    enabled_profiles: [accelerated]
+    model_name: ViT-B-32-quickgelu
+    pretrained: openai
+    embedding_dim: 512
+    device: cuda
+    batch_size: 8
+    verification_record: data/state/organizer-clip-verification.json
     verification_median_cosine: 0.999
     cache_dir: models/open_clip
     local_files_only: true
@@ -229,6 +243,7 @@ services:
     collections:
       native_frames: aic_native_{batch}_siglip2_b16_224_r75de2d55_768d_v1
       organizer_frames: aic25_b1_openclip_b32_quickgelu_openai_512d_v1
+      organizer_compatible_frames: aic_native_{batch}_openclip_b32_quickgelu_openai_512d_v1
       accelerated_frames: aic_native_{batch}_openclip_l14_quickgelu_dfn2b_fp5cac988a_768d_v1
       text_segments: aic_text_{batch}_vietnamese_embedding_r4ab46e46_meanpool_normalized_768d_v1
     distance: Cosine
