@@ -454,6 +454,7 @@ def build_runtime(config: dict[str, Any] | None = None) -> RuntimeContext:
             seed_frames_per_prompt=int(trake_settings.get("seed_frames_per_prompt", 4)),
             grouped_search_workers=int(trake_settings.get("grouped_search_workers", 8)),
             vector_scroll_batch_size=int(trake_settings.get("vector_scroll_batch_size", 4_096)),
+            global_weight=float(trake_settings.get("global_weight", 0.25)),
             trajectory_cache=trajectory_cache,
             query_adapter=pipeline.query_adapter,
             lexical_channels=pipeline.lexical_channels,

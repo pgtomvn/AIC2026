@@ -154,9 +154,9 @@ def validate_trake_submission(
 ) -> tuple[TRAKESubmissionRow, ...]:
     """Validate ranking, batch identity, chronology, and canonical frame semantics.
 
-    Mapping-based ``stage_matches`` carry their timestamps directly. Lightweight
-    ``frame_ids`` inputs require ``get_canonical_timestamp_ms`` so their temporal
-    order is validated before any competition row is emitted.
+    All trust-boundary callbacks are mandatory. Supplied stage timestamps are
+    evidence only: every timestamp is resolved again from the artifact database
+    and must agree before any competition row is emitted.
     """
 
     active_spec = spec or TRAKECompetitionSpec.historical_2025_provisional()
@@ -187,14 +187,14 @@ def validate_trake_submission(
     sole_batch = next(iter(row_batches))
     if requested_batch is None:
         requested_batch = sole_batch
-    if is_batch_active is not None:
-        if not requested_batch:
-            raise TRAKESubmissionValidationError(
-                "batch_id is required when an active-batch callback is provided"
-            )
-        if not is_batch_active(requested_batch):
-            raise TRAKESubmissionValidationError(f"batch {requested_batch!r} is not active")
-
+    if is_batch_active is None:
+        raise TRAKESubmissionValidationError("active-batch validation is required")
+    if not is_batch_active(requested_batch):
+        raise TRAKESubmissionValidationError(f"batch {requested_batch!r} is not active")
+    if is_canonical_source_frame is None:
+        raise TRAKESubmissionValidationError("canonical source-frame validation is required")
+    if get_canonical_timestamp_ms is None:
+        raise TRAKESubmissionValidationError("canonical timestamp lookup is required")
     rows: list[TRAKESubmissionRow] = []
     seen_videos: set[str] = set()
     for rank, row_batch, raw_video_id, alignment in parsed:
@@ -223,40 +223,42 @@ def validate_trake_submission(
             raise TRAKESubmissionValidationError(
                 "source frame indices must be strictly increasing"
             )
-        if is_canonical_source_frame is not None:
-            for frame in frames:
-                if not is_canonical_source_frame(row_batch, video_id, frame):
-                    raise TRAKESubmissionValidationError(
-                        f"{video_id}:{frame} is not a canonical source frame"
-                    )
-        canonical_timestamps: tuple[int, ...] | None = None
-        if alignment.timestamps_ms is None and get_canonical_timestamp_ms is not None:
-            resolved_timestamps: list[int] = []
-            for frame in frames:
-                try:
-                    timestamp_ms = get_canonical_timestamp_ms(
-                        row_batch,
-                        video_id,
-                        frame,
-                    )
-                except Exception:
-                    raise TRAKESubmissionValidationError(
-                        "canonical frame timestamp lookup failed"
-                    ) from None
-                if (
-                    isinstance(timestamp_ms, bool)
-                    or not isinstance(timestamp_ms, int)
-                    or timestamp_ms < 0
-                ):
-                    raise TRAKESubmissionValidationError(
-                        f"{video_id}:{frame} has no valid canonical timestamp"
-                    )
-                resolved_timestamps.append(timestamp_ms)
-            canonical_timestamps = tuple(resolved_timestamps)
-        timestamps_ms = alignment.timestamps_ms or canonical_timestamps
-        if timestamps_ms is None:
+        if alignment.timestamps_ms is not None and any(
+            left >= right
+            for left, right in zip(
+                alignment.timestamps_ms,
+                alignment.timestamps_ms[1:],
+            )
+        ):
             raise TRAKESubmissionValidationError(
-                "canonical timestamp lookup is required when exporting frame_ids"
+                "timestamp_ms values must be strictly increasing"
+            )
+        for frame in frames:
+            if not is_canonical_source_frame(row_batch, video_id, frame):
+                raise TRAKESubmissionValidationError(
+                    f"{video_id}:{frame} is not a canonical source frame"
+                )
+        resolved_timestamps: list[int] = []
+        for frame in frames:
+            try:
+                timestamp_ms = get_canonical_timestamp_ms(row_batch, video_id, frame)
+            except Exception:
+                raise TRAKESubmissionValidationError(
+                    "canonical frame timestamp lookup failed"
+                ) from None
+            if (
+                isinstance(timestamp_ms, bool)
+                or not isinstance(timestamp_ms, int)
+                or timestamp_ms < 0
+            ):
+                raise TRAKESubmissionValidationError(
+                    f"{video_id}:{frame} has no valid canonical timestamp"
+                )
+            resolved_timestamps.append(timestamp_ms)
+        timestamps_ms = tuple(resolved_timestamps)
+        if alignment.timestamps_ms is not None and alignment.timestamps_ms != timestamps_ms:
+            raise TRAKESubmissionValidationError(
+                "submitted timestamp_ms does not match canonical artifact timestamp"
             )
         if any(
             left >= right

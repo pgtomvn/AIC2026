@@ -18,8 +18,49 @@ from src.trake_submission import (
     TRAKEFrameIndexEvidence,
     TRAKESubmissionValidationError,
     export_trake_submission,
-    validate_trake_submission,
 )
+from src.trake_submission import (
+    validate_trake_submission as _validate_trake_submission,
+)
+
+
+def validate_trake_submission(items, **kwargs):
+    """Exercise contract behavior behind the now-mandatory artifact trust boundary."""
+
+    timestamps: dict[tuple[str, int], int] = {}
+    for item in items:
+        video_id = item.video_id if isinstance(item, TRAKEResponseItem) else item.get("video_id")
+        matches = item.stage_matches if isinstance(item, TRAKEResponseItem) else item.get(
+            "stage_matches", ()
+        )
+        for match in matches or ():
+            frame = (
+                match.source_frame_idx
+                if isinstance(match, TRAKEStageMatch)
+                else match.get("source_frame_idx")
+            )
+            timestamp = (
+                match.timestamp_ms
+                if isinstance(match, TRAKEStageMatch)
+                else match.get("timestamp_ms")
+            )
+            if (
+                isinstance(video_id, str)
+                and isinstance(frame, int)
+                and not isinstance(frame, bool)
+                and isinstance(timestamp, int)
+                and not isinstance(timestamp, bool)
+                and timestamp >= 0
+            ):
+                timestamps[(video_id, frame)] = timestamp
+    kwargs.setdefault("batch_id", "aic25-b1-reference")
+    kwargs.setdefault("is_batch_active", lambda batch: batch == "aic25-b1-reference")
+    kwargs.setdefault("is_canonical_source_frame", lambda *_args: True)
+    kwargs.setdefault(
+        "get_canonical_timestamp_ms",
+        lambda _batch, video, frame: timestamps.get((video, frame), frame * 10),
+    )
+    return _validate_trake_submission(items, **kwargs)
 
 
 def _item(
@@ -65,6 +106,7 @@ def test_export_writes_atomic_headerless_rows_and_required_directory_name(tmp_pa
         batch_id="aic25-b1-reference",
         is_batch_active=lambda batch: batch == "aic25-b1-reference",
         is_canonical_source_frame=lambda _batch, _video, frame: frame % 10 == 0,
+        get_canonical_timestamp_ms=lambda _batch, _video, frame: frame * 40,
     )
 
     assert target.name == "query-01-trake-submission.csv"
@@ -227,7 +269,13 @@ def test_direct_frame_ids_use_canonical_timestamp_lookup() -> None:
     }
 
     with pytest.raises(TRAKESubmissionValidationError, match="timestamp lookup"):
-        validate_trake_submission((item,), stage_count=2)
+        _validate_trake_submission(
+            (item,),
+            stage_count=2,
+            batch_id="aic25-b1-reference",
+            is_batch_active=lambda _batch: True,
+            is_canonical_source_frame=lambda *_args: True,
+        )
     with pytest.raises(TRAKESubmissionValidationError, match="strictly increasing"):
         validate_trake_submission(
             (item,),
@@ -249,16 +297,20 @@ def test_direct_frame_ids_use_canonical_timestamp_lookup() -> None:
     assert rows[0].source_frame_indices == (10, 20)
 
 
-def test_mapping_stage_timestamps_are_authoritative_after_strict_validation() -> None:
+def test_mapping_stage_timestamps_must_match_canonical_artifact() -> None:
     item = _mapping_item(stage_indexes=[1, 2], timestamps_ms=[100, 200])
 
-    rows = validate_trake_submission(
-        (item,),
-        stage_count=2,
-        get_canonical_timestamp_ms=lambda _batch, _video, _frame: None,
-    )
+    with pytest.raises(TRAKESubmissionValidationError, match="canonical"):
+        validate_trake_submission(
+            (item,),
+            stage_count=2,
+            get_canonical_timestamp_ms=lambda _batch, _video, _frame: None,
+        )
 
-    assert rows[0].source_frame_indices == (10, 20)
+
+def test_trust_boundary_callbacks_are_mandatory() -> None:
+    with pytest.raises(TRAKESubmissionValidationError, match="active-batch"):
+        _validate_trake_submission((_item(),), stage_count=2)
 
 
 def test_invalid_stage_matches_cannot_fall_back_to_valid_frame_ids() -> None:

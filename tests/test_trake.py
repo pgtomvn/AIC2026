@@ -504,9 +504,10 @@ def test_pipeline_rejects_cross_space_dimension_mismatch() -> None:
 
 
 def test_compatibility_constructor_and_alignment_name() -> None:
-    pipeline = TRAKEPipeline(top_k_videos=5)
+    pipeline = TRAKEPipeline(top_k_videos=5, global_weight=0.4)
 
     assert pipeline.top_k_videos == 5
+    assert pipeline.global_weight == 0.4
     positions, score = pipeline._dtw_align(
         np.eye(2, dtype=np.float32),
         np.eye(2, dtype=np.float32),
@@ -516,3 +517,5 @@ def test_compatibility_constructor_and_alignment_name() -> None:
 
     with pytest.raises(ValueError, match="grouped_search_workers"):
         TRAKEPipeline(grouped_search_workers=13)
+    with pytest.raises(ValueError, match="global_weight"):
+        TRAKEPipeline(global_weight=1.1)

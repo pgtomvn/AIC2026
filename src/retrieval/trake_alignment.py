@@ -205,6 +205,7 @@ class TRAKEPipeline:
         seed_frames_per_prompt: int = 4,
         grouped_search_workers: int = 4,
         vector_scroll_batch_size: int = 4_096,
+        global_weight: float = 0.25,
         trajectory_cache: TRAKETrajectoryCache | None = None,
         query_adapter: QueryTextAdapter | None = None,
         lexical_channels: Sequence[Any] = (),
@@ -224,6 +225,12 @@ class TRAKEPipeline:
             raise ValueError("vector_scroll_batch_size must be between 256 and 16384")
         if not isinstance(channel_name, str) or not channel_name.strip():
             raise ValueError("channel_name must be a non-empty string")
+        if (
+            isinstance(global_weight, bool)
+            or not isinstance(global_weight, (int, float))
+            or not 0.0 <= float(global_weight) <= 1.0
+        ):
+            raise ValueError("global_weight must be between 0 and 1")
         self.clip_encoder = selected_encoder
         self.encoder = selected_encoder
         self.vector_store = vector_store
@@ -233,6 +240,7 @@ class TRAKEPipeline:
         self.seed_frames_per_prompt = seed_frames_per_prompt
         self.grouped_search_workers = grouped_search_workers
         self.vector_scroll_batch_size = vector_scroll_batch_size
+        self.global_weight = float(global_weight)
         self.trajectory_cache = trajectory_cache
         self.query_adapter = query_adapter
         self.lexical_channels = tuple(lexical_channels)
@@ -364,7 +372,9 @@ class TRAKEPipeline:
         for video_id in videos:
             global_score = per_prompt[0].get(video_id, -1.0)
             stage_scores = [scores.get(video_id, -1.0) for scores in per_prompt[1:]]
-            stage_a[video_id] = 0.25 * global_score + 0.75 * (sum(stage_scores) / stage_count)
+            stage_a[video_id] = self.global_weight * global_score + (
+                1.0 - self.global_weight
+            ) * (sum(stage_scores) / stage_count)
         dense_order = sorted(stage_a, key=lambda video: (-stage_a[video], video))
         if lexical_video_order:
             dense_ranks = {video_id: rank for rank, video_id in enumerate(dense_order, 1)}
@@ -790,7 +800,9 @@ class TRAKEPipeline:
                 float(stage_similarities[index, position])
                 for index, position in enumerate(positions)
             )
-            final_score = 0.25 * global_score + 0.75 * mean_stage_score
+            final_score = self.global_weight * global_score + (
+                1.0 - self.global_weight
+            ) * mean_stage_score
             alignments.append(
                 _RankedAlignment(
                     video_id=video_id,
