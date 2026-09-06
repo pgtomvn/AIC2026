@@ -19,7 +19,11 @@ from src import PROJECT_ROOT
 from src.embedding.clip_encoder import CLIPEncoder
 from src.embedding.siglip_encoder import SigLIP2Encoder
 from src.embedding.text_encoder import VietnameseTextEncoder
-from src.evaluation.tuning import load_tuning_override
+from src.evaluation.tuning import (
+    load_intent_policy_override,
+    load_semantic_view_policy,
+    load_tuning_override,
+)
 from src.indexing.text_store import TextStore
 from src.indexing.vector_store import BatchVectorStore, VectorStore
 from src.ingest.ledger import JobLedger, LedgerError
@@ -77,6 +81,7 @@ class RuntimeContext:
     launch_identity: dict[str, Any] = field(default_factory=dict)
     warmup: Any = None
     trake_pipeline: Any = None
+    interaction_logger: Any = None
 
     def validate_batch_filters(self, batch_filters: Iterable[str] | None = None) -> tuple[str, ...]:
         """Validate explicit filters, defaulting empty input to the selected batch."""
@@ -123,6 +128,10 @@ def build_query_adapter(config: Mapping[str, Any]) -> QueryTextAdapter:
         compute_type=str(model.get("compute_type", "int8")),
         intra_threads=int(model.get("intra_threads", 4)),
         max_decoding_length=int(model.get("max_decoding_length", 128)),
+        request_timeout_seconds=float(model.get("request_timeout_seconds", 3.0)),
+        startup_timeout_seconds=float(model.get("startup_timeout_seconds", 30.0)),
+        sentence_max_chars=int(model.get("sentence_max_chars", 400)),
+        source_token_limit=int(model.get("source_token_limit", 448)),
         allow_transformers_fallback=bool(model.get("allow_transformers_fallback", True)),
         asset_manifest=_project_path(str(model["asset_manifest"]))
         if model.get("asset_manifest")
@@ -139,6 +148,32 @@ def build_pipeline(config: dict[str, Any] | None = None) -> TextualKISPipeline:
     models = settings["models"]
     services = settings["services"]
     retrieval = settings["retrieval"]
+    from src.evaluation.rollout import validate_rollout_activation
+
+    for feature in (
+        "candidate_rescue",
+        "video_local",
+        "ocr_quality",
+        "text_reranker",
+    ):
+        selected = retrieval.get(feature, {})
+        validate_rollout_activation(
+            feature,
+            selected if isinstance(selected, Mapping) else {},
+            project_root=PROJECT_ROOT,
+        )
+    selected_batch_id = configured_batch_id(settings)
+    readiness_batches = settings.get("readiness", {}).get("batches", {})
+    selected_readiness = (
+        readiness_batches.get(selected_batch_id, {})
+        if isinstance(readiness_batches, Mapping)
+        else {}
+    )
+    expected_visual_count = int(
+        selected_readiness.get("expected_canonical_frames", 0)
+        if isinstance(selected_readiness, Mapping)
+        else 0
+    )
     query_adapter = build_query_adapter(settings)
     visual = models["visual"]
     qdrant = services["qdrant"]
@@ -154,6 +189,7 @@ def build_pipeline(config: dict[str, Any] | None = None) -> TextualKISPipeline:
     text_max_chunks = int(text_query.get("max_chunks", 4))
     text_chunk_overlap = int(text_query.get("overlap_tokens", 8))
     tuning_record = retrieval.get("tuning_record")
+    intent_policies = dict(retrieval.get("intent_policies", {}))
     if tuning_record:
         tuning_path = _project_path(str(tuning_record))
         if tuning_path.is_file():
@@ -162,6 +198,24 @@ def build_pipeline(config: dict[str, Any] | None = None) -> TextualKISPipeline:
                 rrf_k = override.rrf_k
                 depths = override.depths
                 weights = override.weights
+    intent_tuning_record = retrieval.get("intent_tuning_record")
+    if intent_tuning_record:
+        intent_tuning_path = _project_path(str(intent_tuning_record))
+        if intent_tuning_path.is_file():
+            intent_policies = load_intent_policy_override(intent_tuning_path)
+    semantic_views = dict(retrieval.get("semantic_views", {}))
+    asr_routing = dict(retrieval.get("asr_routing", {}))
+    semantic_record = semantic_views.get("tuning_record")
+    if semantic_record:
+        semantic_record_path = _project_path(str(semantic_record))
+        if semantic_record_path.is_file():
+            semantic_policy = load_semantic_view_policy(semantic_record_path)
+            semantic_views = {
+                **semantic_views,
+                "fusion": semantic_policy.fusion,
+                "weights": semantic_policy.weights,
+                "consensus_alpha": semantic_policy.consensus_alpha,
+            }
 
     encoder = SigLIP2Encoder(
         model_name=visual["model_name"],
@@ -188,6 +242,8 @@ def build_pipeline(config: dict[str, Any] | None = None) -> TextualKISPipeline:
             ),
             float(weights["visual"]),
             int(depths["visual"]),
+            expected_visual_count > 0,
+            expected_visual_count or None,
         )
     ]
     semantic_text = models.get("text", {})
@@ -298,6 +354,11 @@ def build_pipeline(config: dict[str, Any] | None = None) -> TextualKISPipeline:
         for name in ("ocr", "asr", "metadata")
     ]
     diversity = retrieval.get("diversity", {})
+    entity_routing = retrieval.get("entity_routing", {})
+    from src.retrieval.ocr_quality import OCRQualityConfig, OCRQualityStore
+
+    ocr_quality = OCRQualityConfig.from_mapping(retrieval.get("ocr_quality"))
+    ocr_quality_store = OCRQualityStore(_project_path(ocr_quality.sidecar_path))
     return TextualKISPipeline(
         dense_channels=dense,
         lexical_channels=lexical,
@@ -309,6 +370,22 @@ def build_pipeline(config: dict[str, Any] | None = None) -> TextualKISPipeline:
         early_per_video=int(diversity.get("early_per_video", 2)),
         late_per_video=int(diversity.get("late_per_video", 5)),
         query_adapter=query_adapter,
+        entity_lexical_multiplier=float(entity_routing.get("lexical_multiplier", 3.0)),
+        entity_bonus_alpha=float(entity_routing.get("bonus_alpha", 0.25)),
+        intent_policies=intent_policies,
+        semantic_view_fusion=str(semantic_views.get("fusion", "global_only")),
+        semantic_view_weights=semantic_views.get("weights", {}),
+        semantic_consensus_alpha=float(semantic_views.get("consensus_alpha", 0.0)),
+        asr_enabled=bool(asr_routing.get("enabled", True)),
+        asr_max_weight=float(asr_routing.get("max_weight", weights.get("asr", 0.7))),
+        asr_temporal_overlap_bonus=float(
+            asr_routing.get("temporal_overlap_bonus", 0.3)
+        ),
+        asr_temporal_padding_ms=int(asr_routing.get("temporal_padding_ms", 1_000)),
+        candidate_rescue=retrieval.get("candidate_rescue"),
+        video_local=retrieval.get("video_local"),
+        ocr_quality=ocr_quality,
+        ocr_quality_store=ocr_quality_store,
     )
 
 
@@ -344,9 +421,22 @@ def build_runtime(config: dict[str, Any] | None = None) -> RuntimeContext:
             video_id = payload.get("video_id")
             if not isinstance(batch_id, str) or not isinstance(video_id, str):
                 return None
-            start = int(payload.get("start_ms", payload.get("timestamp_ms", 0)))
-            end = int(payload.get("end_ms", start))
-            frame = repository.nearest_frame(batch_id, video_id, (start + end) // 2)
+            frame = None
+            raw_frame_idx = payload.get("source_frame_idx")
+            if not isinstance(raw_frame_idx, bool):
+                try:
+                    source_frame_idx = int(raw_frame_idx)
+                except (TypeError, ValueError):
+                    source_frame_idx = -1
+                if source_frame_idx >= 0:
+                    frame = repository.get_frame(batch_id, video_id, source_frame_idx)
+            if frame is None:
+                try:
+                    start = int(payload.get("start_ms", payload.get("timestamp_ms", 0)))
+                    end = int(payload.get("end_ms", start))
+                except (TypeError, ValueError):
+                    return None
+                frame = repository.nearest_frame(batch_id, video_id, (start + end) // 2)
             if frame is None:
                 return None
             mapped_payload = dict(payload)
@@ -356,8 +446,151 @@ def build_runtime(config: dict[str, Any] | None = None) -> RuntimeContext:
             return mapped
 
         pipeline.frame_resolver = resolve_segment
+        metadata_resolution = settings.get("retrieval", {}).get("metadata_resolution", "scalar")
+        if metadata_resolution not in {"scalar", "batched", "asr_only_batched"}:
+            raise ValueError("retrieval.metadata_resolution must be scalar, batched or asr_only_batched")
+        if metadata_resolution in {"batched", "asr_only_batched"}:
+            from src.retrieval.frame_resolution import BatchedFrameResolver
+
+            pipeline.frame_resolver = BatchedFrameResolver(
+                repository,
+                scalar_fallback=resolve_segment if metadata_resolution == "asr_only_batched" else None,
+            )
+
+    advanced_kis = settings.get("retrieval", {}).get("advanced_kis", {})
+    advanced_color_resolver = None
+    if (
+        repository is not None
+        and isinstance(advanced_kis, Mapping)
+        and bool(advanced_kis.get("enabled", True))
+    ):
+        from src.retrieval.color_filter import AdvancedKISReranker, HSVColorVerifier
+        from src.retrieval.qa_media import CanonicalImageResolver
+        from src.retrieval.spatial_graph import SpatialOntologyConfig
+        from src.retrieval.spatial_rerank import OrganizerObjectArchive
+
+        ontology_value = advanced_kis.get("spatial_ontology", {})
+        ontology = ontology_value if isinstance(ontology_value, Mapping) else {}
+        spatial_ontology = SpatialOntologyConfig(
+            directional_margin=float(ontology.get("directional_margin", 0.03)),
+            directional_scale=float(ontology.get("directional_scale", 0.25)),
+            near_threshold=float(ontology.get("near_threshold", 0.35)),
+            far_min=float(ontology.get("far_min", 0.30)),
+            far_max=float(ontology.get("far_max", 0.70)),
+            inside_satisfied_coverage=float(
+                ontology.get("inside_satisfied_coverage", 0.90)
+            ),
+            between_projection_min=float(ontology.get("between_projection_min", 0.10)),
+            between_projection_max=float(ontology.get("between_projection_max", 0.90)),
+            between_perpendicular_threshold=float(
+                ontology.get("between_perpendicular_threshold", 0.20)
+            ),
+            depth_area_ratio=float(ontology.get("depth_area_ratio", 1.20)),
+            depth_sigmoid_scale=float(ontology.get("depth_sigmoid_scale", 10.0)),
+            depth_vertical_tolerance=float(
+                ontology.get("depth_vertical_tolerance", 0.05)
+            ),
+            perspective_weight=float(ontology.get("perspective_weight", 0.50)),
+            nms_iou_threshold=float(ontology.get("nms_iou_threshold", 0.50)),
+            max_detections_per_node=int(ontology.get("max_detections_per_node", 6)),
+            beam_width=int(ontology.get("beam_width", 512)),
+        )
+        object_archive = OrganizerObjectArchive(
+            _project_path(str(advanced_kis.get("object_archive", "objects-aic25-b1.zip"))),
+            allowed_root=PROJECT_ROOT,
+            batch_id=str(advanced_kis.get("object_batch_id", "aic25-b1-reference")),
+            confidence_threshold=float(
+                advanced_kis.get("object_confidence_threshold", 0.50)
+            ),
+            max_member_bytes=int(
+                advanced_kis.get("object_max_member_bytes", 1024 * 1024)
+            ),
+            max_entries=int(advanced_kis.get("object_cache_entries", 2_048)),
+            max_cache_bytes=int(
+                advanced_kis.get("object_cache_bytes", 16 * 1024 * 1024)
+            ),
+        )
+        color_resolver = CanonicalImageResolver(
+            (PROJECT_ROOT,),
+            max_input_bytes=int(
+                advanced_kis.get("color_max_source_bytes", 16 * 1024 * 1024)
+            ),
+            max_dimension=int(advanced_kis.get("color_image_dimension", 224)),
+            normalized_cache_entries=int(
+                advanced_kis.get("color_cache_entries", 512)
+            ),
+            normalized_cache_bytes=int(
+                advanced_kis.get("color_cache_bytes", 16 * 1024 * 1024)
+            ),
+        )
+        advanced_color_resolver = color_resolver
+        pipeline.advanced_reranker = AdvancedKISReranker(
+            repository,
+            object_archive,
+            HSVColorVerifier(
+                color_resolver,
+                max_entries=int(advanced_kis.get("color_cache_entries", 512)),
+                max_cache_bytes=int(
+                    advanced_kis.get("color_cache_bytes", 16 * 1024 * 1024)
+                ),
+            ),
+            spatial_depth=int(advanced_kis.get("spatial_candidate_depth", 100)),
+            color_depth=int(advanced_kis.get("color_candidate_depth", 12)),
+            spatial_beta=float(advanced_kis.get("spatial_beta", 0.35)),
+            color_absent_multiplier=float(
+                advanced_kis.get("color_absent_multiplier", 0.65)
+            ),
+            color_workers=int(advanced_kis.get("color_workers", 2)),
+            relation_beta=float(advanced_kis.get("relation_beta", 0.40)),
+            strict_color_threshold=float(
+                advanced_kis.get("strict_color_roi_threshold", 0.12)
+            ),
+            strict_color_beta=float(advanced_kis.get("strict_color_beta", 0.25)),
+            strict_mismatch_multiplier=float(
+                advanced_kis.get("strict_color_mismatch_multiplier", 0.10)
+            ),
+            negation_confidence_threshold=float(
+                advanced_kis.get("negation_confidence_threshold", 0.60)
+            ),
+            negation_multiplier=float(
+                advanced_kis.get("negation_multiplier", 0.10)
+            ),
+            spatial_ontology=spatial_ontology,
+        )
+
 
     dense_by_name = {channel.name: channel for channel in pipeline.dense_channels}
+    cross_modal = advanced_kis.get("cross_modal", {}) if isinstance(advanced_kis, Mapping) else {}
+    allowed_profiles = (
+        tuple(str(value) for value in cross_modal.get("allowed_profiles", ()))
+        if isinstance(cross_modal, Mapping)
+        else ()
+    )
+    if (
+        repository is not None
+        and advanced_color_resolver is not None
+        and isinstance(cross_modal, Mapping)
+        and bool(cross_modal.get("enabled", False))
+        and str(settings.get("profile", "laptop")) in allowed_profiles
+    ):
+        from src.retrieval.calibrator import CalibrationWeights
+        from src.retrieval.cross_modal_rescore import CrossModalKISReranker
+
+        seed_weights = cross_modal.get("seed_weights", {})
+        seed_weights = seed_weights if isinstance(seed_weights, Mapping) else {}
+        pipeline.cross_modal_rescorer = CrossModalKISReranker(
+            repository,
+            advanced_color_resolver,
+            dense_by_name,
+            candidate_depth=int(cross_modal.get("candidate_depth", 20)),
+            max_object_crops=int(cross_modal.get("max_object_crops", 2)),
+            calibration=str(cross_modal.get("calibration", "rank")),
+            weights=CalibrationWeights(
+                base=float(seed_weights.get("base", 0.60)),
+                global_image=float(seed_weights.get("global", 0.25)),
+                crop=float(seed_weights.get("crop", 0.15)),
+            ),
+        )
 
     from src.retrieval.trake_alignment import TRAKEPipeline
     from src.retrieval.trake_router import TRAKEPipelineRouter
@@ -439,12 +672,14 @@ def build_runtime(config: dict[str, Any] | None = None) -> RuntimeContext:
         trajectory_cache = TRAKETrajectoryCache(
             channel.store,
             vector_size=int(channel.store.vector_size),
-            # Full-batch warm-up is sequential and benefits from fewer gRPC
-            # round trips; Stage-B fallback scrolling retains its own setting.
-            batch_size=max(16_384, scroll_batch_size),
+            # Keep scroll responses bounded. Large 16K-vector gRPC responses
+            # exceed the local Qdrant deadline on the canonical B01 collection.
+            batch_size=max(512, scroll_batch_size),
             fingerprint_provider=trajectory_fingerprint,
             snapshot_store=snapshot_store,
         )
+        if channel_name == pipeline.video_local.source_channel:
+            pipeline.video_local_trajectories = trajectory_cache
         trake_cores[channel_name] = TRAKEPipeline(
             encoder=channel.encoder,
             vector_store=channel.store,
@@ -455,6 +690,17 @@ def build_runtime(config: dict[str, Any] | None = None) -> RuntimeContext:
             grouped_search_workers=int(trake_settings.get("grouped_search_workers", 8)),
             vector_scroll_batch_size=int(trake_settings.get("vector_scroll_batch_size", 4_096)),
             global_weight=float(trake_settings.get("global_weight", 0.25)),
+            max_stage_gap_ms=(
+                None
+                if trake_settings.get("max_stage_gap_ms") is None
+                else int(trake_settings["max_stage_gap_ms"])
+            ),
+            temporal_gap_penalty_per_second=float(
+                trake_settings.get("temporal_gap_penalty_per_second", 0.0)
+            ),
+            shot_boundary_penalty=float(
+                trake_settings.get("shot_boundary_penalty", 0.0)
+            ),
             trajectory_cache=trajectory_cache,
             query_adapter=pipeline.query_adapter,
             lexical_channels=pipeline.lexical_channels,
@@ -503,6 +749,7 @@ def build_runtime(config: dict[str, Any] | None = None) -> RuntimeContext:
     florence_reasoner = gpu_coordinator = None
     warmup_service: WarmupService | None = None
     if repository is not None:
+        asr_routing = dict(settings.get("retrieval", {}).get("asr_routing", {}))
         from src.contracts import QACompetitionSpec
         from src.retrieval.qa_media import CanonicalImageResolver
         from src.retrieval.qa_retrieval import VisualQARetriever
@@ -670,6 +917,12 @@ def build_runtime(config: dict[str, Any] | None = None) -> RuntimeContext:
             max_inline_image_bytes=int(qa.get("image_max_request_bytes", 20 * 1024 * 1024)),
             reasoning_workers=1,
             retrieval_fingerprint=qa_retrieval_fingerprint,
+            asr_context_radius_ms=int(
+                asr_routing.get("qa_context_radius_ms", 30_000)
+            ),
+            asr_context_max_characters=int(
+                asr_routing.get("qa_context_max_characters", 4_000)
+            ),
         )
     warmup_config = settings.get("warmup", {})
     if bool(warmup_config.get("enabled", True)):
@@ -686,6 +939,16 @@ def build_runtime(config: dict[str, Any] | None = None) -> RuntimeContext:
         )
     if gpu_coordinator is not None:
         gpu_coordinator.warmup = warmup_service
+    from src.evaluation.interaction_log import InteractionLogger
+
+    interaction_settings = settings.get("retrieval", {}).get("interaction_log", {})
+    interaction_logger = InteractionLogger(
+        _project_path(
+            str(interaction_settings.get("path", "outputs/evaluation/kis-interactions.jsonl"))
+        ),
+        mode=str(interaction_settings.get("mode", "off")),
+        max_results=int(interaction_settings.get("max_results", 100)),
+    )
     return RuntimeContext(
         config=settings,
         pipeline=pipeline,
@@ -702,4 +965,5 @@ def build_runtime(config: dict[str, Any] | None = None) -> RuntimeContext:
         launch_identity=launch_identity,
         warmup=warmup_service,
         trake_pipeline=trake_pipeline,
+        interaction_logger=interaction_logger,
     )

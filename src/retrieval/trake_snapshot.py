@@ -21,8 +21,8 @@ from uuid import uuid4
 
 import numpy as np
 
-TRAKE_SNAPSHOT_SCHEMA_VERSION = 1
-_CACHE_DIRECTORY_VERSION = "v1"
+TRAKE_SNAPSHOT_SCHEMA_VERSION = 2
+_CACHE_DIRECTORY_VERSION = "v2"
 _SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9._-]+$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _CHUNK_SIZE = 4 * 1024 * 1024
@@ -41,6 +41,7 @@ class TRAKETrajectorySnapshot:
     fingerprint: str
     source_frame_indices: np.ndarray
     timestamps_ms: np.ndarray
+    shot_codes: np.ndarray
     vectors: np.ndarray
     video_ids: tuple[str, ...]
     video_offsets: np.ndarray
@@ -269,6 +270,7 @@ class TRAKETrajectorySnapshotStore:
                 "vectors.npy": ("<f4", (frame_count, self.vector_size)),
                 "source_frame_indices.npy": ("<i8", (frame_count,)),
                 "timestamps_ms.npy": ("<i8", (frame_count,)),
+                "shot_codes.npy": ("<i8", (frame_count,)),
                 "video_offsets.npy": ("<i8", (video_count + 1,)),
             }
             for filename, (dtype, shape) in expected.items():
@@ -284,11 +286,13 @@ class TRAKETrajectorySnapshotStore:
                 path / "source_frame_indices.npy", mmap_mode="r", allow_pickle=False
             )
             timestamps = np.load(path / "timestamps_ms.npy", mmap_mode="r", allow_pickle=False)
+            shot_codes = np.load(path / "shot_codes.npy", mmap_mode="r", allow_pickle=False)
             offsets = np.load(path / "video_offsets.npy", mmap_mode="r", allow_pickle=False)
             arrays = {
                 "vectors.npy": vectors,
                 "source_frame_indices.npy": source_frames,
                 "timestamps_ms.npy": timestamps,
+                "shot_codes.npy": shot_codes,
                 "video_offsets.npy": offsets,
             }
             for filename, array in arrays.items():
@@ -314,6 +318,7 @@ class TRAKETrajectorySnapshotStore:
                     fingerprint=fingerprint,
                     source_frame_indices=source_frames,
                     timestamps_ms=timestamps,
+                    shot_codes=shot_codes,
                     vectors=vectors,
                     video_ids=video_ids,
                     video_offsets=offsets,
@@ -351,6 +356,7 @@ class TRAKETrajectorySnapshotStore:
         video_ids: tuple[str, ...],
         video_offsets: np.ndarray,
         source_point_count: int,
+        shot_codes: np.ndarray | None = None,
     ) -> None:
         """Publish one complete snapshot; caller must hold ``build_lock``."""
 
@@ -360,12 +366,20 @@ class TRAKETrajectorySnapshotStore:
         temporary = parent / f".tmp-{fingerprint}-{os.getpid()}-{uuid4().hex}"
         temporary.mkdir()
         try:
+            effective_shot_codes = (
+                np.asarray(shot_codes)
+                if shot_codes is not None
+                else -np.arange(1, int(vectors.shape[0]) + 1, dtype=np.int64)
+            )
+            if effective_shot_codes.shape != (int(vectors.shape[0]),):
+                raise ValueError("shot_codes must align with trajectory vectors")
             arrays = {
                 "vectors.npy": np.ascontiguousarray(vectors, dtype="<f4"),
                 "source_frame_indices.npy": np.ascontiguousarray(
                     source_frame_indices, dtype="<i8"
                 ),
                 "timestamps_ms.npy": np.ascontiguousarray(timestamps_ms, dtype="<i8"),
+                "shot_codes.npy": np.ascontiguousarray(effective_shot_codes, dtype="<i8"),
                 "video_offsets.npy": np.ascontiguousarray(video_offsets, dtype="<i8"),
             }
             files: dict[str, Mapping[str, Any]] = {}

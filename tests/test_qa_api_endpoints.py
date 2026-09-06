@@ -18,12 +18,14 @@ from src.contracts import (
     QACandidateFrame,
     QACandidateRequest,
     QACompetitionSpec,
+    QAFrameInjectionRequest,
     QAQueryRequest,
     QAReasoningResult,
     QASingleFrameAnswerRequest,
 )
 from src.retrieval.visual_qa import (
     QACandidateMediaUnavailableError,
+    QAInjectedFrameNotFoundError,
     VisualQATotalFailureError,
 )
 
@@ -164,6 +166,54 @@ class _QAPipeline:
             "expires_at": 1234.0,
         }
         return (candidate,)
+
+    def start_injected_session(
+        self,
+        request: QAFrameInjectionRequest,
+        *,
+        session_id: str,
+    ) -> QACandidateFrame:
+        if self.failure is not None:
+            raise self.failure
+        if request.video_id == "missing":
+            raise QAInjectedFrameNotFoundError("qa_injected_frame_not_found")
+        candidate_id = f"{request.batch_id}:{request.video_id}:{request.source_frame_idx}"
+        if request.video_id == "broken":
+            raise QACandidateMediaUnavailableError(candidate_id)
+        candidate = QACandidateFrame(
+            candidate_id=candidate_id,
+            retrieval_rank=1,
+            retrieval_score=0.0,
+            batch_id=request.batch_id,
+            video_id=request.video_id,
+            source_frame_idx=request.source_frame_idx,
+            timestamp_ms=1_000,
+            shot_id="shot-1",
+            evidence={"origin": request.source},
+        )
+        self.snapshots[session_id] = {
+            "session_id": session_id,
+            "request": request.to_dict(),
+            "state_version": 3,
+            "status": "candidates_ready",
+            "state": {
+                "state_version": 3,
+                "status": "candidates_ready",
+                "selected_candidate_id": candidate_id,
+                "candidate_cache_status": "injected",
+            },
+            "session_candidates": [candidate.to_dict()],
+            "candidate_count": 1,
+            "candidate_retrieval_ms": 0.0,
+            "selected_candidate_id": candidate_id,
+            "predictions": [],
+            "answers": {},
+            "failures": {},
+            "channel_statuses": {},
+            "retrieval_errors": {},
+            "expires_at": 1234.0,
+        }
+        return candidate
 
     def search(self, request: QAQueryRequest, *, session_id: str) -> list[dict[str, Any]]:
         if self.failure is not None:
@@ -415,6 +465,71 @@ def test_qa_search_alias_is_retrieval_only_and_deprecated(tmp_path: Path) -> Non
     assert alias.deprecated is True
 
 
+def test_qa_frame_injection_returns_one_safe_authoritative_candidate(
+    tmp_path: Path,
+) -> None:
+    pipeline = _QAPipeline()
+    endpoint = _route(
+        create_app(_context(tmp_path, pipeline)), "/v1/qa/inject", "POST"
+    ).endpoint
+
+    response = endpoint(
+        {
+            "query_id": "bridge-1",
+            "batch_id": "b1",
+            "video_id": "L21_V001",
+            "source_frame_idx": 10,
+            "source": "kis_bridge",
+            "event_description": "a news presenter",
+        }
+    )
+
+    assert response["candidate_count"] == 1
+    assert response["selected_candidate_id"] == "b1:L21_V001:10"
+    assert response["candidates"][0]["retrieval_score"] == 0.0
+    assert response["candidates"][0]["evidence"] == {
+        "channel_ranks": {},
+        "origin": "kis_bridge",
+    }
+    assert "image_uri" not in str(response)
+
+
+@pytest.mark.parametrize(
+    ("payload_update", "status_code", "code"),
+    [
+        ({"frame_idx": 10}, 422, "qa_frame_injection_invalid"),
+        ({"source_frame_idx": True}, 422, "qa_frame_injection_invalid"),
+        ({"video_id": "missing"}, 404, "qa_injected_frame_not_found"),
+        ({"video_id": "broken"}, 409, "qa_candidate_media_unavailable"),
+        ({"batch_id": "inactive"}, 422, "qa_frame_injection_invalid"),
+    ],
+)
+def test_qa_frame_injection_maps_validation_and_media_failures(
+    tmp_path: Path,
+    payload_update: dict[str, Any],
+    status_code: int,
+    code: str,
+) -> None:
+    endpoint = _route(
+        create_app(_context(tmp_path, _QAPipeline())), "/v1/qa/inject", "POST"
+    ).endpoint
+    payload: dict[str, Any] = {
+        "query_id": "inject-errors",
+        "batch_id": "b1",
+        "video_id": "L21_V001",
+        "source_frame_idx": 10,
+        "source": "manual",
+        "event_description": "operator-selected canonical frame",
+    }
+    payload.update(payload_update)
+
+    with pytest.raises(HTTPException) as captured:
+        endpoint(payload)
+
+    assert captured.value.status_code == status_code
+    assert captured.value.detail["code"] == code
+
+
 def test_qa_search_defaults_and_validates_batches_before_pipeline(tmp_path: Path) -> None:
     pipeline = _QAPipeline()
     context = _context(tmp_path, pipeline)
@@ -547,6 +662,48 @@ def test_qa_restore_and_total_failure_are_safe(tmp_path: Path) -> None:
         failed(_request())
     assert raised.value.status_code == 503
     assert secret not in str(raised.value.detail)
+
+
+def test_qa_unexpected_failures_return_sanitized_correlation_ids(tmp_path: Path) -> None:
+    secret = "unexpected-secret-must-not-leak"
+    retrieve = _route(
+        create_app(_context(tmp_path, _QAPipeline(failure=AssertionError(secret)))),
+        "/v1/qa/retrieve",
+        "POST",
+    ).endpoint
+
+    with pytest.raises(HTTPException) as retrieve_error:
+        retrieve(_request())
+
+    assert retrieve_error.value.status_code == 500
+    assert retrieve_error.value.detail["code"] == "qa_internal_error"
+    assert retrieve_error.value.detail["correlation_id"].startswith("ERR-QA-")
+    assert secret not in str(retrieve_error.value.detail)
+
+    class UnexpectedAnswerPipeline(_QAPipeline):
+        def answer_candidate(self, search_id, request):
+            del search_id, request
+            raise AssertionError(secret)
+
+    pipeline = UnexpectedAnswerPipeline()
+    app = create_app(_context(tmp_path, pipeline))
+    retrieved = _route(app, "/v1/qa/retrieve", "POST").endpoint(_request())
+    answer = _route(app, "/v1/qa/search/{search_id}/answer", "POST").endpoint
+
+    with pytest.raises(HTTPException) as answer_error:
+        answer(
+            retrieved["search_id"],
+            {
+                "candidate_id": "b1:L21_V001:10",
+                "question": "How many apples?",
+                "reasoning_policy": "local_only",
+            },
+        )
+
+    assert answer_error.value.status_code == 500
+    assert answer_error.value.detail["code"] == "qa_internal_error"
+    assert answer_error.value.detail["correlation_id"].startswith("ERR-QA-")
+    assert secret not in str(answer_error.value.detail)
 
 
 def test_qa_restore_allowlists_predictions_and_drops_media_paths(tmp_path: Path) -> None:
@@ -707,6 +864,16 @@ def test_runtime_capabilities_expose_safe_local_and_cloud_states(tmp_path: Path)
     assert response["qa"]["default_policy"] == "gemini_then_local"
     assert response["qa"]["local"]["status"]["state"] == "ready"
     assert response["qa"]["cloud"]["status"]["state"] == "blocked_asset"
+    assert response["runtime_contract"]["version"] == 6
+    assert "kis.adaptive_rrf" in response["runtime_contract"]["features"]
+    assert "kis.full_spatial_ontology" in response["runtime_contract"]["features"]
+    assert (
+        "kis.spatial_color_rerank" in response["runtime_contract"]["features"]
+    )
+    assert "qa.frame_injection" in response["runtime_contract"]["features"]
+    assert "qa.top_k_50" in response["runtime_contract"]["features"]
+    assert "entity_constraints.qa" in response["runtime_contract"]["features"]
+    assert len(response["runtime_contract"]["source_contract_sha256"]) == 64
     assert "api_key" not in str(response)
 
 

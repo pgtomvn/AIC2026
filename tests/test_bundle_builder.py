@@ -88,7 +88,10 @@ def test_build_valid_bundle_has_exact_submission_root(tmp_path, context) -> None
     ("entry", "code"),
     [
         (_entry("kis", "1", b"L21_V001.mp4,10\n"), "submission_video_extension_forbidden"),
-        (_entry("qa", "2", f"L21_V001,10,{'đ' * 101}\n".encode()), "submission_answer_too_long"),
+        (
+            _entry("qa", "2", f'L21_V001,10,"{"đ" * 101}"\n'.encode()),
+            "submission_answer_too_long",
+        ),
         (_entry("trake", "3", b"L21_V001,20,10\n", stages=2), "submission_frame_order_invalid"),
     ],
 )
@@ -121,7 +124,7 @@ def test_current_bundle_requires_exactly_one_entry(context) -> None:
         validate_bundle_entries(
             (
                 _entry("kis", "1", b"L21_V001,10\n"),
-                _entry("qa", "2", b"L21_V001,20,yes\n"),
+                _entry("qa", "2", b'L21_V001,20,"yes"\n'),
             ),
             context=context,
             mode="current",
@@ -134,7 +137,7 @@ def test_bundle_rejects_duplicate_query_ids_across_tasks(context) -> None:
         validate_bundle_entries(
             (
                 _entry("kis", "1", b"L21_V001,10\n"),
-                _entry("qa", "1", b"L21_V001,20,yes\n"),
+                _entry("qa", "1", b'L21_V001,20,"yes"\n'),
             ),
             context=context,
             mode="all",
@@ -196,7 +199,7 @@ def test_preflight_reports_one_sanitized_issue_per_invalid_file(context) -> None
         validate_bundle_entries(
             (
                 _entry("kis", "1", b"L21_V001.mp4,10\n"),
-                _entry("qa", "2", f"L21_V001,20,{'x' * 101}\n".encode()),
+                _entry("qa", "2", f'L21_V001,20,"{"x" * 101}"\n'.encode()),
                 _entry("trake", "3", b"L21_V001,10,20\n", stages=2),
             ),
             context=context,

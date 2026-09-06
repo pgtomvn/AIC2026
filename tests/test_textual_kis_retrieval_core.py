@@ -91,7 +91,7 @@ def test_query_plan_preserves_unicode_quotes_entities_actions_and_attributes() -
     assert plan.normalized_text == "Người ở Hà Nội nói “Cà phê Đỏ” rồi chạy"
     assert plan.accent_folded_text == "nguoi o ha noi noi “ca phe do” roi chay"
     assert plan.quoted_text == ("Cà phê Đỏ",)
-    assert plan.named_entities == ("Hà", "Nội", "Cà", "Đỏ")
+    assert plan.named_entities == ("Hà Nội",)
     assert plan.objects == ("Người",)
     assert plan.actions == ("nói", "chạy")
     assert plan.attributes == ("Đỏ",)
@@ -435,7 +435,7 @@ def test_pipeline_propagates_batch_filters_and_returns_only_canonical_frames() -
 
     hits = pipeline.search(request, refine_raw=False)
 
-    assert encoder.calls == [request.original_text]
+    assert encoder.calls == ["Cà phê"]
     dense_query, dense_depth, dense_filter = dense_store.calls[0]
     assert dense_query == pytest.approx(np.asarray([0.6, 0.8], dtype=np.float32))
     assert dense_depth == 17
@@ -529,6 +529,49 @@ def test_pipeline_resolves_timestamped_text_segments_to_canonical_frames() -> No
 
     assert len(resolved_inputs) == 1
     assert [canonical_key(item) for item in hits] == [("L21_V001", 45)]
+
+
+def test_pipeline_enriches_existing_text_frame_identity_without_changing_rank_data() -> None:
+    resolved_inputs: list[dict[str, Any]] = []
+
+    def resolve(result: dict[str, Any]) -> dict[str, Any]:
+        resolved_inputs.append(result)
+        payload = dict(result["payload"])
+        payload.update(
+            {
+                "source_frame_idx": 0,
+                "timestamp_ms": 2_400,
+                "shot_id": "shot-canonical",
+                "keyframe_ordinal": 7,
+            }
+        )
+        return {**result, "payload": payload}
+
+    pipeline = TextualKISPipeline(frame_resolver=resolve, temporal_windows_ms=())
+    source = {
+        "rank": 3,
+        "score": 0.875,
+        "payload": {
+            "batch_id": "aic25-b1",
+            "video_id": "L21_V001",
+            "source_frame_idx": 0,
+            "timestamp_ms": 0,
+            "kind": "asr",
+            "segment_id": "asr:aic25-b1:L21_V001:0",
+            "text_raw": "xin chào",
+        },
+    }
+
+    (result,) = pipeline._resolve_results((source,))
+
+    assert resolved_inputs == [source]
+    assert result["rank"] == 3
+    assert result["score"] == 0.875
+    assert result["payload"]["source_frame_idx"] == 0
+    assert result["payload"]["timestamp_ms"] == 2_400
+    assert result["payload"]["shot_id"] == "shot-canonical"
+    assert result["payload"]["keyframe_ordinal"] == 7
+    assert result["payload"]["text_raw"] == "xin chào"
 
 
 def test_explicit_temporal_clauses_reach_raw_refinement_unchanged() -> None:

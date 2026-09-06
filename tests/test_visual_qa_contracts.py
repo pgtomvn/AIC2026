@@ -13,6 +13,7 @@ from src.contracts import (
     QAPrediction,
     QAQueryRequest,
     QAReasoningResult,
+    QASingleFrameAnswerRequest,
     resolve_qa_competition_spec,
 )
 from src.vlm.answer_normalizer import (
@@ -80,6 +81,35 @@ def test_qa_query_request_round_trip_and_defaults() -> None:
     with pytest.raises(ValueError, match="mode"):
         QAQueryRequest(
             "qa-1", "event", "question", mode="unsupported", reasoning_policy="local_only"
+        )
+
+
+def test_single_frame_manual_answer_contract_is_local_only() -> None:
+    request = QASingleFrameAnswerRequest(
+        candidate_id="b1:L21_V001:181",
+        question="Địa điểm này ở đâu?",
+        reasoning_policy="local_only",
+        answer_engine="manual",
+        manual_answer="xã Cam Hiệp Bắc",
+    )
+
+    assert QASingleFrameAnswerRequest.from_dict(request.to_dict()) == request
+    with pytest.raises(ValueError, match="local-only"):
+        QASingleFrameAnswerRequest(
+            candidate_id=request.candidate_id,
+            question=request.question,
+            reasoning_policy="gemini_then_local",
+            allow_external_frame_transfer=True,
+            answer_engine="manual",
+            manual_answer="answer",
+        )
+    with pytest.raises(ValueError, match="requires answer_engine=manual"):
+        QASingleFrameAnswerRequest(
+            candidate_id=request.candidate_id,
+            question=request.question,
+            reasoning_policy="local_only",
+            answer_engine="vlm",
+            manual_answer="answer",
         )
     with pytest.raises(ValueError, match="duplicates"):
         QAQueryRequest(

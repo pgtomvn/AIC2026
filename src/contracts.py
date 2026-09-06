@@ -17,9 +17,21 @@ from typing import Any, ClassVar, Literal, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator, model_validator
 
+from src.query.entity_extractor import (
+    MAX_ENTITIES_PER_TRAKE_QUERY,
+    EntityConstraint,
+    normalize_entity_constraints,
+)
+
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _KIND_RE = re.compile(r"^[a-z][a-z0-9_.-]*$")
 _QUERY_MODES = frozenset({"automatic", "interactive"})
+_KIS_QUERY_MODES = frozenset(
+    {"automatic", "interactive", "visual_only", "asr_only"}
+)
+_KIS_PRECISION_PROFILES = frozenset(
+    {"standard", "advanced", "experimental_cross_modal"}
+)
 _QA_ANSWER_NORMALIZATIONS = frozenset({"numeric", "general_text"})
 QA_HISTORICAL_NUMERIC_SPEC_ID = "aic-2024-visual-qa-numeric-v1"
 QA_GENERAL_TEXT_SPEC_ID = "aic-2026-visual-qa-general-text-provisional-v1"
@@ -341,16 +353,35 @@ class QueryRequest:
     negative_feedback_ids: tuple[str, ...] = ()
     query_language: str = "auto"
     english_text_override: str | None = None
+    entity_constraints: tuple[EntityConstraint, ...] = ()
+    refine_raw: bool = True
+    precision_profile: str = "standard"
 
     def __post_init__(self) -> None:
         _require_text(self.query_id, "query_id")
         _require_text(self.original_text, "original_text")
-        if self.mode not in _QUERY_MODES:
-            raise ValueError(f"mode must be one of {sorted(_QUERY_MODES)}")
+        if len(self.original_text) > 8_192:
+            raise ValueError("original_text cannot exceed 8192 Unicode code points")
+        if self.mode not in _KIS_QUERY_MODES:
+            raise ValueError(f"mode must be one of {sorted(_KIS_QUERY_MODES)}")
         if self.query_language not in {"auto", "vi", "en"}:
             raise ValueError("query_language must be auto, vi, or en")
         if self.english_text_override is not None:
             _require_text(self.english_text_override, "english_text_override")
+        object.__setattr__(
+            self,
+            "entity_constraints",
+            normalize_entity_constraints(self.entity_constraints),
+        )
+        if not isinstance(self.refine_raw, bool):
+            raise TypeError("refine_raw must be a boolean")
+        if not isinstance(self.precision_profile, str):
+            raise TypeError("precision_profile must be a string")
+        if self.precision_profile not in _KIS_PRECISION_PROFILES:
+            raise ValueError(
+                "precision_profile must be standard, advanced, or "
+                "experimental_cross_modal"
+            )
         _require_int(self.limit, "limit", minimum=1)
         if self.limit > 100:
             raise ValueError("limit cannot exceed the competition maximum of 100")
@@ -393,6 +424,7 @@ class QueryRequest:
             if getattr(self, name) is None:
                 continue
             result[name] = list(getattr(self, name))
+        result["entity_constraints"] = [asdict(value) for value in self.entity_constraints]
         return result
 
     @classmethod
@@ -416,6 +448,8 @@ class QAQueryRequest:
     allow_external_frame_transfer: bool = False
     query_language: str = "auto"
     event_description_en: str | None = None
+    transcript_context: tuple[str, ...] = ()
+    entity_constraints: tuple[EntityConstraint, ...] = ()
 
     def __post_init__(self) -> None:
         for name in ("query_id", "event_description", "question", "answer_spec_id"):
@@ -426,6 +460,17 @@ class QAQueryRequest:
             raise ValueError("query_language must be auto, vi, or en")
         if self.event_description_en is not None:
             _require_text(self.event_description_en, "event_description_en")
+        transcript_context = _as_string_tuple(
+            self.transcript_context, "transcript_context"
+        )
+        if len(transcript_context) > 200 or sum(map(len, transcript_context)) > 8_192:
+            raise ValueError("transcript_context exceeds its bounded prompt budget")
+        object.__setattr__(self, "transcript_context", transcript_context)
+        object.__setattr__(
+            self,
+            "entity_constraints",
+            normalize_entity_constraints(self.entity_constraints),
+        )
         if self.answer_spec_id not in _QA_SPEC_IDS:
             raise ValueError(f"unknown Visual Q&A answer_spec_id: {self.answer_spec_id!r}")
         if self.reasoning_policy not in {"gemini_then_local", "local_only"}:
@@ -449,6 +494,8 @@ class QAQueryRequest:
 
         result = asdict(self)
         result["batch_filters"] = list(self.batch_filters)
+        result["transcript_context"] = list(self.transcript_context)
+        result["entity_constraints"] = [asdict(value) for value in self.entity_constraints]
         return result
 
     @classmethod
@@ -468,6 +515,7 @@ class QACandidateRequest:
     top_k: int = 5
     query_language: str = "auto"
     event_description_en: str | None = None
+    entity_constraints: tuple[EntityConstraint, ...] = ()
 
     def __post_init__(self) -> None:
         _require_text(self.query_id, "query_id")
@@ -476,6 +524,11 @@ class QACandidateRequest:
             raise ValueError("query_language must be auto, vi, or en")
         if self.event_description_en is not None:
             _require_text(self.event_description_en, "event_description_en")
+        object.__setattr__(
+            self,
+            "entity_constraints",
+            normalize_entity_constraints(self.entity_constraints),
+        )
         filters = _as_string_tuple(self.batch_filters, "batch_filters")
         if len(filters) != len(set(filters)):
             raise ValueError("batch_filters must not contain duplicates")
@@ -483,17 +536,49 @@ class QACandidateRequest:
             raise ValueError("Visual Q&A retrieval requires exactly one batch")
         object.__setattr__(self, "batch_filters", filters)
         _require_int(self.top_k, "top_k", minimum=1)
-        if self.top_k > 20:
-            raise ValueError("top_k cannot exceed 20")
+        if self.top_k > 50:
+            raise ValueError("top_k cannot exceed 50")
 
     def to_dict(self) -> dict[str, Any]:
         result = asdict(self)
         result["batch_filters"] = list(self.batch_filters)
+        result["entity_constraints"] = [asdict(value) for value in self.entity_constraints]
         return result
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> QACandidateRequest:
         return cls(**dict(value))
+
+
+@dataclass(frozen=True, slots=True)
+class QAFrameInjectionRequest:
+    """Create a one-candidate QA session from an operator-selected canonical frame."""
+
+    query_id: str
+    batch_id: str
+    video_id: str
+    source_frame_idx: int
+    source: str
+    event_description: str
+
+    def __post_init__(self) -> None:
+        for name in ("query_id", "batch_id", "video_id", "event_description"):
+            _require_text(getattr(self, name), name)
+        _require_int(self.source_frame_idx, "source_frame_idx", minimum=0)
+        if self.source not in {"kis_bridge", "manual"}:
+            raise ValueError("source must be kis_bridge or manual")
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> QAFrameInjectionRequest:
+        data = dict(value)
+        if "frame_idx" in data or "frame_id" in data:
+            raise ValueError(
+                "ambiguous frame identifier is forbidden; use source_frame_idx"
+            )
+        return cls(**data)
 
 
 @dataclass(frozen=True, slots=True)
@@ -508,6 +593,7 @@ class QASingleFrameAnswerRequest:
     answer_engine: str = "vlm"
     florence_task: str | None = None
     florence_target_label: str | None = None
+    manual_answer: str | None = None
 
     def __post_init__(self) -> None:
         _require_text(self.candidate_id, "candidate_id")
@@ -523,9 +609,17 @@ class QASingleFrameAnswerRequest:
             and not self.allow_external_frame_transfer
         ):
             raise ValueError("Gemini requires external frame transfer consent")
-        if self.answer_engine not in {"vlm", "florence2"}:
-            raise ValueError("answer_engine must be vlm or florence2")
-        if self.answer_engine == "florence2":
+        if self.answer_engine not in {"vlm", "florence2", "manual"}:
+            raise ValueError("answer_engine must be vlm, florence2, or manual")
+        if self.answer_engine == "manual":
+            if self.reasoning_policy != "local_only" or self.allow_external_frame_transfer:
+                raise ValueError("manual answers must be local-only without frame transfer")
+            _require_text(self.manual_answer, "manual_answer")
+            if self.florence_task is not None or self.florence_target_label is not None:
+                raise ValueError("manual answers cannot include Florence task fields")
+        elif self.manual_answer is not None:
+            raise ValueError("manual_answer requires answer_engine=manual")
+        elif self.answer_engine == "florence2":
             if self.reasoning_policy != "local_only" or self.allow_external_frame_transfer:
                 raise ValueError("Florence-2 is an offline local-only answer engine")
             if self.florence_task not in {"ocr", "object_count"}:
@@ -1173,6 +1267,12 @@ class TRAKEStage(_TRAKEModel):
     stage_index: int = Field(ge=1, le=20, strict=True)
     description: str = Field(min_length=1)
     description_en: str | None = Field(default=None, min_length=1)
+    entity_constraints: tuple[EntityConstraint, ...] = ()
+
+    @field_validator("entity_constraints", mode="before")
+    @classmethod
+    def _validate_entity_constraints(cls, value: Any) -> tuple[EntityConstraint, ...]:
+        return normalize_entity_constraints(value)
 
 
 class TRAKEQueryRequest(_TRAKEModel):
@@ -1185,6 +1285,12 @@ class TRAKEQueryRequest(_TRAKEModel):
     top_k: int = Field(default=100, ge=1, le=100, strict=True)
     query_language: Literal["auto", "vi", "en"] = "auto"
     global_description_en: str | None = Field(default=None, min_length=1)
+    global_entity_constraints: tuple[EntityConstraint, ...] = ()
+
+    @field_validator("global_entity_constraints", mode="before")
+    @classmethod
+    def _validate_global_entity_constraints(cls, value: Any) -> tuple[EntityConstraint, ...]:
+        return normalize_entity_constraints(value)
 
     @field_validator("batch_filters")
     @classmethod
@@ -1201,6 +1307,13 @@ class TRAKEQueryRequest(_TRAKEModel):
         actual = tuple(stage.stage_index for stage in self.stages)
         if actual != expected:
             raise ValueError("stage_index values must be contiguous from 1 in input order")
+        total_entities = len(self.global_entity_constraints) + sum(
+            len(stage.entity_constraints) for stage in self.stages
+        )
+        if total_entities > MAX_ENTITIES_PER_TRAKE_QUERY:
+            raise ValueError(
+                f"TRAKE entity constraints cannot exceed {MAX_ENTITIES_PER_TRAKE_QUERY} entries"
+            )
         return self
 
     def resolve_batch(self, default_batch_id: str | None = None) -> str:

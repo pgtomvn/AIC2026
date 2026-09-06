@@ -8,6 +8,13 @@ from src.export.preflight import (
     BundleValidationIssue,
     validate_bundle_entries,
 )
+from src.export.staging_store import (
+    StagedEntry,
+    StagingRevisionConflict,
+    StagingSnapshot,
+    StagingStore,
+    StagingStoreError,
+)
 
 __all__ = [
     "BundleArtifact",
@@ -15,6 +22,11 @@ __all__ = [
     "BundleValidationContext",
     "BundleValidationError",
     "BundleValidationIssue",
+    "StagedEntry",
+    "StagingRevisionConflict",
+    "StagingSnapshot",
+    "StagingStore",
+    "StagingStoreError",
     "build_codabench_bundle",
     "validate_bundle_entries",
 ]

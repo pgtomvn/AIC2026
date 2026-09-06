@@ -11,6 +11,7 @@ import pytest
 from app.http_backend import BackendError, _safe_error, build_http_runtime
 from src.contracts import (
     QACompetitionSpec,
+    QAFrameInjectionRequest,
     QAQueryRequest,
     QASingleFrameAnswerRequest,
     QueryRequest,
@@ -106,7 +107,7 @@ def test_kis_adapter_serializes_feedback_ids_without_unknown_fields() -> None:
 
     search_payload = http.calls[1][2]["json"]
     refine_payload = http.calls[2][2]["json"]
-    assert "refine_raw" not in search_payload
+    assert search_payload["refine_raw"] is True
     assert refine_payload["positive_feedback_ids"] == ["L21_V001:10"]
     assert refine_payload["negative_feedback_ids"] == ["L21_V002:20"]
     assert context.pipeline.last_channel_statuses["organizer_clip"]["state"] == "ready"
@@ -123,6 +124,97 @@ def test_repository_uses_bounded_validation_api_for_export_membership() -> None:
     assert record is not None and record.timestamp_ms == 1_000
     validation_calls = [call for call in http.calls if call[1].endswith("/v1/frames/validate")]
     assert len(validation_calls) == 2
+
+
+class _NeighborsHTTP(_HTTP):
+    def request(self, method: str, url: str, **kwargs: Any) -> _Response:
+        if url.endswith("/v1/frames/b1/L21_V001/neighbors") and method == "GET":
+            self.calls.append((method, url, kwargs))
+            return _Response(
+                {
+                    "neighbors": [
+                        {
+                            "batch_id": "b1",
+                            "video_id": "L21_V001",
+                            "source_frame_idx": 12,
+                            "timestamp_ms": 1_250,
+                            "shot_id": "shot-1",
+                        }
+                    ]
+                }
+            )
+        return super().request(method, url, **kwargs)
+
+
+def test_repository_neighbors_uses_timestamp_route_and_bounded_parameters() -> None:
+    http = _NeighborsHTTP()
+    context = build_http_runtime("http://127.0.0.1:8080", http=http)
+
+    frames = context.artifact_repository.neighbors(
+        "b1",
+        "L21_V001",
+        1_250,
+        radius_ms=4_000,
+        limit=5,
+    )
+
+    assert [(frame.source_frame_idx, frame.timestamp_ms, frame.shot_id) for frame in frames] == [
+        (12, 1_250, "shot-1")
+    ]
+    method, url, kwargs = http.calls[-1]
+    assert method == "GET"
+    assert url.endswith("/v1/frames/b1/L21_V001/neighbors")
+    assert "/1250/neighbors" not in url
+    assert kwargs["params"] == {
+        "timestamp_ms": 1_250,
+        "radius_ms": 4_000,
+        "limit": 5,
+    }
+
+
+class _QAInjectionHTTP(_HTTP):
+    def request(self, method: str, url: str, **kwargs: Any) -> _Response:
+        if url.endswith("/v1/qa/inject") and method == "POST":
+            self.calls.append((method, url, kwargs))
+            return _Response(
+                {
+                    "search_id": "server-injected",
+                    "candidate_count": 1,
+                    "selected_candidate_id": "b1:L21_V001:10",
+                    "candidates": [
+                        {
+                            "candidate_id": "b1:L21_V001:10",
+                            "retrieval_rank": 1,
+                            "retrieval_score": 0.0,
+                            "batch_id": "b1",
+                            "video_id": "L21_V001",
+                            "source_frame_idx": 10,
+                            "timestamp_ms": 1_000,
+                            "shot_id": "shot-1",
+                            "channel_ranks": {},
+                            "evidence": {"origin": "kis_bridge"},
+                        }
+                    ],
+                    "predictions": [],
+                }
+            )
+        return super().request(method, url, **kwargs)
+
+
+def test_qa_thin_client_injects_frame_and_keeps_authoritative_search_id() -> None:
+    http = _QAInjectionHTTP()
+    context = build_http_runtime("http://127.0.0.1:8080", http=http)
+    request = QAFrameInjectionRequest(
+        "bridge", "b1", "L21_V001", 10, "kis_bridge", "a news presenter"
+    )
+
+    candidates = context.qa_pipeline.inject(request, session_id="client-correlation")
+
+    assert len(candidates) == 1
+    assert context.qa_pipeline.last_snapshot["session_id"] == "server-injected"
+    assert context.qa_pipeline.aliases["client-correlation"] == "server-injected"
+    assert http.calls[-1][2]["json"] == request.to_dict()
+    assert http.calls[-1][2]["timeout"] == (3, 30.0)
 
 
 def test_thin_client_warmup_poll_is_read_only_while_qwen_is_resident() -> None:
@@ -340,3 +432,50 @@ def test_thin_client_rejects_bundle_download_hash_mismatch() -> None:
     with pytest.raises(BackendError) as caught:
         context.create_submission_bundle({"mode": "current", "entries": [{}]})
     assert caught.value.code == "bundle_download_integrity_failed"
+
+
+class _StagingHTTP(_HTTP):
+    snapshot = {
+        "schema_version": 1,
+        "revision": 4,
+        "updated_at_utc": "2026-08-20T09:30:00Z",
+        "entries": {},
+    }
+
+    def request(self, method: str, url: str, **kwargs: Any) -> _Response:
+        if "/v1/submissions/staging" in url:
+            self.calls.append((method, url, kwargs))
+            return _Response(dict(self.snapshot))
+        return super().request(method, url, **kwargs)
+
+
+def test_thin_client_owns_staging_through_fastapi_only() -> None:
+    http = _StagingHTTP()
+    context = build_http_runtime("http://127.0.0.1:8080", http=http)
+
+    assert context.load_submission_staging()["revision"] == 4
+    context.stage_submission_entry(
+        {"expected_revision": 4, "batch_id": "b1", "entry": {}}
+    )
+    context.mutate_submission_rows(
+        "query-p1-15-qa.csv",
+        {"action": "delete", "expected_revision": 4, "rank": 1},
+    )
+    context.delete_submission_entry("query-p1-15-qa.csv", expected_revision=4)
+    context.clear_submission_staging(expected_revision=4)
+
+    staging_calls = [call for call in http.calls if "/v1/submissions/staging" in call[1]]
+    assert [call[0] for call in staging_calls] == [
+        "GET",
+        "POST",
+        "POST",
+        "DELETE",
+        "DELETE",
+    ]
+    assert staging_calls[2][1].endswith(
+        "/v1/submissions/staging/entries/query-p1-15-qa.csv/rows"
+    )
+    assert staging_calls[3][1].endswith(
+        "/v1/submissions/staging/entries/query-p1-15-qa.csv"
+    )
+    assert staging_calls[3][2]["params"] == {"expected_revision": 4}

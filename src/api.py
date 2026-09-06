@@ -10,9 +10,12 @@ import math
 import re
 import shutil
 import sys
+import time
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from datetime import datetime, timezone
+from inspect import Parameter, signature
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -22,11 +25,13 @@ from fastapi.responses import FileResponse, Response
 from PIL import Image, UnidentifiedImageError
 
 from src import PROJECT_ROOT
+from src.codabench_query_id import normalize_codabench_query_id
 from src.contracts import (
     CompetitionSpec,
     QACandidateFrame,
     QACandidateRequest,
     QACompetitionSpec,
+    QAFrameInjectionRequest,
     QAQueryRequest,
     QASingleFrameAnswerRequest,
     QueryRequest,
@@ -44,13 +49,32 @@ from src.export.preflight import (
     BundleEntry,
     BundleValidationContext,
     BundleValidationError,
+    validate_bundle_entries,
+)
+from src.export.staging_store import (
+    StagedEntry,
+    StagingRevisionConflict,
+    StagingStore,
+    StagingStoreError,
 )
 from src.qa_submission import QASubmissionValidationError, export_qa_submission
+from src.query.translator import normalize_query_text
 from src.readiness import aggregate_channel_health
 from src.retrieval.qa_session import QASessionStoreError
 from src.retrieval.trake_router import TRAKENotReadyError
-from src.retrieval.visual_qa import QACandidateMediaUnavailableError
+from src.retrieval.visual_qa import (
+    QACandidateMediaUnavailableError,
+    QACandidateNotCanonicalError,
+    QACandidateOutsideSessionError,
+    QAInjectedFrameNotFoundError,
+    QAManualAnswerValidationError,
+)
 from src.runtime import RuntimeContext, build_runtime
+from src.runtime_contract import (
+    RUNTIME_CONTRACT_FEATURES,
+    RUNTIME_CONTRACT_VERSION,
+    source_contract_fingerprint,
+)
 from src.submission import FrameIndexEvidence, SubmissionValidationError, export_submission
 from src.trake_submission import (
     TRAKEFrameIndexEvidence,
@@ -58,6 +82,7 @@ from src.trake_submission import (
     export_trake_submission,
 )
 from src.utils.io_helpers import sanitize_launch_identity
+from src.utils.logger import record_application_error
 from src.vlm.qa_reasoner import QAImage, QAReasonerError
 
 _SAFE_FILENAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
@@ -376,7 +401,11 @@ def _require_qa_policy_usable(
     usable = local if request.reasoning_policy == "local_only" else local or gemini
     if usable:
         return
-    code = "ollama_unavailable" if request.reasoning_policy == "local_only" else "qa_all_providers_failed"
+    code = (
+        "ollama_unavailable"
+        if request.reasoning_policy == "local_only"
+        else "qa_all_providers_failed"
+    )
     raise HTTPException(status_code=503, detail={"code": code})
 
 
@@ -495,7 +524,7 @@ def _safe_hit_evidence(value: Any) -> dict[str, Any]:
         rank = raw.get("rank")
         if isinstance(rank, int) and not isinstance(rank, bool) and rank >= 1:
             item["rank"] = rank
-        for name in ("raw_score", "sample_fps", "radius_seconds"):
+        for name in ("raw_score", "score", "sample_fps", "radius_seconds"):
             number = raw.get(name)
             if isinstance(number, (int, float)) and not isinstance(number, bool):
                 number = float(number)
@@ -507,9 +536,117 @@ def _safe_hit_evidence(value: Any) -> dict[str, Any]:
         polygons = _safe_polygon_values(raw.get("polygons"))
         if polygons is not None:
             item["polygons"] = polygons
+        raw_matches = raw.get("entity_matches")
+        if isinstance(raw_matches, (list, tuple)):
+            matches: list[dict[str, Any]] = []
+            for raw_match in raw_matches[:16]:
+                if not isinstance(raw_match, Mapping):
+                    continue
+                text_value = raw_match.get("text")
+                category = _safe_identifier(raw_match.get("category"))
+                mode = _safe_identifier(raw_match.get("mode"))
+                channel = _safe_identifier(raw_match.get("channel"))
+                if not isinstance(text_value, str) or not text_value.strip():
+                    continue
+                match = {"text": text_value.strip()[:128]}
+                if category in {"location", "person", "organization"}:
+                    match["category"] = category
+                if mode in {"optional", "required"}:
+                    match["mode"] = mode
+                if channel is not None:
+                    match["channel"] = channel
+                matches.append(match)
+            if matches:
+                item["entity_matches"] = matches
+        raw_constraints = raw.get("constraints")
+        if isinstance(raw_constraints, (list, tuple)):
+            constraints: list[dict[str, Any]] = []
+            for raw_constraint in raw_constraints[:16]:
+                if not isinstance(raw_constraint, Mapping):
+                    continue
+                constraint: dict[str, Any] = {}
+                for name in (
+                    "relation", "zone", "color", "state", "scope", "verification_type"
+                ):
+                    safe = _safe_identifier(raw_constraint.get(name))
+                    if safe is not None:
+                        constraint[name] = safe
+                for source_name, target_name in (
+                    ("subject", "subject"),
+                    ("object_subject", "object"),
+                    ("second_object_subject", "second_object"),
+                ):
+                    text_value = raw_constraint.get(source_name)
+                    if isinstance(text_value, str) and text_value.strip():
+                        constraint[target_name] = text_value.strip()[:128]
+                for name in ("satisfied", "negated", "perspective_proxy"):
+                    boolean = raw_constraint.get(name)
+                    if isinstance(boolean, bool):
+                        constraint[name] = boolean
+                arity = raw_constraint.get("arity")
+                if arity in {2, 3}:
+                    constraint["arity"] = arity
+                labels = raw_constraint.get("matched_labels")
+                if isinstance(labels, (list, tuple)):
+                    safe_labels = [
+                        value.strip()[:128]
+                        for value in labels[:8]
+                        if isinstance(value, str) and value.strip()
+                    ]
+                    if safe_labels:
+                        constraint["matched_labels"] = safe_labels
+                for name in ("score", "ratio"):
+                    number = raw_constraint.get(name)
+                    if isinstance(number, (int, float)) and not isinstance(number, bool):
+                        if math.isfinite(float(number)) and 0.0 <= float(number) <= 1.0:
+                            constraint[name] = round(float(number), 6)
+                if constraint:
+                    constraints.append(constraint)
+            if constraints:
+                item["constraints"] = constraints
+        matched = raw.get("matched")
+        if isinstance(matched, bool):
+            item["matched"] = matched
         if item:
             items.append(item)
     return {"items": items}
+
+
+def _safe_frame_neighbor(frame: Any, *, offset: int | None = None) -> dict[str, Any]:
+    """Project frame metadata without exposing local media URIs."""
+
+    batch_id = str(getattr(frame, "batch_id", "")).strip()
+    video_id = str(getattr(frame, "video_id", "")).strip()
+    if not _SAFE_FRAME_IDENTIFIER.fullmatch(batch_id) or not _SAFE_FRAME_IDENTIFIER.fullmatch(
+        video_id
+    ):
+        raise ValueError("frame identity is invalid")
+    source_frame_idx = int(getattr(frame, "source_frame_idx"))
+    timestamp_ms = int(getattr(frame, "timestamp_ms"))
+    if source_frame_idx < 0 or timestamp_ms < 0:
+        raise ValueError("frame coordinates are invalid")
+    raw_shot = str(getattr(frame, "shot_id", "")).strip()
+    shot_id = (
+        raw_shot
+        if raw_shot and _SAFE_OPERATIONAL_IDENTIFIER.fullmatch(raw_shot)
+        else f"frame:{source_frame_idx}"
+    )
+    result: dict[str, Any] = {
+        "batch_id": batch_id,
+        "video_id": video_id,
+        "source_frame_idx": source_frame_idx,
+        "timestamp_ms": timestamp_ms,
+        "shot_id": shot_id,
+        "thumbnail_url": (
+            f"/v1/frames/{batch_id}/{video_id}/{source_frame_idx}/image"
+        ),
+    }
+    if offset is not None:
+        if isinstance(offset, bool) or not isinstance(offset, int) or not -5 <= offset <= 5:
+            raise ValueError("frame offset is invalid")
+        result["offset"] = offset
+    return result
+
 
 
 def _public_hits(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -521,7 +658,17 @@ def _public_hits(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
         video_id = raw_video_id if _SAFE_FRAME_IDENTIFIER.fullmatch(raw_video_id) else None
         if video_id is None:
             continue
-        source_frame_idx = int(item["source_frame_idx"])
+        raw_source_frame_idx = item.get("source_frame_idx")
+        if isinstance(raw_source_frame_idx, bool) or not isinstance(
+            raw_source_frame_idx, (int, str)
+        ):
+            continue
+        try:
+            source_frame_idx = int(raw_source_frame_idx)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if source_frame_idx < 0:
+            continue
         raw_batch_id = item.get("batch_id")
         batch_id = (
             raw_batch_id.strip()
@@ -558,17 +705,32 @@ def _public_hits(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
             and _SAFE_OPERATIONAL_IDENTIFIER.fullmatch(raw_shot_id.strip())
             else f"frame:{source_frame_idx}"
         )
-        hit = SearchHit(
-            rank=len(result) + 1,
-            video_id=video_id,
-            source_frame_idx=source_frame_idx,
-            timestamp_ms=int(item.get("timestamp_ms", 0)),
-            shot_id=shot_id,
-            fused_score=float(item.get("fused_score", item.get("score", 0.0))),
-            thumbnail_uri=thumbnail_uri,
-            channel_ranks=channel_ranks,
-            evidence=_safe_hit_evidence(item.get("evidence", ())),
-        )
+        try:
+            timestamp_ms = int(item.get("timestamp_ms") or 0)
+        except (TypeError, ValueError, OverflowError):
+            timestamp_ms = 0
+        if timestamp_ms < 0:
+            timestamp_ms = 0
+        try:
+            fused_score = float(item.get("fused_score", item.get("score", 0.0)) or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            fused_score = 0.0
+        if not math.isfinite(fused_score):
+            fused_score = 0.0
+        try:
+            hit = SearchHit(
+                rank=len(result) + 1,
+                video_id=video_id,
+                source_frame_idx=source_frame_idx,
+                timestamp_ms=timestamp_ms,
+                shot_id=shot_id,
+                fused_score=fused_score,
+                thumbnail_uri=thumbnail_uri,
+                channel_ranks=channel_ranks,
+                evidence=_safe_hit_evidence(item.get("evidence", ())),
+            )
+        except (TypeError, ValueError):
+            continue
         public = hit.to_dict()
         public["frame_semantics"] = "source_frame_idx"
         if batch_id is not None:
@@ -581,12 +743,65 @@ def _public_hits(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 and field_value >= 0
             ):
                 public[field] = field_value
+        for field in (
+            "spatial_rerank_state",
+            "relation_rerank_state",
+            "negation_rerank_state",
+            "color_rerank_state",
+            "cross_modal_rerank_state",
+        ):
+            state = _safe_identifier(item.get(field))
+            if state is not None:
+                public[field] = state
+        for score_name in ("spatial_score", "relation_score", "color_score", "cross_modal_score"):
+            score_value = item.get(score_name)
+            if (
+                isinstance(score_value, (int, float))
+                and not isinstance(score_value, bool)
+                and math.isfinite(float(score_value))
+                and 0.0 <= float(score_value) <= 1.0
+            ):
+                public[score_name] = round(float(score_value), 6)
+        for penalty_name in (
+            "color_penalty_applied",
+            "color_reward_applied",
+            "negation_penalty_applied",
+            "tier2_penalty_applied",
+        ):
+            penalty = item.get(penalty_name)
+            if isinstance(penalty, bool):
+                public[penalty_name] = penalty
+        rank_delta = item.get("advanced_rank_delta")
+        if (
+            isinstance(rank_delta, int)
+            and not isinstance(rank_delta, bool)
+            and -99 <= rank_delta <= 99
+        ):
+            public["advanced_rank_delta"] = rank_delta
+
+        inconclusive_reason = _safe_identifier(
+            item.get("verification_inconclusive_reason")
+        )
+        if inconclusive_reason is not None:
+            public["verification_inconclusive_reason"] = inconclusive_reason
+
+
         result.append(public)
     return result
 
 
 def _search_payload(context: RuntimeContext, request: QueryRequest) -> dict[str, Any]:
-    hits = context.pipeline.search(request, limit=request.limit)
+    search_method = context.pipeline.search
+    try:
+        parameters = tuple(signature(search_method).parameters.values())
+        names = {value.name for value in parameters}
+        supports_kwargs = any(value.kind is Parameter.VAR_KEYWORD for value in parameters)
+    except (TypeError, ValueError):
+        names, supports_kwargs = set(), False
+    kwargs: dict[str, Any] = {"limit": request.limit}
+    if supports_kwargs or "refine_raw" in names:
+        kwargs["refine_raw"] = request.refine_raw
+    hits = search_method(request, **kwargs)
     raw_errors = getattr(context.pipeline, "last_channel_errors", {})
     statuses = getattr(context.pipeline, "last_channel_statuses", {})
     safe_errors: dict[str, str] = {}
@@ -1249,7 +1464,17 @@ def _safe_channel_statuses(value: Any) -> dict[str, dict[str, Any]]:
             status["state"] = raw_status["state"]
         if raw_status.get("applicability") in _QA_CHANNEL_APPLICABILITY:
             status["applicability"] = raw_status["applicability"]
-        for field in ("reason_code", "collection_name", "index_name", "remediation_id"):
+        for field in (
+            "reason_code",
+            "collection_name",
+            "index_name",
+            "remediation_id",
+            "query_text_source",
+            "source_channel",
+            "cache_state",
+            "cache_source",
+            "cache_fingerprint",
+        ):
             item = _safe_identifier(raw_status.get(field))
             if item is not None:
                 status[field] = item
@@ -1264,6 +1489,11 @@ def _safe_channel_statuses(value: Any) -> dict[str, dict[str, Any]]:
             "dropped_tokens",
             "query_variant_count",
             "result_count",
+            "expected_count",
+            "candidate_video_count",
+            "scored_video_count",
+            "cache_video_count",
+            "cache_frame_count",
         ):
             item = raw_status.get(field)
             if isinstance(item, int) and not isinstance(item, bool) and item >= 0:
@@ -1298,11 +1528,18 @@ def _safe_query_processing(value: Any) -> dict[str, Any]:
         "translation_source",
         "translation_cache",
         "failure_code",
+        "intent",
+        "precision_profile",
     ):
         item = _safe_identifier(value.get(field))
         if item is not None:
             result[field] = item
-    for field in ("english_text", "original_text", "normalized_text"):
+    for field in (
+        "english_text",
+        "original_text",
+        "normalized_text",
+        "visual_description_en",
+    ):
         item = value.get(field)
         if isinstance(item, str) and item:
             result[field] = item[:4096]
@@ -1316,10 +1553,510 @@ def _safe_query_processing(value: Any) -> dict[str, Any]:
     applied = value.get("translation_applied")
     if isinstance(applied, bool):
         result["translation_applied"] = applied
-    for field in ("prompt_count", "translated_prompt_count"):
+    for field in ("candidate_rescue", "video_local"):
+        raw_stage = value.get(field)
+        if not isinstance(raw_stage, Mapping):
+            continue
+        stage: dict[str, Any] = {}
+        for key in (
+            "mode",
+            "reason_code",
+            "source_channel",
+            "cache_state",
+            "cache_source",
+            "cache_fingerprint",
+        ):
+            selected = _safe_identifier(raw_stage.get(key))
+            if selected is not None:
+                stage[key] = selected
+        for key in ("triggered", "applied"):
+            selected = raw_stage.get(key)
+            if isinstance(selected, bool):
+                stage[key] = selected
+        for key in (
+            "candidate_video_count",
+            "scored_video_count",
+            "result_count",
+            "overfetch_result_count",
+            "grouped_result_count",
+            "cache_video_count",
+            "cache_frame_count",
+        ):
+            selected = raw_stage.get(key)
+            if isinstance(selected, int) and not isinstance(selected, bool) and selected >= 0:
+                stage[key] = selected
+        latency = raw_stage.get("latency_ms")
+        if (
+            isinstance(latency, (int, float))
+            and not isinstance(latency, bool)
+            and math.isfinite(float(latency))
+            and 0 <= float(latency) <= 600_000
+        ):
+            stage["latency_ms"] = round(float(latency), 3)
+        concentration = raw_stage.get("concentration")
+        if isinstance(concentration, Mapping):
+            safe_concentration: dict[str, int | float] = {}
+            for key in ("sample_count", "unique_videos"):
+                selected = concentration.get(key)
+                if isinstance(selected, int) and not isinstance(selected, bool) and selected >= 0:
+                    safe_concentration[key] = selected
+            for key in ("top_video_share", "video_hhi"):
+                selected = concentration.get(key)
+                if (
+                    isinstance(selected, (int, float))
+                    and not isinstance(selected, bool)
+                    and math.isfinite(float(selected))
+                    and 0 <= float(selected) <= 1
+                ):
+                    safe_concentration[key] = round(float(selected), 6)
+            if safe_concentration:
+                stage["concentration"] = safe_concentration
+        reasons = raw_stage.get("trigger_reasons")
+        if isinstance(reasons, (list, tuple)):
+            safe_reasons = [
+                reason
+                for value in reasons[:8]
+                if (reason := _safe_identifier(value)) is not None
+            ]
+            if safe_reasons:
+                stage["trigger_reasons"] = safe_reasons
+        if stage:
+            result[field] = stage
+    raw_ocr_quality = value.get("ocr_quality")
+    if isinstance(raw_ocr_quality, Mapping):
+        ocr_quality: dict[str, Any] = {}
+        mode = _safe_identifier(raw_ocr_quality.get("mode"))
+        if mode is not None:
+            ocr_quality["mode"] = mode
+        for key in ("applied",):
+            selected = raw_ocr_quality.get(key)
+            if isinstance(selected, bool):
+                ocr_quality[key] = selected
+        for key in ("candidate_count", "feature_count", "quoted_text_exemptions"):
+            selected = raw_ocr_quality.get(key)
+            if isinstance(selected, int) and not isinstance(selected, bool) and selected >= 0:
+                ocr_quality[key] = selected
+        if ocr_quality:
+            result["ocr_quality"] = ocr_quality
+    raw_asr_gate = value.get("asr_gate")
+    if isinstance(raw_asr_gate, Mapping):
+        asr_gate: dict[str, Any] = {}
+        source = _safe_identifier(raw_asr_gate.get("query_text_source"))
+        if source is not None:
+            asr_gate["query_text_source"] = source
+        for key in ("enabled", "forced", "suppressed", "intent_detected"):
+            selected = raw_asr_gate.get(key)
+            if isinstance(selected, bool):
+                asr_gate[key] = selected
+        query = raw_asr_gate.get("query")
+        if isinstance(query, str) and query:
+            asr_gate["query"] = query[:4096]
+        max_weight = raw_asr_gate.get("max_weight")
+        if (
+            isinstance(max_weight, (int, float))
+            and not isinstance(max_weight, bool)
+            and math.isfinite(float(max_weight))
+            and 0 <= float(max_weight) <= 1
+        ):
+            asr_gate["max_weight"] = round(float(max_weight), 6)
+        if asr_gate:
+            result["asr_gate"] = asr_gate
+    for field in (
+        "prompt_count",
+        "translated_prompt_count",
+        "spatial_constraint_count",
+        "color_constraint_count",
+        "relative_constraint_count",
+        "negation_constraint_count",
+        "unsupported_relation_count",
+        "ambiguous_relation_count",
+        "bound_constraint_count",
+        "effective_rrf_k",
+        "semantic_view_count",
+    ):
+        item = value.get(field)
+        if isinstance(item, int) and not isinstance(item, bool) and 0 <= item <= 100:
+            result[field] = item
+    raw_semantic_views = value.get("semantic_views")
+    if isinstance(raw_semantic_views, Mapping):
+        safe_views: dict[str, list[dict[str, str]]] = {}
+        for language in ("vi", "en"):
+            raw_views = raw_semantic_views.get(language)
+            if not isinstance(raw_views, (list, tuple)):
+                continue
+            values: list[dict[str, str]] = []
+            for raw_view in raw_views[:4]:
+                if not isinstance(raw_view, Mapping):
+                    continue
+                role = _safe_identifier(raw_view.get("role"))
+                text_value = raw_view.get("text")
+                if role in {
+                    "global", "action", "foreground_subject", "distinctive_attributes"
+                } and isinstance(text_value, str) and text_value.strip():
+                    values.append({"role": role, "text": text_value.strip()[:1024]})
+            if values:
+                safe_views[language] = values
+        if safe_views:
+            result["semantic_views"] = safe_views
+    raw_cues = value.get("parenthetical_cues")
+    if isinstance(raw_cues, (list, tuple)):
+        cues: list[dict[str, str]] = []
+        for raw_cue in raw_cues[:16]:
+            if not isinstance(raw_cue, Mapping):
+                continue
+            text_value = raw_cue.get("text")
+            language = _safe_identifier(raw_cue.get("language"))
+            if isinstance(text_value, str) and text_value.strip() and language in {
+                "vi", "en", "unknown"
+            }:
+                cues.append({"text": text_value.strip()[:256], "language": language})
+        if cues:
+            result["parenthetical_cues"] = cues
+    raw_aliases = value.get("lexical_aliases")
+    if isinstance(raw_aliases, (list, tuple)):
+        aliases = [
+            alias.strip()[:256]
+            for alias in raw_aliases[:16]
+            if isinstance(alias, str) and alias.strip()
+        ]
+        if aliases:
+            result["lexical_aliases"] = aliases
+    for field in ("required_entity_count", "matched_entity_count"):
         item = value.get(field)
         if isinstance(item, int) and not isinstance(item, bool) and 0 <= item <= 64:
             result[field] = item
+    for field in ("entity_boost_enabled",):
+        item = value.get(field)
+        if isinstance(item, bool):
+            result[field] = item
+    for field in ("entity_bonus_normalized",):
+        item = value.get(field)
+        if isinstance(item, (int, float)) and not isinstance(item, bool) and math.isfinite(float(item)):
+            result[field] = round(float(item), 9)
+    raw_rank_trace = value.get("rank_trace")
+    if isinstance(raw_rank_trace, Mapping):
+        safe_trace: dict[str, list[dict[str, Any]]] = {}
+        allowed_stages = {
+            "tier1_fusion", "metadata", "entity_policy", "tier2",
+            "raw_refinement", "diversity",
+        }
+        for raw_stage, raw_rows in raw_rank_trace.items():
+            stage = _safe_identifier(raw_stage)
+            if stage not in allowed_stages or not isinstance(raw_rows, (list, tuple)):
+                continue
+            rows: list[dict[str, Any]] = []
+            for raw_row in raw_rows[:20]:
+                if not isinstance(raw_row, Mapping):
+                    continue
+                video_id = raw_row.get("video_id")
+                rank = raw_row.get("rank")
+                frame_idx = raw_row.get("source_frame_idx")
+                score = raw_row.get("score")
+                if (
+                    not isinstance(video_id, str)
+                    or not _SAFE_FRAME_IDENTIFIER.fullmatch(video_id)
+                    or not isinstance(rank, int)
+                    or isinstance(rank, bool)
+                    or not 1 <= rank <= 100
+                    or not isinstance(frame_idx, int)
+                    or isinstance(frame_idx, bool)
+                    or frame_idx < 0
+                    or not isinstance(score, (int, float))
+                    or isinstance(score, bool)
+                    or not math.isfinite(float(score))
+                ):
+                    continue
+                rows.append(
+                    {
+                        "rank": rank,
+                        "video_id": video_id,
+                        "source_frame_idx": frame_idx,
+                        "score": round(float(score), 12),
+                    }
+                )
+            if rows:
+                safe_trace[stage] = rows
+        if safe_trace:
+            result["rank_trace"] = safe_trace
+    raw_deltas = value.get("stage_rank_delta")
+    if isinstance(raw_deltas, (list, tuple)):
+        safe_deltas: list[dict[str, Any]] = []
+        for raw_delta in raw_deltas[:20]:
+            if not isinstance(raw_delta, Mapping):
+                continue
+            video_id = raw_delta.get("video_id")
+            frame_idx = raw_delta.get("source_frame_idx")
+            initial_rank = raw_delta.get("initial_rank")
+            if (
+                not isinstance(video_id, str)
+                or not _SAFE_FRAME_IDENTIFIER.fullmatch(video_id)
+                or not isinstance(frame_idx, int)
+                or isinstance(frame_idx, bool)
+                or frame_idx < 0
+                or not isinstance(initial_rank, int)
+                or isinstance(initial_rank, bool)
+                or not 1 <= initial_rank <= 100
+            ):
+                continue
+            item: dict[str, Any] = {
+                "video_id": video_id,
+                "source_frame_idx": frame_idx,
+                "initial_rank": initial_rank,
+            }
+            for source, target in (
+                (raw_delta.get("stage_ranks"), "stage_ranks"),
+                (raw_delta.get("stage_rank_delta"), "stage_rank_delta"),
+            ):
+                if not isinstance(source, Mapping):
+                    continue
+                values: dict[str, int] = {}
+                for raw_stage, raw_value in source.items():
+                    stage = _safe_identifier(raw_stage)
+                    if (
+                        stage in {
+                            "tier1_fusion", "metadata", "entity_policy", "tier2",
+                            "raw_refinement", "diversity",
+                        }
+                        and isinstance(raw_value, int)
+                        and not isinstance(raw_value, bool)
+                        and -100 <= raw_value <= 100
+                    ):
+                        values[stage] = raw_value
+                if values:
+                    item[target] = values
+            safe_deltas.append(item)
+        if safe_deltas:
+            result["stage_rank_delta"] = safe_deltas
+    status = _safe_identifier(value.get("required_entity_status"))
+    if status is not None:
+        result["required_entity_status"] = status
+    weights = value.get("effective_channel_weights")
+    if isinstance(weights, Mapping):
+        safe_weights: dict[str, float] = {}
+        for raw_name, raw_weight in weights.items():
+            name = _safe_identifier(str(raw_name))
+            if (
+                name is not None
+                and isinstance(raw_weight, (int, float))
+                and not isinstance(raw_weight, bool)
+                and math.isfinite(float(raw_weight))
+                and 0.0 <= float(raw_weight) <= 1.0
+            ):
+                safe_weights[name] = round(float(raw_weight), 6)
+        if safe_weights:
+            result["effective_channel_weights"] = safe_weights
+    for field, allowed in (
+        ("spatial_constraints", {"left", "right", "center", "top", "bottom"}),
+        (
+            "color_constraints",
+            {"red", "blue", "yellow", "green", "black", "white", "pink", "purple"},
+        ),
+    ):
+        raw_constraints = value.get(field)
+        if not isinstance(raw_constraints, (list, tuple)):
+            continue
+        constraints: list[dict[str, Any]] = []
+        for raw_constraint in raw_constraints[:16]:
+            if not isinstance(raw_constraint, Mapping):
+                continue
+            constraint: dict[str, Any] = {}
+            subject = raw_constraint.get("subject")
+            if isinstance(subject, str) and subject.strip():
+                constraint["subject"] = subject.strip()[:128]
+            key = "zone" if field == "spatial_constraints" else "color"
+            selected = _safe_identifier(raw_constraint.get(key))
+            if selected in allowed:
+                constraint[key] = selected
+            bound = raw_constraint.get("bound")
+            if isinstance(bound, bool):
+                constraint["bound"] = bound
+            proxy = raw_constraint.get("perspective_proxy")
+            if field == "spatial_constraints" and isinstance(proxy, bool):
+                constraint["perspective_proxy"] = proxy
+            if key in constraint:
+                constraints.append(constraint)
+        if constraints:
+            result[field] = constraints
+    raw_relations = value.get("relative_constraints")
+    if isinstance(raw_relations, (list, tuple)):
+        relations: list[dict[str, Any]] = []
+        for raw in raw_relations[:16]:
+            if not isinstance(raw, Mapping):
+                continue
+            relation = _safe_identifier(raw.get("relation"))
+            if relation not in {
+                "left_of", "right_of", "above", "below", "near", "far_from",
+                "inside", "surrounding", "overlapping", "between",
+                "in_front_of", "behind",
+            }:
+                continue
+            item = {"relation": relation, "bound": bool(raw.get("bound"))}
+            arity = raw.get("arity")
+            if arity in {2, 3}:
+                item["arity"] = arity
+            verification_type = _safe_identifier(raw.get("verification_type"))
+            if verification_type in {"geometry", "heuristic_2d"}:
+                item["verification_type"] = verification_type
+            for source_name, target_name in (
+                ("subject", "subject"),
+                ("object_subject", "object"),
+                ("second_object_subject", "second_object"),
+            ):
+                text_value = raw.get(source_name)
+                if isinstance(text_value, str) and text_value.strip():
+                    item[target_name] = text_value.strip()[:128]
+            relations.append(item)
+        if relations:
+            result["relative_constraints"] = relations
+    raw_negations = value.get("negation_constraints")
+    if isinstance(raw_negations, (list, tuple)):
+        negations: list[dict[str, Any]] = []
+        for raw in raw_negations[:16]:
+            if not isinstance(raw, Mapping):
+                continue
+            subject = raw.get("subject")
+            if not isinstance(subject, str) or not subject.strip():
+                continue
+            item = {"subject": subject.strip()[:128], "bound": bool(raw.get("bound"))}
+            color = _safe_identifier(raw.get("color"))
+            if color in {"red", "blue", "yellow", "green", "black", "white", "pink", "purple"}:
+                item["color"] = color
+            negations.append(item)
+        if negations:
+            result["negation_constraints"] = negations
+    raw_ambiguous = value.get("ambiguous_relations")
+    if isinstance(raw_ambiguous, (list, tuple)):
+        ambiguous = []
+        for raw in raw_ambiguous[:16]:
+            if not isinstance(raw, Mapping):
+                continue
+            relation = _safe_identifier(raw.get("relation"))
+            reason = _safe_identifier(raw.get("reason"))
+            if relation == "between" and reason == "requires_two_anchors":
+                ambiguous.append({"relation": relation, "reason": reason})
+        if ambiguous:
+            result["ambiguous_relations"] = ambiguous
+    raw_unsupported = value.get("unsupported_relations")
+    if isinstance(raw_unsupported, (list, tuple)):
+        unsupported = []
+        for raw in raw_unsupported[:16]:
+            if isinstance(raw, Mapping):
+                relation = _safe_identifier(raw.get("relation"))
+                if relation in {"near", "ahead_of", "behind"}:
+                    unsupported.append({"relation": relation})
+        if unsupported:
+            result["unsupported_relations"] = unsupported
+
+    advanced = value.get("advanced_rerank")
+    if isinstance(advanced, Mapping):
+        safe_advanced: dict[str, Any] = {}
+        state = _safe_identifier(advanced.get("state"))
+        if state is not None:
+            safe_advanced["state"] = state
+        for field in ("precision_profile", "deadline_phase"):
+            item = _safe_identifier(advanced.get(field))
+            if item is not None:
+                safe_advanced[field] = item
+        for field in (
+            "processed_candidate_count",
+            "spatial_candidates",
+            "spatial_verified",
+            "relation_candidates",
+            "relation_verified",
+            "negation_candidates",
+            "negation_verified",
+            "color_candidates",
+            "color_verified",
+        ):
+            item = advanced.get(field)
+            if isinstance(item, int) and not isinstance(item, bool) and 0 <= item <= 100:
+                safe_advanced[field] = item
+        for field in (
+            "deadline_budget_ms",
+            "spatial_latency_ms", "relation_latency_ms", "geometry_latency_ms",
+            "negation_latency_ms", "color_latency_ms", "total_latency_ms",
+        ):
+            item = advanced.get(field)
+            if (
+                isinstance(item, (int, float))
+                and not isinstance(item, bool)
+                and 0 <= float(item) <= 600_000
+            ):
+                safe_advanced[field] = round(float(item), 3)
+        for cache_name in ("object_cache", "color_cache"):
+            raw_cache = advanced.get(cache_name)
+            if not isinstance(raw_cache, Mapping):
+                continue
+            cache: dict[str, Any] = {}
+            cache_state = _safe_identifier(raw_cache.get("archive_state"))
+            if cache_state is not None:
+                cache["archive_state"] = cache_state
+            for field in (
+                "archive_members", "cache_entries", "cache_bytes",
+                "cache_hits", "cache_misses",
+            ):
+                item = raw_cache.get(field)
+                if (
+                    isinstance(item, int)
+                    and not isinstance(item, bool)
+                    and 0 <= item <= 100_000_000
+                ):
+                    cache[field] = item
+            open_ms = raw_cache.get("archive_open_ms")
+            if isinstance(open_ms, (int, float)) and not isinstance(open_ms, bool):
+                if math.isfinite(float(open_ms)) and 0 <= float(open_ms) <= 600_000:
+                    cache["archive_open_ms"] = round(float(open_ms), 3)
+            if cache:
+                safe_advanced[cache_name] = cache
+        if safe_advanced:
+            result["advanced_rerank"] = safe_advanced
+
+    cross_modal = value.get("cross_modal_rerank")
+    if isinstance(cross_modal, Mapping):
+        safe_cross: dict[str, Any] = {}
+        for field in ("state", "reason_code", "channel", "calibration"):
+            item = _safe_identifier(cross_modal.get(field))
+            if item is not None:
+                safe_cross[field] = item
+        for field in ("candidate_count", "crop_count"):
+            item = cross_modal.get(field)
+            if isinstance(item, int) and not isinstance(item, bool) and 0 <= item <= 100:
+                safe_cross[field] = item
+        latency_value = cross_modal.get("latency_ms")
+        if isinstance(latency_value, (int, float)) and not isinstance(latency_value, bool):
+            if math.isfinite(float(latency_value)) and 0 <= float(latency_value) <= 600_000:
+                safe_cross["latency_ms"] = round(float(latency_value), 3)
+        if safe_cross:
+            result["cross_modal_rerank"] = safe_cross
+
+    entities = value.get("entities")
+    if isinstance(entities, (list, tuple)):
+        safe_entities: list[dict[str, Any]] = []
+        for raw_entity in entities[:64]:
+            if not isinstance(raw_entity, Mapping):
+                continue
+            text_value = raw_entity.get("text")
+            if not isinstance(text_value, str) or not text_value.strip():
+                continue
+            category = _safe_identifier(raw_entity.get("category"))
+            mode = _safe_identifier(raw_entity.get("mode"))
+            source = _safe_identifier(raw_entity.get("source"))
+            entity: dict[str, Any] = {"text": text_value.strip()[:128]}
+            if category in {"location", "person", "organization"}:
+                entity["category"] = category
+            if mode in {"optional", "required"}:
+                entity["mode"] = mode
+            if source is not None:
+                entity["source"] = source
+            prompt_index = raw_entity.get("prompt_index")
+            if isinstance(prompt_index, int) and not isinstance(prompt_index, bool) and 0 <= prompt_index <= 20:
+                entity["prompt_index"] = prompt_index
+            boost_applied = raw_entity.get("boost_applied")
+            if isinstance(boost_applied, bool):
+                entity["boost_applied"] = boost_applied
+            safe_entities.append(entity)
+        if safe_entities:
+            result["entities"] = safe_entities
     policies = value.get("channel_policies")
     if isinstance(policies, Mapping):
         safe_policies: dict[str, dict[str, Any]] = {}
@@ -1330,9 +2067,7 @@ def _safe_query_processing(value: Any) -> dict[str, Any]:
             policy: dict[str, Any] = {}
             if isinstance(raw_policy, (list, tuple)):
                 values = [
-                    item
-                    for value in raw_policy
-                    if (item := _safe_identifier(value)) is not None
+                    item for value in raw_policy if (item := _safe_identifier(value)) is not None
                 ]
                 if values:
                     policy["policy"] = "+".join(values[:8])
@@ -1379,14 +2114,19 @@ def _safe_qa_snapshot(context: RuntimeContext, search_id: str) -> dict[str, Any]
                 )
                 # Dense/lexical evidence can contain backend-specific payloads.
                 # Public QA retrieval exposes only stable channel ranks.
-                public["evidence"] = {"channel_ranks": dict(candidate.channel_ranks)}
+                public_evidence: dict[str, Any] = {
+                    "channel_ranks": dict(candidate.channel_ranks)
+                }
+                origin = candidate.evidence.get("origin")
+                if origin in {"manual", "kis_bridge"}:
+                    public_evidence["origin"] = origin
+                public["evidence"] = public_evidence
                 candidates.append(public)
         raw_predictions = snapshot.get("predictions", ())
         predictions = [
             prediction
             for value in raw_predictions
-            if isinstance(value, dict)
-            and (prediction := _safe_qa_prediction(value)) is not None
+            if isinstance(value, dict) and (prediction := _safe_qa_prediction(value)) is not None
         ]
         state = snapshot.get("state", {})
         state = state if isinstance(state, Mapping) else {}
@@ -1408,9 +2148,7 @@ def _safe_qa_snapshot(context: RuntimeContext, search_id: str) -> dict[str, Any]
                         "answerable": bool(reasoning.get("answerable", False)),
                         "provider": _safe_identifier(reasoning.get("provider")),
                         "model_name": _safe_identifier(reasoning.get("model_name")),
-                        "requested_policy": _safe_identifier(
-                            reasoning.get("requested_policy")
-                        ),
+                        "requested_policy": _safe_identifier(reasoning.get("requested_policy")),
                         "fallback_used": bool(reasoning.get("fallback_used", False)),
                         "fallback_reason_code": _safe_identifier(
                             reasoning.get("fallback_reason_code")
@@ -1470,18 +2208,13 @@ def _safe_qa_snapshot(context: RuntimeContext, search_id: str) -> dict[str, Any]
                 and not isinstance(snapshot.get("candidate_retrieval_ms"), bool)
                 else 0.0
             },
-            "candidate_cache_status": _safe_identifier(
-                state.get("candidate_cache_status")
-            ),
-            "channel_statuses": _safe_channel_statuses(
-                snapshot.get("channel_statuses", {})
-            ),
+            "candidate_cache_status": _safe_identifier(state.get("candidate_cache_status")),
+            "channel_statuses": _safe_channel_statuses(snapshot.get("channel_statuses", {})),
             "query_processing": _safe_query_processing(
                 snapshot.get("query_processing", state.get("query_processing", {}))
             ),
             "retrieval_errors": {
-                str(name): "channel_unavailable"
-                for name in snapshot.get("retrieval_errors", {})
+                str(name): "channel_unavailable" for name in snapshot.get("retrieval_errors", {})
             }
             if isinstance(snapshot.get("retrieval_errors"), Mapping)
             else {},
@@ -1491,6 +2224,13 @@ def _safe_qa_snapshot(context: RuntimeContext, search_id: str) -> dict[str, Any]
             }
             if isinstance(snapshot.get("failures"), Mapping)
             else {},
+            "operator_edits": [
+                edit
+                for value in snapshot.get("operator_edits", ())
+                if (edit := _safe_operator_edit(value)) is not None
+            ]
+            if isinstance(snapshot.get("operator_edits", ()), (list, tuple))
+            else [],
             "expires_at": snapshot.get("expires_at"),
         }
     state = snapshot.get("state", {})
@@ -1744,7 +2484,19 @@ def create_app(context: RuntimeContext) -> FastAPI:
         start = getattr(warmup, "start", None)
         if callable(start):
             start()
-        yield
+        try:
+            yield
+        finally:
+            advanced = getattr(context.pipeline, "advanced_reranker", None)
+            archive = getattr(advanced, "object_archive", None)
+            close_archive = getattr(archive, "close", None)
+            if callable(close_archive):
+                close_archive()
+            verifier = getattr(advanced, "color_verifier", None)
+            resolver = getattr(verifier, "resolver", None)
+            close_resolver = getattr(resolver, "close", None)
+            if callable(close_resolver):
+                close_resolver()
 
     app = FastAPI(
         title="AIC 2026 Multimodal Retrieval",
@@ -1752,20 +2504,80 @@ def create_app(context: RuntimeContext) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.runtime = context
+    launch_identity = sanitize_launch_identity(getattr(context, "launch_identity", {}))
+    source_contract_sha256 = str(
+        launch_identity.get("source_contract_sha256") or source_contract_fingerprint()
+    )
 
     @app.post("/v1/kis/search")
     def search(payload: dict[str, Any]) -> dict[str, Any]:
         try:
             request = _with_runtime_batches(context, QueryRequest.from_dict(payload))
-            _release_local_vlm(context)
-            _require_search_usable(context, "kis")
-            return _search_payload(context, request)
-        except HTTPException:
-            raise
+            normalize_query_text(request.original_text)
         except (TypeError, ValueError):
             raise HTTPException(
                 status_code=422,
-                detail="KIS request is invalid or its selected batch is unavailable",
+                detail={
+                    "code": "kis_request_invalid",
+                    "message": "KIS request is invalid or its selected batch is unavailable",
+                },
+            ) from None
+        started = time.monotonic()
+        try:
+            _release_local_vlm(context)
+            _require_search_usable(context, "kis")
+            response = _search_payload(context, request)
+            logger = getattr(context, "interaction_logger", None)
+            if logger is not None:
+                try:
+                    logger.record_search(
+                        query_id=request.query_id,
+                        query_text=request.original_text,
+                        retrieval_fingerprint=context.pipeline.fingerprint,
+                        batch_ids=request.batch_filters,
+                        results=response.get("hits", ()),
+                        latency_ms=(time.monotonic() - started) * 1_000,
+                        diagnostics=response.get("query_processing"),
+                    )
+                except (OSError, TypeError, ValueError):
+                    pass
+            return response
+        except HTTPException:
+            raise
+        except TimeoutError:
+            raise HTTPException(
+                status_code=504,
+                detail={"code": "kis_search_timeout", "recoverable": True},
+            ) from None
+        except (ConnectionError, OSError, RuntimeError) as error:
+            event_id = record_application_error(
+                error,
+                workflow="kis",
+                stage="search",
+                batch_id=request.batch_filters[0] if request.batch_filters else None,
+                query_or_session_id=request.query_id,
+                latency_ms=(time.monotonic() - started) * 1_000,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "kis_search_unavailable",
+                    "recoverable": True,
+                    "correlation_id": event_id,
+                },
+            ) from None
+        except Exception as error:
+            event_id = record_application_error(
+                error,
+                workflow="kis",
+                stage="search",
+                batch_id=request.batch_filters[0] if request.batch_filters else None,
+                query_or_session_id=request.query_id,
+                latency_ms=(time.monotonic() - started) * 1_000,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail={"code": "kis_internal_error", "correlation_id": event_id},
             ) from None
 
     @app.post("/v1/kis/refine")
@@ -1780,6 +2592,16 @@ def create_app(context: RuntimeContext) -> FastAPI:
                 negative_ids=tuple(_feedback_key(value) for value in request.negative_feedback_ids),
                 limit=request.limit,
             )
+            logger = getattr(context, "interaction_logger", None)
+            if logger is not None:
+                try:
+                    logger.record_feedback(
+                        query_id=request.query_id,
+                        positive_ids=request.positive_feedback_ids,
+                        negative_ids=request.negative_feedback_ids,
+                    )
+                except (OSError, TypeError, ValueError):
+                    pass
             return {
                 "query_id": request.query_id,
                 "hits": _public_hits(hits),
@@ -1853,6 +2675,7 @@ def create_app(context: RuntimeContext) -> FastAPI:
 
     def _qa_retrieve(payload: dict[str, Any]) -> dict[str, Any]:
         search_id: str | None = None
+        request: QACandidateRequest | None = None
         try:
             legacy_request: dict[str, Any] | None = None
             if "question" in payload:
@@ -1872,6 +2695,7 @@ def create_app(context: RuntimeContext) -> FastAPI:
                     ),
                     query_language=legacy.query_language,
                     event_description_en=legacy.event_description_en,
+                    entity_constraints=legacy.entity_constraints,
                 )
             else:
                 request = QACandidateRequest.from_dict(payload)
@@ -1895,7 +2719,7 @@ def create_app(context: RuntimeContext) -> FastAPI:
                 status_code=422,
                 detail={"code": "qa_retrieval_request_invalid"},
             ) from None
-        except Exception:
+        except (OSError, QASessionStoreError, RuntimeError):
             raise HTTPException(
                 status_code=503,
                 detail={
@@ -1904,10 +2728,88 @@ def create_app(context: RuntimeContext) -> FastAPI:
                     "recoverable": search_id is not None,
                 },
             ) from None
+        except Exception as error:
+            event_id = record_application_error(
+                error,
+                workflow="qa",
+                stage="retrieve",
+                batch_id=(request.batch_filters[0] if request and request.batch_filters else None),
+                query_or_session_id=(request.query_id if request is not None else None),
+            )
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "qa_internal_error",
+                    "correlation_id": event_id,
+                    "recoverable": False,
+                },
+            ) from None
 
     @app.post("/v1/qa/retrieve")
     def qa_retrieve(payload: dict[str, Any]) -> dict[str, Any]:
         return _qa_retrieve(payload)
+
+    @app.post("/v1/qa/inject")
+    def qa_inject(payload: dict[str, Any]) -> dict[str, Any]:
+        """Create a one-frame v3 QA session after canonical media validation."""
+
+        request: QAFrameInjectionRequest | None = None
+        search_id: str | None = None
+        try:
+            request = QAFrameInjectionRequest.from_dict(payload)
+            selected_batch_id = str(getattr(context, "selected_batch_id", "") or "")
+            if request.batch_id != selected_batch_id:
+                raise ValueError("injected frame must belong to the selected batch")
+            batches = _runtime_batch_filters(context, (request.batch_id,))
+            if batches != (request.batch_id,):
+                raise ValueError("injected frame batch is not active")
+            is_active = getattr(context.ledger, "is_batch_active", None)
+            if callable(is_active) and not bool(is_active(request.batch_id)):
+                raise ValueError("injected frame batch is not active")
+            search_id = uuid4().hex
+            _qa_pipeline(context).start_injected_session(request, session_id=search_id)
+            return _safe_qa_snapshot(context, search_id)
+        except HTTPException:
+            raise
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "qa_frame_injection_invalid"},
+            ) from None
+        except QAInjectedFrameNotFoundError:
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "qa_injected_frame_not_found"},
+            ) from None
+        except QACandidateMediaUnavailableError as error:
+            detail: dict[str, Any] = {
+                "code": "qa_candidate_media_unavailable",
+                "recoverable": True,
+            }
+            if _SAFE_OPERATIONAL_IDENTIFIER.fullmatch(error.candidate_id):
+                detail["candidate_id"] = error.candidate_id
+            raise HTTPException(status_code=409, detail=detail) from None
+        except (OSError, QASessionStoreError, RuntimeError):
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "qa_frame_injection_unavailable"},
+            ) from None
+        except Exception as error:
+            event_id = record_application_error(
+                error,
+                workflow="qa",
+                stage="inject",
+                batch_id=request.batch_id if request is not None else None,
+                query_or_session_id=request.query_id if request is not None else None,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "qa_internal_error",
+                    "correlation_id": event_id,
+                    "recoverable": False,
+                },
+            ) from None
 
     @app.post("/api/v1/search/qa", deprecated=True)
     @app.post("/v1/qa/search", deprecated=True)
@@ -1940,7 +2842,7 @@ def create_app(context: RuntimeContext) -> FastAPI:
                 None,
             )
             if selected is None:
-                raise ValueError("candidate is outside the session")
+                raise QACandidateOutsideSessionError("candidate is outside the session")
             if answer_request.answer_engine == "vlm":
                 request = QAQueryRequest(
                     query_id=search_id,
@@ -1951,19 +2853,37 @@ def create_app(context: RuntimeContext) -> FastAPI:
                     batch_filters=(selected.batch_id,),
                     limit=1,
                     reasoning_policy=answer_request.reasoning_policy,
-                    allow_external_frame_transfer=(
-                        answer_request.allow_external_frame_transfer
-                    ),
+                    allow_external_frame_transfer=(answer_request.allow_external_frame_transfer),
                 )
                 _require_qa_policy_usable(context, request, require_retrieval=False)
             pipeline.answer_candidate(search_id, answer_request)
             return _safe_qa_snapshot(context, search_id)
         except HTTPException:
             raise
-        except (KeyError, QASessionStoreError):
+        except KeyError:
             raise HTTPException(
                 status_code=404,
                 detail={"code": "qa_search_missing"},
+            ) from None
+        except QASessionStoreError:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "qa_session_conflict", "recoverable": True},
+            ) from None
+        except QACandidateOutsideSessionError:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "qa_candidate_outside_session"},
+            ) from None
+        except QACandidateNotCanonicalError:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "qa_candidate_not_canonical", "recoverable": True},
+            ) from None
+        except QAManualAnswerValidationError:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "qa_manual_answer_invalid"},
             ) from None
         except ValueError as error:
             code = (
@@ -1985,7 +2905,8 @@ def create_app(context: RuntimeContext) -> FastAPI:
                 status_code=503,
                 detail={
                     "code": code,
-                    "recoverable": error.category in {
+                    "recoverable": error.category
+                    in {
                         "provider_chain_exhausted",
                         "network_unreachable",
                         "gemini_timeout",
@@ -2018,10 +2939,30 @@ def create_app(context: RuntimeContext) -> FastAPI:
                 status_code=503,
                 detail={"code": "qa_single_frame_unavailable", "recoverable": True},
             ) from None
-        except Exception:
+        except OSError:
             raise HTTPException(
                 status_code=503,
                 detail={"code": "qa_single_frame_unavailable", "recoverable": True},
+            ) from None
+        except Exception as error:
+            event_id = record_application_error(
+                error,
+                workflow="qa",
+                stage="answer",
+                batch_id=(
+                    selected.batch_id
+                    if "selected" in locals() and selected is not None
+                    else None
+                ),
+                query_or_session_id=search_id,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "qa_internal_error",
+                    "correlation_id": event_id,
+                    "recoverable": False,
+                },
             ) from None
 
     @app.post("/v1/qa/search/{search_id}/expand", deprecated=True)
@@ -2193,13 +3134,65 @@ def create_app(context: RuntimeContext) -> FastAPI:
                 radius_ms=radius_ms,
                 limit=limit,
             )
-            return {"frame": frame.to_dict(), "neighbors": [item.to_dict() for item in values]}
+            return {
+                "frame": _safe_frame_neighbor(frame),
+                "neighbors": [_safe_frame_neighbor(item) for item in values],
+            }
         except HTTPException:
             raise
         except (TypeError, ValueError):
             raise HTTPException(
                 status_code=422, detail="frame neighborhood request is invalid"
             ) from None
+
+    @app.get("/v1/frames/{batch_id}/{video_id}/{source_frame_idx}/adjacent")
+    def adjacent_frames(
+        batch_id: str,
+        video_id: str,
+        source_frame_idx: int,
+        radius: int = 5,
+    ) -> dict[str, Any]:
+        repository = context.artifact_repository
+        if repository is None:
+            raise HTTPException(status_code=503, detail={"code": "frame_repository_unavailable"})
+        try:
+            selected_batch = _runtime_batch_filters(context, (batch_id,))[0]
+            values = repository.adjacent_frames(
+                selected_batch,
+                video_id,
+                source_frame_idx,
+                radius=radius,
+            )
+            if not values:
+                raise HTTPException(
+                    status_code=404,
+                    detail={"code": "canonical_frame_not_found"},
+                )
+            return {
+                "anchor": {
+                    "batch_id": selected_batch,
+                    "video_id": video_id,
+                    "source_frame_idx": source_frame_idx,
+                },
+                "radius": radius,
+                "frames": [
+                    _safe_frame_neighbor(frame, offset=offset)
+                    for offset, frame in values
+                ],
+            }
+        except HTTPException:
+            raise
+        except (AttributeError, TypeError, ValueError):
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "frame_adjacency_invalid"},
+            ) from None
+        except OSError:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "frame_repository_unavailable"},
+            ) from None
+
 
     @app.get("/v1/frames/{batch_id}/{video_id}/{source_frame_idx}/image")
     def frame_image(batch_id: str, video_id: str, source_frame_idx: int) -> Response:
@@ -2250,7 +3243,7 @@ def create_app(context: RuntimeContext) -> FastAPI:
                 radius_ms=radius_ms,
                 limit=limit,
             )
-            return {"neighbors": [value.to_dict() for value in values]}
+            return {"neighbors": [_safe_frame_neighbor(value) for value in values]}
         except (TypeError, ValueError):
             raise HTTPException(
                 status_code=422, detail="frame neighborhood request is invalid"
@@ -2507,73 +3500,10 @@ def create_app(context: RuntimeContext) -> FastAPI:
     def _bundle_output_dir() -> Path:
         return _project_path(str(context.config["competition"]["output_dir"]))
 
-    @app.post("/v1/submissions/bundles")
-    def create_submission_bundle(payload: dict[str, Any]) -> dict[str, Any]:
-        mode = payload.get("mode", "all")
-        batch_id = payload.get("batch_id")
-        raw_entries = payload.get("entries")
-        if mode not in {"all", "current"}:
-            raise HTTPException(
-                status_code=422,
-                detail={"code": "bundle_mode_invalid", "issues": []},
-            )
-        if not isinstance(batch_id, str) or not batch_id.strip():
-            raise HTTPException(
-                status_code=422,
-                detail={"code": "bundle_batch_invalid", "issues": []},
-            )
-        if not isinstance(raw_entries, list) or not 1 <= len(raw_entries) <= 256:
-            raise HTTPException(
-                status_code=422,
-                detail={"code": "bundle_entries_invalid", "issues": []},
-            )
-        try:
-            batch_id = _runtime_batch_filters(context, (batch_id.strip(),))[0]
-        except (IndexError, TypeError, ValueError):
-            raise HTTPException(
-                status_code=422,
-                detail={"code": "bundle_batch_invalid", "issues": []},
-            ) from None
+    def _staging_store() -> StagingStore:
+        return StagingStore(_bundle_output_dir() / "active_staging.json")
 
-        entries: list[BundleEntry] = []
-        total_bytes = 0
-        try:
-            for raw in raw_entries:
-                if not isinstance(raw, Mapping):
-                    raise ValueError("entry must be a mapping")
-                encoded = raw.get("csv_base64")
-                if not isinstance(encoded, str) or len(encoded) > 2_000_000:
-                    raise ValueError("csv payload is invalid")
-                try:
-                    csv_bytes = base64.b64decode(encoded, validate=True)
-                except (ValueError, TypeError):
-                    raise ValueError("csv payload is invalid") from None
-                if not csv_bytes or len(csv_bytes) > 1_000_000:
-                    raise ValueError("csv payload is invalid")
-                total_bytes += len(csv_bytes)
-                if total_bytes > 8_000_000:
-                    raise ValueError("bundle payload is too large")
-                entries.append(
-                    BundleEntry(
-                        task=str(raw.get("task", "")),  # type: ignore[arg-type]
-                        query_id=str(raw.get("query_id", "")),
-                        csv_bytes=csv_bytes,
-                        batch_id=batch_id,
-                        source_fingerprint=str(raw.get("source_fingerprint", "")),
-                        stage_count=raw.get("stage_count"),  # type: ignore[arg-type]
-                        source_ranks=(
-                            tuple(raw.get("source_ranks", ()))
-                            if raw.get("source_ranks") is not None
-                            else None
-                        ),
-                    )
-                )
-        except (TypeError, ValueError):
-            raise HTTPException(
-                status_code=422,
-                detail={"code": "bundle_entries_invalid", "issues": []},
-            ) from None
-
+    def _bundle_validation_context(batch_id: str) -> BundleValidationContext:
         repository = context.artifact_repository
         if repository is None:
             raise HTTPException(
@@ -2591,7 +3521,7 @@ def create_app(context: RuntimeContext) -> FastAPI:
                 frame_cache[key] = getter(batch_id, video_id, frame_idx)
             return frame_cache[key]
 
-        validation_context = BundleValidationContext(
+        return BundleValidationContext(
             is_batch_active=lambda candidate: (
                 candidate == batch_id and bool(context.ledger.is_batch_active(candidate))
             ),
@@ -2604,6 +3534,280 @@ def create_app(context: RuntimeContext) -> FastAPI:
                 else int(source_frame(video, frame).timestamp_ms)
             ),
         )
+
+    def _resolved_bundle_batch(value: object) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "bundle_batch_invalid", "issues": []},
+            )
+        try:
+            return _runtime_batch_filters(context, (value.strip(),))[0]
+        except (IndexError, TypeError, ValueError):
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "bundle_batch_invalid", "issues": []},
+            ) from None
+
+    def _staging_failure(error: StagingStoreError) -> HTTPException:
+        if isinstance(error, StagingRevisionConflict):
+            return HTTPException(
+                status_code=409,
+                detail={"code": "staging_revision_conflict"},
+            )
+        if error.code == "staging_entry_not_found":
+            return HTTPException(status_code=404, detail={"code": error.code})
+        status = 422 if error.code in {
+            "staging_entry_invalid",
+            "bundle_query_id_collision",
+            "staging_size_limit_exceeded",
+            "staging_row_action_invalid",
+            "staging_row_invalid",
+            "staging_rank_invalid",
+            "staging_row_limit_exceeded",
+            "staging_row_mutation_unsupported",
+            "staging_entry_validation_invalid",
+        } else 503
+        return HTTPException(status_code=status, detail={"code": error.code})
+
+    def _validate_staging_candidate(entry: BundleEntry) -> int:
+        validated = validate_bundle_entries(
+            (entry,),
+            context=_bundle_validation_context(entry.batch_id),
+            mode="current",
+        )[0]
+        return len(validated.parsed.rows)
+
+    @app.get("/v1/submissions/staging")
+    def submission_staging() -> dict[str, Any]:
+        try:
+            return _staging_store().load().to_api()
+        except StagingStoreError as error:
+            raise _staging_failure(error) from None
+
+    @app.post("/v1/submissions/staging/entries")
+    def upsert_submission_staging_entry(payload: dict[str, Any]) -> dict[str, Any]:
+        expected_revision = payload.get("expected_revision")
+        batch_id = _resolved_bundle_batch(payload.get("batch_id"))
+        raw = payload.get("entry")
+        if not isinstance(raw, Mapping):
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "staging_entry_invalid"},
+            )
+        raw_query_id = raw.get("query_id")
+        try:
+            query_id = normalize_codabench_query_id(raw_query_id)  # type: ignore[arg-type]
+            encoded = raw.get("csv_base64")
+            if not isinstance(encoded, str) or len(encoded) > 2_000_000:
+                raise ValueError("csv payload is invalid")
+            csv_bytes = base64.b64decode(encoded, validate=True)
+            entry = BundleEntry(
+                task=raw.get("task"),  # type: ignore[arg-type]
+                query_id=query_id,
+                csv_bytes=csv_bytes,
+                batch_id=batch_id,
+                source_fingerprint=raw.get("source_fingerprint"),  # type: ignore[arg-type]
+                stage_count=raw.get("stage_count"),  # type: ignore[arg-type]
+                source_ranks=(
+                    tuple(raw.get("source_ranks", ()))
+                    if raw.get("source_ranks") is not None
+                    else None
+                ),
+            )
+            validated = validate_bundle_entries(
+                (entry,),
+                context=_bundle_validation_context(batch_id),
+                mode="current",
+            )[0]
+            staged = StagedEntry.create(
+                entry,
+                row_count=len(validated.parsed.rows),
+                clock=lambda: datetime.now(timezone.utc),
+            )
+            return _staging_store().upsert(
+                staged,
+                expected_revision=expected_revision,  # type: ignore[arg-type]
+            ).to_api()
+        except BundleValidationError as error:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "bundle_validation_failed",
+                    "issues": [issue.to_dict() for issue in error.issues],
+                },
+            ) from None
+        except StagingStoreError as error:
+            raise _staging_failure(error) from None
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "staging_entry_invalid"},
+            ) from None
+
+    @app.delete("/v1/submissions/staging/entries/{filename}")
+    def delete_submission_staging_entry(
+        filename: str,
+        expected_revision: int,
+    ) -> dict[str, Any]:
+        try:
+            return _staging_store().delete(
+                filename,
+                expected_revision=expected_revision,
+            ).to_api()
+        except StagingStoreError as error:
+            raise _staging_failure(error) from None
+
+    @app.post("/v1/submissions/staging/entries/{filename}/rows")
+    def mutate_submission_staging_rows(
+        filename: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Atomically mutate one physical QA/TRAKE rank and re-run preflight."""
+
+        action = payload.get("action")
+        encoded = payload.get("row_csv_base64")
+        row_csv_bytes: bytes | None = None
+        try:
+            if encoded is not None:
+                if not isinstance(encoded, str) or len(encoded) > 16_384:
+                    raise ValueError("row payload is invalid")
+                row_csv_bytes = base64.b64decode(encoded, validate=True)
+                if not row_csv_bytes or len(row_csv_bytes) > 8_192:
+                    raise ValueError("row payload is invalid")
+            snapshot = _staging_store().mutate_rows(
+                filename,
+                action=action,  # type: ignore[arg-type]
+                expected_revision=payload.get("expected_revision"),  # type: ignore[arg-type]
+                validator=_validate_staging_candidate,
+                row_csv_bytes=row_csv_bytes,
+                rank=payload.get("rank"),  # type: ignore[arg-type]
+                target_rank=payload.get("target_rank"),  # type: ignore[arg-type]
+                source_fingerprint=payload.get("source_fingerprint"),  # type: ignore[arg-type]
+            )
+            return snapshot.to_api()
+        except BundleValidationError as error:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "bundle_validation_failed",
+                    "issues": [issue.to_dict() for issue in error.issues],
+                },
+            ) from None
+        except StagingStoreError as error:
+            raise _staging_failure(error) from None
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "staging_row_invalid"},
+            ) from None
+
+    @app.delete("/v1/submissions/staging")
+    def clear_submission_staging(expected_revision: int) -> dict[str, Any]:
+        try:
+            return _staging_store().clear(
+                expected_revision=expected_revision,
+            ).to_api()
+        except StagingStoreError as error:
+            raise _staging_failure(error) from None
+
+    @app.post("/v1/submissions/bundles")
+    def create_submission_bundle(payload: dict[str, Any]) -> dict[str, Any]:
+        mode = payload.get("mode", "all")
+        batch_id = _resolved_bundle_batch(payload.get("batch_id"))
+        raw_entries = payload.get("entries")
+        staged_filenames = payload.get("entry_filenames")
+        if mode not in {"all", "current", "selection"}:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "bundle_mode_invalid", "issues": []},
+            )
+        if (raw_entries is None) == (staged_filenames is None):
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "bundle_entries_invalid", "issues": []},
+            )
+
+        entries: list[BundleEntry] = []
+        if staged_filenames is not None:
+            if (
+                not isinstance(staged_filenames, list)
+                or not 1 <= len(staged_filenames) <= 256
+                or any(not isinstance(name, str) for name in staged_filenames)
+                or len(staged_filenames) != len(set(staged_filenames))
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail={"code": "bundle_entries_invalid", "issues": []},
+                )
+            try:
+                snapshot = _staging_store().load()
+                if payload.get("staging_revision") != snapshot.revision:
+                    raise StagingRevisionConflict()
+            except StagingStoreError as error:
+                raise _staging_failure(error) from None
+            by_name = {entry.filename: entry.bundle_entry for entry in snapshot.entries}
+            try:
+                entries = [by_name[name] for name in staged_filenames]
+            except KeyError:
+                raise HTTPException(
+                    status_code=422,
+                    detail={"code": "staging_entry_missing", "issues": []},
+                ) from None
+            if any(entry.batch_id != batch_id for entry in entries):
+                raise HTTPException(
+                    status_code=422,
+                    detail={"code": "bundle_mixed_batch", "issues": []},
+                )
+        else:
+            if not isinstance(raw_entries, list) or not 1 <= len(raw_entries) <= 256:
+                raise HTTPException(
+                    status_code=422,
+                    detail={"code": "bundle_entries_invalid", "issues": []},
+                )
+            total_bytes = 0
+            try:
+                for raw in raw_entries:
+                    if not isinstance(raw, Mapping):
+                        raise ValueError("entry must be a mapping")
+                    try:
+                        query_id = normalize_codabench_query_id(raw.get("query_id"))  # type: ignore[arg-type]
+                    except (TypeError, ValueError):
+                        raise HTTPException(
+                            status_code=422,
+                            detail={"code": "bundle_query_id_invalid", "issues": []},
+                        ) from None
+                    encoded = raw.get("csv_base64")
+                    if not isinstance(encoded, str) or len(encoded) > 2_000_000:
+                        raise ValueError("csv payload is invalid")
+                    csv_bytes = base64.b64decode(encoded, validate=True)
+                    if not csv_bytes or len(csv_bytes) > 1_000_000:
+                        raise ValueError("csv payload is invalid")
+                    total_bytes += len(csv_bytes)
+                    if total_bytes > 8_000_000:
+                        raise ValueError("bundle payload is too large")
+                    entries.append(
+                        BundleEntry(
+                            task=raw.get("task"),  # type: ignore[arg-type]
+                            query_id=query_id,
+                            csv_bytes=csv_bytes,
+                            batch_id=batch_id,
+                            source_fingerprint=raw.get("source_fingerprint"),  # type: ignore[arg-type]
+                            stage_count=raw.get("stage_count"),  # type: ignore[arg-type]
+                            source_ranks=(
+                                tuple(raw.get("source_ranks", ()))
+                                if raw.get("source_ranks") is not None
+                                else None
+                            ),
+                        )
+                    )
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    status_code=422,
+                    detail={"code": "bundle_entries_invalid", "issues": []},
+                ) from None
+
+        validation_context = _bundle_validation_context(batch_id)
         try:
             artifact = build_codabench_bundle(
                 entries,
@@ -2718,15 +3922,10 @@ def create_app(context: RuntimeContext) -> FastAPI:
             payload["warmup"] = _warmup_snapshot(context)
             channels = {item.name: item for item in report.channels}
             canonical_ready = bool(
-                channels.get("canonical_images")
-                and channels["canonical_images"].usable
+                channels.get("canonical_images") and channels["canonical_images"].usable
             )
-            local_ready = bool(
-                channels.get("ollama_vlm") and channels["ollama_vlm"].usable
-            )
-            gemini_ready = bool(
-                channels.get("gemini_vlm") and channels["gemini_vlm"].usable
-            )
+            local_ready = bool(channels.get("ollama_vlm") and channels["ollama_vlm"].usable)
+            gemini_ready = bool(channels.get("gemini_vlm") and channels["gemini_vlm"].usable)
             answer_usable = canonical_ready and (local_ready or gemini_ready)
             answer_state = (
                 "ready"
@@ -2784,6 +3983,7 @@ def create_app(context: RuntimeContext) -> FastAPI:
                 "qa": report.get("qa"),
                 "channels": report.get("channels", []),
                 "checks": report.get("checks", []),
+                "multimodal": report.get("multimodal", {}),
                 "ingest": ingest,
                 "warmup": _warmup_snapshot(context),
                 "checked_at_unix": report.get("checked_at_unix"),
@@ -2827,13 +4027,25 @@ def create_app(context: RuntimeContext) -> FastAPI:
             ingest: dict[str, Any] | None = None
             if context.ledger.is_batch_registered(selected_batch):
                 ingest = ingest_status(selected_batch)
+            multimodal = payload.get("multimodal", {})
             return {
                 "profile": payload.get("profile"),
                 "batch_id": selected_batch,
+                "capability_mode": (
+                    multimodal.get("capability_mode")
+                    if isinstance(multimodal, Mapping)
+                    else None
+                ),
+                "status_label": (
+                    multimodal.get("status_label")
+                    if isinstance(multimodal, Mapping)
+                    else None
+                ),
                 "kis": payload.get("kis"),
                 "qa": payload.get("qa"),
                 "trake": trake,
                 "channel_statuses": aggregate_channel_health(report.channels),
+                "multimodal": multimodal,
                 "ingest": ingest,
                 "warmup": _warmup_snapshot(context),
                 "checked_at_unix": payload.get("checked_at_unix"),
@@ -2910,14 +4122,21 @@ def create_app(context: RuntimeContext) -> FastAPI:
             translation_enabled and translation_files_ready and translation_dependency_ready
         )
         return {
+            "runtime_contract": {
+                "version": RUNTIME_CONTRACT_VERSION,
+                "features": list(RUNTIME_CONTRACT_FEATURES),
+                "source_contract_sha256": source_contract_sha256,
+            },
             "profile": str(context.config.get("profile", "laptop")),
             "default_batch_id": context.selected_batch_id,
             "workflows": ["kis", "qa", "trake"],
             "query_translation": {
-                "state": "ready" if translation_ready else (
-                    "not_provisioned" if translation_enabled else "disabled_by_profile"
-                ),
-                "reason_code": None if translation_ready else (
+                "state": "ready"
+                if translation_ready
+                else ("not_provisioned" if translation_enabled else "disabled_by_profile"),
+                "reason_code": None
+                if translation_ready
+                else (
                     "translator_asset_missing"
                     if translation_enabled and not translation_files_ready
                     else "translator_dependency_missing"
@@ -3019,7 +4238,11 @@ def create_app(context: RuntimeContext) -> FastAPI:
             if not usable:
                 raise HTTPException(
                     status_code=503,
-                    detail={"code": "qa_all_providers_failed", "workflow": workflow, "stage": stage},
+                    detail={
+                        "code": "qa_all_providers_failed",
+                        "workflow": workflow,
+                        "stage": stage,
+                    },
                 )
             return {"status": "ready", "workflow": workflow, "stage": stage}
         effective_workflow = "kis" if workflow == "qa" and stage == "retrieve" else workflow

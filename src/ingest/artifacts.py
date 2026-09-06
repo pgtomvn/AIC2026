@@ -14,7 +14,7 @@ import hashlib
 import json
 import sqlite3
 import time
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -908,6 +908,64 @@ class ArtifactRepository:
                 inserted += 1
         return UpsertResult(inserted, unchanged, readiness_changed)
 
+    def replace_text_segments_for_video(
+        self,
+        batch_id: str,
+        video_id: str,
+        kind: str,
+        segments: Iterable[TextSegment],
+        *,
+        fingerprint: str,
+        index_ready: bool = True,
+    ) -> UpsertResult:
+        """Atomically replace one generated text channel for one canonical video.
+
+        This deliberately cannot modify frames or another text kind. It is the
+        scoped recovery boundary used when an OCR/ASR model fingerprint changes.
+        """
+
+        _require_nonempty(batch_id, "batch_id")
+        _require_nonempty(video_id, "video_id")
+        _require_nonempty(kind, "kind")
+        _require_nonempty(fingerprint, "fingerprint")
+        if not isinstance(index_ready, bool):
+            raise TypeError("index_ready must be a boolean")
+        values = tuple(segments)
+        for segment in values:
+            if (
+                segment.batch_id != batch_id
+                or segment.video_id != video_id
+                or segment.kind != kind
+            ):
+                raise ValueError("replacement segments must match batch, video, and kind")
+        prepared = self._prepare_text_segments(values, fingerprint)
+        timestamp = time.time()
+        with self._transaction() as connection:
+            previous = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM canonical_text_segments
+                    WHERE batch_id = ? AND video_id = ? AND kind = ?
+                    """,
+                    (batch_id, video_id, kind),
+                ).fetchone()[0]
+            )
+            connection.execute(
+                """
+                DELETE FROM canonical_text_segments
+                WHERE batch_id = ? AND video_id = ? AND kind = ?
+                """,
+                (batch_id, video_id, kind),
+            )
+            for value in prepared:
+                self._insert_text_segment(
+                    connection,
+                    value,
+                    index_ready=index_ready,
+                    timestamp=timestamp,
+                )
+        return UpsertResult(len(prepared), 0, previous)
+
     def replace_video(
         self,
         batch_id: str,
@@ -1093,6 +1151,107 @@ class ArtifactRepository:
                 (batch_id, video_id, source_frame_idx),
             ).fetchone()
         return None if row is None else self._frame_from_row(row)
+
+    def get_frames(
+        self,
+        batch_id: str,
+        identities: Sequence[tuple[str, int]],
+    ) -> dict[tuple[str, int], FrameRecord]:
+        """Resolve a bounded candidate head in one read-only SQLite query."""
+
+        _require_nonempty(batch_id, "batch_id")
+        unique: list[tuple[str, int]] = []
+        seen: set[tuple[str, int]] = set()
+        for video_id, source_frame_idx in identities:
+            _require_nonempty(video_id, "video_id")
+            _require_nonnegative_int(source_frame_idx, "source_frame_idx")
+            key = (video_id, source_frame_idx)
+            if key not in seen:
+                seen.add(key)
+                unique.append(key)
+        if not unique:
+            return {}
+        if len(unique) > 100:
+            raise ValueError("get_frames accepts at most 100 canonical identities")
+        values = ",".join("(?, ?)" for _value in unique)
+        parameters: list[Any] = []
+        for video_id, source_frame_idx in unique:
+            parameters.extend((video_id, source_frame_idx))
+        parameters.append(batch_id)
+        with closing(self._connection()) as connection:
+            rows = connection.execute(
+                f"""
+                WITH requested(video_id, source_frame_idx) AS (VALUES {values})
+                SELECT frame.* FROM canonical_frames AS frame
+                JOIN requested
+                  ON requested.video_id = frame.video_id
+                 AND requested.source_frame_idx = frame.source_frame_idx
+                WHERE frame.batch_id = ?
+                """,
+                tuple(parameters),
+            ).fetchall()
+        frames = [self._frame_from_row(row) for row in rows]
+        return {(frame.video_id, frame.source_frame_idx): frame for frame in frames}
+
+    def adjacent_frames(
+        self,
+        batch_id: str,
+        video_id: str,
+        source_frame_idx: int,
+        *,
+        radius: int = 5,
+    ) -> list[tuple[int, FrameRecord]]:
+        """Return canonical ordinal neighbors with stable signed offsets.
+
+        Adjacent source frames are resolved through the ordinal mapping table;
+        source-frame arithmetic is deliberately never used. Duplicate ordinal
+        aliases are represented by the offset nearest to the anchor.
+        """
+
+        _require_nonempty(batch_id, "batch_id")
+        _require_nonempty(video_id, "video_id")
+        _require_nonnegative_int(source_frame_idx, "source_frame_idx")
+        if isinstance(radius, bool) or not isinstance(radius, int) or not 1 <= radius <= 5:
+            raise ValueError("radius must be between 1 and 5")
+        anchor = self.get_frame(batch_id, video_id, source_frame_idx)
+        if anchor is None:
+            return []
+        with closing(self._connection()) as connection:
+            rows = connection.execute(
+                """
+                SELECT mapping.keyframe_ordinal AS adjacent_ordinal, frame.*
+                FROM canonical_frame_mappings AS mapping
+                JOIN canonical_frames AS frame
+                  ON frame.batch_id = mapping.batch_id
+                 AND frame.video_id = mapping.video_id
+                 AND frame.source_frame_idx = mapping.source_frame_idx
+                WHERE mapping.batch_id = ?
+                  AND mapping.video_id = ?
+                  AND mapping.keyframe_ordinal BETWEEN ? AND ?
+                ORDER BY mapping.keyframe_ordinal, mapping.source_frame_idx
+                """,
+                (
+                    batch_id,
+                    video_id,
+                    max(1, anchor.keyframe_ordinal - radius),
+                    anchor.keyframe_ordinal + radius,
+                ),
+            ).fetchall()
+        selected: dict[int, tuple[int, FrameRecord]] = {}
+        for row in rows:
+            offset = int(row["adjacent_ordinal"]) - anchor.keyframe_ordinal
+            frame = self._frame_from_row(row)
+            current = selected.get(frame.source_frame_idx)
+            if current is None or (abs(offset), offset) < (abs(current[0]), current[0]):
+                selected[frame.source_frame_idx] = (offset, frame)
+        return sorted(
+            selected.values(),
+            key=lambda value: (
+                value[0],
+                value[1].source_frame_idx,
+            ),
+        )
+
 
     def get_refined_frame(
         self, batch_id: str, video_id: str, source_frame_idx: int
@@ -1352,6 +1511,58 @@ class ArtifactRepository:
 
         return self.iter_frames(batch_id=batch_id, video_id=video_id, index_ready_only=True)
 
+    def count_frames(self, batch_id: str, *, video_id: str | None = None) -> int:
+        """Return the exact canonical frame count for a batch or one video."""
+
+        _require_nonempty(batch_id, "batch_id")
+        if video_id is not None:
+            _require_nonempty(video_id, "video_id")
+        query = "SELECT COUNT(*) FROM canonical_frames WHERE batch_id = ?"
+        parameters: list[Any] = [batch_id]
+        if video_id is not None:
+            query += " AND video_id = ?"
+            parameters.append(video_id)
+        with closing(self._connection()) as connection:
+            return int(connection.execute(query, parameters).fetchone()[0])
+
+    def video_frame_counts(self, batch_id: str) -> dict[str, int]:
+        """Return stable per-video canonical frame counts."""
+
+        _require_nonempty(batch_id, "batch_id")
+        with closing(self._connection()) as connection:
+            rows = connection.execute(
+                """
+                SELECT video_id, COUNT(*) AS frame_count
+                FROM canonical_frames
+                WHERE batch_id = ?
+                GROUP BY video_id
+                ORDER BY video_id
+                """,
+                (batch_id,),
+            ).fetchall()
+        return {str(row["video_id"]): int(row["frame_count"]) for row in rows}
+
+    def count_text_segments(
+        self,
+        batch_id: str,
+        *,
+        kind: str | None = None,
+        video_id: str | None = None,
+    ) -> int:
+        """Return an exact artifact-database text-segment count."""
+
+        _require_nonempty(batch_id, "batch_id")
+        clauses = ["batch_id = ?"]
+        parameters: list[Any] = [batch_id]
+        for column, value in (("kind", kind), ("video_id", video_id)):
+            if value is not None:
+                _require_nonempty(value, column)
+                clauses.append(f"{column} = ?")
+                parameters.append(value)
+        query = "SELECT COUNT(*) FROM canonical_text_segments WHERE " + " AND ".join(clauses)
+        with closing(self._connection()) as connection:
+            return int(connection.execute(query, parameters).fetchone()[0])
+
     def iter_text_segments(
         self,
         *,
@@ -1406,6 +1617,50 @@ class ArtifactRepository:
             kind=kind,
             index_ready_only=True,
         )
+
+    def text_segments_in_range(
+        self,
+        batch_id: str,
+        video_id: str,
+        *,
+        start_ms: int,
+        end_ms: int,
+        kind: str = "asr",
+        index_ready_only: bool = True,
+        limit: int = 200,
+    ) -> tuple[TextSegment, ...]:
+        """Return timestamped text overlapping one bounded video interval."""
+
+        for name, value in (("batch_id", batch_id), ("video_id", video_id), ("kind", kind)):
+            _require_nonempty(value, name)
+        if isinstance(start_ms, bool) or not isinstance(start_ms, int) or start_ms < 0:
+            raise ValueError("start_ms must be a non-negative integer")
+        if isinstance(end_ms, bool) or not isinstance(end_ms, int) or end_ms < start_ms:
+            raise ValueError("end_ms must be greater than or equal to start_ms")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        clauses = [
+            "batch_id = ?",
+            "video_id = ?",
+            "kind = ?",
+            "end_ms >= ?",
+            "start_ms <= ?",
+        ]
+        parameters: list[Any] = [batch_id, video_id, kind, start_ms, end_ms]
+        if index_ready_only:
+            clauses.append("index_ready = 1")
+        query = f"""
+            SELECT * FROM canonical_text_segments
+            WHERE {' AND '.join(clauses)}
+            ORDER BY start_ms, end_ms, segment_id
+            LIMIT ?
+        """
+        parameters.append(limit)
+        with closing(self._connection()) as connection:
+            return tuple(
+                self._text_segment_from_row(row)
+                for row in connection.execute(query, parameters)
+            )
 
     def set_video_index_ready(
         self,

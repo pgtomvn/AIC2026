@@ -12,6 +12,7 @@ from typing import Callable, Mapping, Sequence
 
 from src.contracts import CompetitionSpec, SearchHit
 from src.evaluation.textual_kis import Prediction
+from src.submission.csv_exporter import export_qa_csv, format_qa_submission_row
 
 
 class SubmissionValidationError(ValueError):
@@ -301,7 +302,9 @@ __all__ = [
     "FrameIndexEvidence",
     "CanonicalSourceFrameCheck",
     "SubmissionValidationError",
+    "export_qa_csv",
     "export_submission",
+    "format_qa_submission_row",
     "serialize_submission",
     "validate_submission",
 ]

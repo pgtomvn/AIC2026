@@ -1119,6 +1119,73 @@ class QASessionStore:
             **value,
         }
 
+    def commit_manual_answer(
+        self,
+        session_id: str,
+        state: Mapping[str, Any],
+        *,
+        candidate_id: str,
+        edit: Mapping[str, Any],
+        expected_revision: int,
+    ) -> tuple[QASession, dict[str, Any]]:
+        """Atomically replace v3 state and append its operator-answer audit row."""
+
+        if not isinstance(candidate_id, str) or not candidate_id.strip():
+            raise ValueError("candidate_id must be a non-empty string")
+        if isinstance(expected_revision, bool) or not isinstance(expected_revision, int):
+            raise TypeError("expected_revision must be an integer")
+        if expected_revision < 0:
+            raise ValueError("expected_revision must be non-negative")
+        state_value = self._mapping(state, "state")
+        edit_value = self._mapping(edit, "edit")
+        now = self.clock()
+        with closing(self._connection()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE qa_sessions
+                SET state_json = ?, updated_at = ?, revision = revision + 1
+                WHERE session_id = ? AND expires_at > ? AND revision = ?
+                """,
+                (
+                    json.dumps(state_value, ensure_ascii=False, sort_keys=True),
+                    now,
+                    session_id,
+                    now,
+                    expected_revision,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise QASessionStoreError(
+                    "QA session is missing, expired, or concurrently modified"
+                )
+            edit_cursor = connection.execute(
+                """
+                INSERT INTO qa_operator_edits(session_id, window_id, edit_json, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    candidate_id.strip(),
+                    json.dumps(edit_value, ensure_ascii=False, sort_keys=True),
+                    now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM qa_sessions WHERE session_id = ?", (session_id,)
+            ).fetchone()
+            connection.commit()
+        if row is None:  # pragma: no cover - guarded by the successful update
+            raise QASessionStoreError("QA session disappeared during manual answer")
+        persisted_edit = {
+            "edit_id": int(edit_cursor.lastrowid),
+            "session_id": session_id,
+            "window_id": candidate_id.strip(),
+            "created_at": now,
+            **edit_value,
+        }
+        return self._session(row), persisted_edit
+
     def get_operator_edits(self, session_id: str) -> tuple[dict[str, Any], ...]:
         """Return the ordered answer-edit audit for a live QA session."""
 

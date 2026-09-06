@@ -11,6 +11,8 @@ import pytest
 from PIL import Image
 
 from src.contracts import (
+    QA_GENERAL_TEXT_SPEC_ID,
+    QA_HISTORICAL_NUMERIC_SPEC_ID,
     FrameRecord,
     QACandidateRequest,
     QACompetitionSpec,
@@ -21,7 +23,11 @@ from src.contracts import (
 from src.retrieval.qa_media import CanonicalImageError
 from src.retrieval.qa_retrieval import VisualQARetriever
 from src.retrieval.qa_session import QASessionStore
-from src.retrieval.visual_qa import QACandidateMediaUnavailableError, VisualQAPipeline
+from src.retrieval.visual_qa import (
+    QACandidateMediaUnavailableError,
+    QAManualAnswerValidationError,
+    VisualQAPipeline,
+)
 from src.vlm.florence2 import Florence2TaskReasoner
 from src.vlm.gpu_coordinator import GPUModelCoordinator
 from src.vlm.qa_reasoner import QAProviderRequestError, QAProviderUnavailableError
@@ -210,6 +216,113 @@ def test_answer_stage_accepts_only_session_candidate_and_exactly_one_image(
     with pytest.raises(ValueError, match="not part"):
         pipeline.answer_candidate("answer-session", outsider)
     assert reasoner.calls == 1
+
+
+def test_manual_answer_is_normalized_audited_and_bypasses_media_and_vlm(
+    tmp_path: Path,
+) -> None:
+    pipeline, sessions, _textual, resolver, reasoner = _pipeline(tmp_path)
+    pipeline.start_candidate_search(
+        QACandidateRequest("q-manual", "a news presenter", ("b1",), 5),
+        session_id="manual-session",
+    )
+    request = QASingleFrameAnswerRequest(
+        candidate_id="b1:V001:10",
+        question="Địa điểm này ở đâu?",
+        answer_spec_id=QA_GENERAL_TEXT_SPEC_ID,
+        reasoning_policy="local_only",
+        answer_engine="manual",
+        manual_answer='  “XÃ Cam Hiệp Bắc!”\n',
+    )
+
+    first = pipeline.answer_candidate("manual-session", request)
+    first_session = sessions.get_session("manual-session")
+    assert first_session is not None
+    second = pipeline.answer_candidate("manual-session", request)
+    second_session = sessions.get_session("manual-session")
+    assert second_session is not None
+
+    assert first["prediction"]["answer"] == "xã cam hiệp bắc"
+    assert first["prediction"]["answer_source"] == "operator"
+    assert first["reasoning"]["cache_status"] == "bypass"
+    assert second == first
+    assert second_session.revision == first_session.revision
+    assert resolver.calls == 0
+    assert reasoner.calls == 0
+    snapshot = pipeline.get_search("manual-session")
+    assert snapshot["selected_candidate_id"] == "b1:V001:10"
+    assert snapshot["predictions"][0]["answer"] == "xã cam hiệp bắc"
+    assert len(snapshot["operator_edits"]) == 1
+    assert snapshot["operator_edits"][0]["provider"] == "operator"
+
+
+@pytest.mark.parametrize(
+    ("answer", "expected"),
+    [
+        ("  005  ", "5"),
+        ("x" * 100, "x" * 100),
+    ],
+)
+def test_manual_answer_uses_selected_competition_normalizer(
+    tmp_path: Path,
+    answer: str,
+    expected: str,
+) -> None:
+    pipeline, _sessions, _textual, resolver, reasoner = _pipeline(tmp_path)
+    pipeline.start_candidate_search(
+        QACandidateRequest("q-normalize", "a news presenter", ("b1",), 5),
+        session_id="manual-normalize",
+    )
+    numeric = answer.strip().isdigit()
+    result = pipeline.answer_candidate(
+        "manual-normalize",
+        QASingleFrameAnswerRequest(
+            candidate_id="b1:V001:10",
+            question="Có bao nhiêu người?" if numeric else "Địa điểm này ở đâu?",
+            answer_spec_id=(
+                QA_HISTORICAL_NUMERIC_SPEC_ID
+                if numeric
+                else QA_GENERAL_TEXT_SPEC_ID
+            ),
+            reasoning_policy="local_only",
+            answer_engine="manual",
+            manual_answer=answer,
+        ),
+    )
+
+    assert result["prediction"]["answer"] == expected
+    assert resolver.calls == 0
+    assert reasoner.calls == 0
+
+
+def test_manual_answer_rejects_more_than_100_normalized_code_points(
+    tmp_path: Path,
+) -> None:
+    pipeline, sessions, _textual, resolver, reasoner = _pipeline(tmp_path)
+    pipeline.start_candidate_search(
+        QACandidateRequest("q-long", "a news presenter", ("b1",), 5),
+        session_id="manual-too-long",
+    )
+
+    with pytest.raises(QAManualAnswerValidationError, match="100 Unicode"):
+        pipeline.answer_candidate(
+            "manual-too-long",
+            QASingleFrameAnswerRequest(
+                candidate_id="b1:V001:10",
+                question="Địa điểm này ở đâu?",
+                answer_spec_id=QA_GENERAL_TEXT_SPEC_ID,
+                reasoning_policy="local_only",
+                answer_engine="manual",
+                manual_answer="x" * 101,
+            ),
+        )
+
+    assert resolver.calls == 0
+    assert reasoner.calls == 0
+    snapshot = sessions.get_snapshot("manual-too-long")
+    assert snapshot is not None
+    assert snapshot["predictions"] == []
+    assert snapshot["operator_edits"] == []
 
 
 def test_missing_candidate_media_is_persisted_without_calling_provider(

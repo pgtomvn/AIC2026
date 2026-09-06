@@ -12,6 +12,10 @@ venv/
 .venv/
 .venv-runtime/
 .cache/
+/.uv-cache*/
+/.test-runs/
+/tmp*/
+/.research/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
@@ -71,3 +75,5 @@ Thumbs.db
 
 # Local remediation notes
 BUG_FIX_PLAN.md
+# One-off local query probe; reusable diagnostics remain versioned.
+/scripts/debug_long_kis_queries.py

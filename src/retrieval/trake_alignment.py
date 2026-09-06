@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import heapq
+import re
+import threading
+import unicodedata
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -17,10 +21,11 @@ from src.contracts import (
     TRAKEStage,
     TRAKEStageMatch,
 )
+from src.query.entity_extractor import fold_entity_text
 from src.query.translator import QueryProcessing, QueryTextAdapter, QueryVariant
 from src.retrieval.trake_trajectory_cache import TRAKETrajectoryCache
 
-TRAKE_ALIGNMENT_VERSION = "trake-exact-alignment-v3"
+TRAKE_ALIGNMENT_VERSION = "trake-exact-alignment-v5-entity-routing"
 
 
 class TextEncoder(Protocol):
@@ -67,12 +72,100 @@ class _FrameVector:
     source_frame_idx: int
     timestamp_ms: int
     vector: np.ndarray
+    shot_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class _DPState:
     score: float
     path: tuple[int, ...]
+
+
+class _TemporalPrefixBest:
+    """Track the best predecessor under a linear post-threshold gap cost."""
+
+    def __init__(
+        self,
+        timestamps_ms: Sequence[int],
+        source_frame_indices: Sequence[int],
+        *,
+        max_gap_ms: int | None,
+        gap_penalty_per_second: float,
+    ) -> None:
+        self.timestamps_ms = timestamps_ms
+        self.source_frame_indices = source_frame_indices
+        self.max_gap_ms = max_gap_ms
+        self.gap_penalty_per_second = gap_penalty_per_second
+        self._entries: list[tuple[int, _DPState]] = []
+        self._old_cursor = 0
+        self._recent_heap: list[
+            tuple[tuple[float, int, tuple[int, ...]], int, _DPState]
+        ] = []
+        self._old_best: tuple[float, _DPState] | None = None
+
+    def _priority(self, state: _DPState) -> tuple[float, int, tuple[int, ...]]:
+        frames = tuple(self.source_frame_indices[index] for index in state.path)
+        return (-state.score, -frames[0], frames)
+
+    def add(self, frame_index: int, state: _DPState | None) -> None:
+        if state is None:
+            return
+        self._entries.append((frame_index, state))
+        heapq.heappush(
+            self._recent_heap,
+            (self._priority(state), frame_index, state),
+        )
+
+    def _move_old(self, timestamp_ms: int) -> None:
+        if self.max_gap_ms is None or self.gap_penalty_per_second <= 0.0:
+            return
+        cutoff = timestamp_ms - self.max_gap_ms
+        while self._old_cursor < len(self._entries):
+            frame_index, state = self._entries[self._old_cursor]
+            if self.timestamps_ms[frame_index] >= cutoff:
+                break
+            adjusted = state.score + (
+                self.gap_penalty_per_second
+                * float(self.timestamps_ms[frame_index])
+                / 1_000.0
+            )
+            if self._old_best is None or _scored_state_better(
+                adjusted,
+                state,
+                self._old_best[0],
+                self._old_best[1],
+                self.source_frame_indices,
+            ):
+                self._old_best = (adjusted, state)
+            self._old_cursor += 1
+        while (
+            self._recent_heap
+            and self.timestamps_ms[self._recent_heap[0][1]] < cutoff
+        ):
+            heapq.heappop(self._recent_heap)
+
+    def best(self, timestamp_ms: int) -> tuple[float, _DPState] | None:
+        self._move_old(timestamp_ms)
+        selected: tuple[float, _DPState] | None = None
+        if self._recent_heap:
+            state = self._recent_heap[0][2]
+            selected = (state.score, state)
+        if self._old_best is not None:
+            assert self.max_gap_ms is not None
+            adjusted = self._old_best[0] - (
+                self.gap_penalty_per_second
+                * float(timestamp_ms - self.max_gap_ms)
+                / 1_000.0
+            )
+            if selected is None or _scored_state_better(
+                adjusted,
+                self._old_best[1],
+                selected[0],
+                selected[1],
+                self.source_frame_indices,
+            ):
+                selected = (adjusted, self._old_best[1])
+        return selected
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,15 +194,11 @@ def _normalized_matrix(value: np.ndarray, *, name: str) -> np.ndarray:
     return matrix / norms
 
 
-def _state_better(
+def _path_better(
     candidate: _DPState,
-    current: _DPState | None,
+    current: _DPState,
     source_frame_indices: Sequence[int],
 ) -> bool:
-    if current is None:
-        return True
-    if candidate.score != current.score:
-        return candidate.score > current.score
     candidate_first = source_frame_indices[candidate.path[0]]
     current_first = source_frame_indices[current.path[0]]
     if candidate_first != current_first:
@@ -120,13 +209,58 @@ def _state_better(
     return candidate_frames < current_frames
 
 
+def _state_better(
+    candidate: _DPState,
+    current: _DPState | None,
+    source_frame_indices: Sequence[int],
+) -> bool:
+    if current is None:
+        return True
+    if candidate.score != current.score:
+        return candidate.score > current.score
+    return _path_better(candidate, current, source_frame_indices)
+
+
+def _scored_state_better(
+    candidate_score: float,
+    candidate: _DPState,
+    current_score: float,
+    current: _DPState,
+    source_frame_indices: Sequence[int],
+) -> bool:
+    if candidate_score != current_score:
+        return candidate_score > current_score
+    return _path_better(candidate, current, source_frame_indices)
+
+
+def _nonnegative_penalty(value: float, *, name: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float, np.integer, np.floating))
+        or not np.isfinite(value)
+        or float(value) < 0.0
+    ):
+        raise ValueError(f"{name} must be a finite non-negative number")
+    return float(value)
+
+
 def strict_monotonic_alignment(
     similarities: np.ndarray,
     source_frame_indices: Sequence[int] | None = None,
+    *,
+    timestamps_ms: Sequence[int] | None = None,
+    shot_ids: Sequence[str | None] | None = None,
+    max_gap_ms: int | None = None,
+    gap_penalty_per_second: float = 0.0,
+    shot_boundary_penalty: float = 0.0,
 ) -> tuple[tuple[int, ...], float] | None:
-    """Align all stages to increasing frames using prefix-max DP in ``O(NT)``.
+    """Align stages to a strict timeline with optional transition penalties.
 
-    Returned positions index columns in ``similarities``. Ties prefer the
+    The default zero-penalty path retains the original prefix-max ``O(NT)``
+    behavior. When enabled, the temporal cost is linear in seconds beyond
+    ``max_gap_ms``. A fixed shot cost applies only when both adjacent frames
+    carry known, different shot IDs. Returned positions index columns in
+    ``similarities``; the score is the penalized stage mean. Ties prefer the
     shorter source-frame span, then the lexicographically earlier frame chain.
     """
 
@@ -149,6 +283,56 @@ def strict_monotonic_alignment(
         raise ValueError("source_frame_indices length must match the frame dimension")
     if any(left >= right for left, right in zip(frames, frames[1:])):
         raise ValueError("source_frame_indices must be strictly increasing")
+    gap_penalty = _nonnegative_penalty(
+        gap_penalty_per_second,
+        name="gap_penalty_per_second",
+    )
+    boundary_penalty = _nonnegative_penalty(
+        shot_boundary_penalty,
+        name="shot_boundary_penalty",
+    )
+    if max_gap_ms is not None and (
+        isinstance(max_gap_ms, bool)
+        or not isinstance(max_gap_ms, (int, np.integer))
+        or max_gap_ms < 0
+    ):
+        raise ValueError("max_gap_ms must be a non-negative integer or None")
+    max_gap_ms = None if max_gap_ms is None else int(max_gap_ms)
+    if gap_penalty > 0.0 and max_gap_ms is None:
+        raise ValueError("max_gap_ms is required when gap penalties are enabled")
+
+    if timestamps_ms is None:
+        if gap_penalty > 0.0:
+            raise ValueError("timestamps_ms is required when gap penalties are enabled")
+        timestamps = tuple(range(frame_count))
+    else:
+        if len(timestamps_ms) != frame_count:
+            raise ValueError("timestamps_ms length must match the frame dimension")
+        if any(isinstance(value, bool) or not isinstance(value, (int, np.integer)) for value in timestamps_ms):
+            raise ValueError("timestamps_ms must contain integers")
+        timestamps = tuple(int(value) for value in timestamps_ms)
+        if any(value < 0 for value in timestamps):
+            raise ValueError("timestamps_ms must not contain negative values")
+        if any(left >= right for left, right in zip(timestamps, timestamps[1:])):
+            raise ValueError("timestamps_ms must be strictly increasing")
+
+    if shot_ids is None:
+        shots: tuple[str | None, ...] = (None,) * frame_count
+    else:
+        if len(shot_ids) != frame_count:
+            raise ValueError("shot_ids length must match the frame dimension")
+        normalized_shots: list[str | None] = []
+        for shot_id in shot_ids:
+            if shot_id is None:
+                normalized_shots.append(None)
+            elif isinstance(shot_id, str):
+                normalized_shots.append(shot_id.strip() or None)
+            else:
+                raise ValueError("shot_ids must contain strings or None")
+        shots = tuple(normalized_shots)
+    apply_shot_penalty = boundary_penalty > 0.0 and any(
+        shot_id is not None for shot_id in shots
+    )
 
     previous: list[_DPState | None] = [
         _DPState(float(matrix[0, frame_index]), (frame_index,))
@@ -156,17 +340,93 @@ def strict_monotonic_alignment(
     ]
     for stage_index in range(1, stage_count):
         current: list[_DPState | None] = [None] * frame_count
-        prefix_best: _DPState | None = None
+        if gap_penalty == 0.0 and boundary_penalty == 0.0:
+            prefix_best: _DPState | None = None
+            for frame_index in range(frame_count):
+                prior_index = frame_index - 1
+                if prior_index >= 0:
+                    prior = previous[prior_index]
+                    if prior is not None and _state_better(prior, prefix_best, frames):
+                        prefix_best = prior
+                if prefix_best is not None:
+                    current[frame_index] = _DPState(
+                        prefix_best.score + float(matrix[stage_index, frame_index]),
+                        prefix_best.path + (frame_index,),
+                    )
+            previous = current
+            continue
+        global_prefix = _TemporalPrefixBest(
+            timestamps,
+            frames,
+            max_gap_ms=max_gap_ms,
+            gap_penalty_per_second=gap_penalty,
+        )
+        unknown_prefix = (
+            _TemporalPrefixBest(
+                timestamps,
+                frames,
+                max_gap_ms=max_gap_ms,
+                gap_penalty_per_second=gap_penalty,
+            )
+            if apply_shot_penalty
+            else None
+        )
+        shot_prefixes: dict[str, _TemporalPrefixBest] = {}
         for frame_index in range(frame_count):
             prior_index = frame_index - 1
             if prior_index >= 0:
                 prior = previous[prior_index]
-                if prior is not None and _state_better(prior, prefix_best, frames):
-                    prefix_best = prior
-            if prefix_best is not None:
+                global_prefix.add(prior_index, prior)
+                prior_shot = shots[prior_index]
+                if unknown_prefix is not None and prior_shot is None:
+                    unknown_prefix.add(prior_index, prior)
+                elif apply_shot_penalty and prior_shot is not None:
+                    prefix = shot_prefixes.get(prior_shot)
+                    if prefix is None:
+                        prefix = _TemporalPrefixBest(
+                            timestamps,
+                            frames,
+                            max_gap_ms=max_gap_ms,
+                            gap_penalty_per_second=gap_penalty,
+                        )
+                        shot_prefixes[prior_shot] = prefix
+                    prefix.add(prior_index, prior)
+
+            selected = global_prefix.best(timestamps[frame_index])
+            current_shot = shots[frame_index]
+            if selected is not None and apply_shot_penalty and current_shot is not None:
+                selected = (selected[0] - boundary_penalty, selected[1])
+                compatible = (
+                    unknown_prefix.best(timestamps[frame_index])
+                    if unknown_prefix is not None
+                    else None
+                )
+                same_shot = shot_prefixes.get(current_shot)
+                if same_shot is not None:
+                    same_shot_candidate = same_shot.best(timestamps[frame_index])
+                    if same_shot_candidate is not None and (
+                        compatible is None
+                        or _scored_state_better(
+                            same_shot_candidate[0],
+                            same_shot_candidate[1],
+                            compatible[0],
+                            compatible[1],
+                            frames,
+                        )
+                    ):
+                        compatible = same_shot_candidate
+                if compatible is not None and _scored_state_better(
+                    compatible[0],
+                    compatible[1],
+                    selected[0],
+                    selected[1],
+                    frames,
+                ):
+                    selected = compatible
+            if selected is not None:
                 current[frame_index] = _DPState(
-                    prefix_best.score + float(matrix[stage_index, frame_index]),
-                    prefix_best.path + (frame_index,),
+                    selected[0] + float(matrix[stage_index, frame_index]),
+                    selected[1].path + (frame_index,),
                 )
         previous = current
 
@@ -206,6 +466,9 @@ class TRAKEPipeline:
         grouped_search_workers: int = 4,
         vector_scroll_batch_size: int = 4_096,
         global_weight: float = 0.25,
+        max_stage_gap_ms: int | None = None,
+        temporal_gap_penalty_per_second: float = 0.0,
+        shot_boundary_penalty: float = 0.0,
         trajectory_cache: TRAKETrajectoryCache | None = None,
         query_adapter: QueryTextAdapter | None = None,
         lexical_channels: Sequence[Any] = (),
@@ -231,6 +494,27 @@ class TRAKEPipeline:
             or not 0.0 <= float(global_weight) <= 1.0
         ):
             raise ValueError("global_weight must be between 0 and 1")
+        if max_stage_gap_ms is not None and (
+            isinstance(max_stage_gap_ms, bool)
+            or not isinstance(max_stage_gap_ms, (int, np.integer))
+            or max_stage_gap_ms < 0
+        ):
+            raise ValueError("max_stage_gap_ms must be a non-negative integer or None")
+        max_stage_gap_ms = (
+            None if max_stage_gap_ms is None else int(max_stage_gap_ms)
+        )
+        temporal_penalty = _nonnegative_penalty(
+            temporal_gap_penalty_per_second,
+            name="temporal_gap_penalty_per_second",
+        )
+        boundary_penalty = _nonnegative_penalty(
+            shot_boundary_penalty,
+            name="shot_boundary_penalty",
+        )
+        if temporal_penalty > 0.0 and max_stage_gap_ms is None:
+            raise ValueError(
+                "max_stage_gap_ms is required when temporal penalties are enabled"
+            )
         self.clip_encoder = selected_encoder
         self.encoder = selected_encoder
         self.vector_store = vector_store
@@ -241,11 +525,33 @@ class TRAKEPipeline:
         self.grouped_search_workers = grouped_search_workers
         self.vector_scroll_batch_size = vector_scroll_batch_size
         self.global_weight = float(global_weight)
+        self.max_stage_gap_ms = max_stage_gap_ms
+        self.temporal_gap_penalty_per_second = temporal_penalty
+        self.shot_boundary_penalty = boundary_penalty
         self.trajectory_cache = trajectory_cache
         self.query_adapter = query_adapter
         self.lexical_channels = tuple(lexical_channels)
+        self._execution_state = threading.local()
         self.last_query_processing: dict[str, Any] = {}
         self.last_channel_statuses: dict[str, dict[str, Any]] = {}
+
+    @property
+    def last_query_processing(self) -> dict[str, Any]:
+        return getattr(self._execution_state, "query_processing", {})
+
+    @last_query_processing.setter
+    def last_query_processing(self, value: Mapping[str, Any]) -> None:
+        self._execution_state.query_processing = dict(value)
+
+    @property
+    def last_channel_statuses(self) -> dict[str, dict[str, Any]]:
+        return getattr(self._execution_state, "channel_statuses", {})
+
+    @last_channel_statuses.setter
+    def last_channel_statuses(self, value: Mapping[str, Mapping[str, Any]]) -> None:
+        self._execution_state.channel_statuses = {
+            str(name): dict(status) for name, status in value.items()
+        }
 
     def _dependencies(self) -> tuple[TextEncoder, TRAKEVectorStore]:
         if self.encoder is None or self.vector_store is None:
@@ -279,6 +585,7 @@ class TRAKEPipeline:
         query_vectors: Sequence[np.ndarray],
         batch_id: str,
         lexical_video_order: Sequence[str] = (),
+        eligible_videos: set[str] | None = None,
     ) -> tuple[dict[str, float], tuple[dict[str, Any], ...]]:
         if isinstance(query_vectors, np.ndarray):
             if query_vectors.ndim != 2:
@@ -382,6 +689,8 @@ class TRAKEPipeline:
                 video_id: rank for rank, video_id in enumerate(lexical_video_order, 1)
             }
             fused_videos = set(dense_ranks) | set(lexical_ranks)
+            if eligible_videos is not None:
+                fused_videos &= eligible_videos
             ordered = sorted(
                 fused_videos,
                 key=lambda video_id: (
@@ -399,7 +708,11 @@ class TRAKEPipeline:
             for video_id in lexical_ranks:
                 stage_a.setdefault(video_id, -1.0)
         else:
-            ordered = dense_order
+            ordered = (
+                [video_id for video_id in dense_order if video_id in eligible_videos]
+                if eligible_videos is not None
+                else dense_order
+            )
         selected = {video: stage_a[video] for video in ordered[: self.top_k_videos]}
         selected_ids = set(selected)
         if supports_point_retrieval and point_refs:
@@ -461,18 +774,65 @@ class TRAKEPipeline:
                 values.append(video_id)
         return tuple(values)
 
+    @staticmethod
+    def _payload_text_values(result: Mapping[str, Any]) -> tuple[str, ...]:
+        payload = result.get("payload", result)
+        if not isinstance(payload, Mapping):
+            return ()
+        values: list[str] = []
+        for field in (
+            "text_raw", "text_nfc", "text_accent_folded", "text",
+            "ocr_text", "asr_text", "title", "description", "objects",
+        ):
+            value = payload.get(field)
+            if isinstance(value, str) and value:
+                values.append(value)
+            elif isinstance(value, (list, tuple)):
+                values.extend(item for item in value if isinstance(item, str) and item)
+        return tuple(values)
+
+    @staticmethod
+    def _exact_entity_match(texts: Sequence[str], terms: Sequence[str]) -> bool:
+        def fold(value: str) -> str:
+            normalized = unicodedata.normalize("NFD", value)
+            value = "".join(
+                character
+                for character in normalized
+                if unicodedata.category(character) != "Mn"
+            )
+            return " ".join(value.replace("đ", "d").replace("Đ", "D").casefold().split())
+
+        folded_texts = tuple(fold(value) for value in texts)
+        for term in terms:
+            needle = fold(term)
+            pattern = re.compile(r"(?<!\w)" + re.escape(needle) + r"(?!\w)")
+            if needle and any(pattern.search(text) for text in folded_texts):
+                return True
+        return False
+
     def _lexical_candidate_order(
         self,
         processings: Sequence[QueryProcessing],
         batch_id: str,
-    ) -> tuple[str, ...]:
+    ) -> tuple[tuple[str, ...], set[str] | None]:
         """Return bounded lexical video candidates without touching trajectories."""
 
+        required_by_prompt = [
+            tuple(processing.decomposition.required_entities)
+            if processing.decomposition is not None
+            else ()
+            for processing in processings
+        ]
+        has_required = any(required_by_prompt)
         if not self.lexical_channels:
-            return ()
+            return (), set() if has_required else None
         escaped_batch = batch_id.replace('"', '\\"')
         batch_filter = f'batch_id = "{escaped_batch}"'
         per_prompt_scores: list[dict[str, float]] = [defaultdict(float) for _ in processings]
+        per_prompt_entity_videos: list[dict[str, set[str]]] = [
+            defaultdict(set) for _ in processings
+        ]
+        ready_channels = 0
         for channel in self.lexical_channels:
             channel_name = str(getattr(channel, "name", "metadata"))
             store = getattr(channel, "store", None)
@@ -486,15 +846,31 @@ class TRAKEPipeline:
                         "reason_code": "no_compatible_documents",
                     }
                     continue
+                ready_channels += 1
                 depth = min(300, int(getattr(channel, "depth", 100)))
+                specifications: list[tuple[int, QueryVariant]] = []
                 for prompt_index, processing in enumerate(processings):
                     variants = (
                         self.query_adapter.lexical_variants(channel_name, processing)
                         if self.query_adapter is not None
                         else QueryTextAdapter().lexical_variants(channel_name, processing)
                     )
-                    variant_orders: list[tuple[str, ...]] = []
-                    for variant in variants:
+                    specifications.extend((prompt_index, variant) for variant in variants)
+                search_many = getattr(store, "search_many", None)
+                if callable(search_many) and specifications:
+                    result_sets = list(
+                        search_many(
+                            tuple(
+                                (variant.text, (variant.locale,) if variant.locale else None)
+                                for _prompt_index, variant in specifications
+                            ),
+                            top_k=depth,
+                            filters=batch_filter,
+                        )
+                    )
+                else:
+                    result_sets = []
+                    for _prompt_index, variant in specifications:
                         kwargs: dict[str, Any] = {
                             "top_k": depth,
                             "filters": batch_filter,
@@ -508,11 +884,29 @@ class TRAKEPipeline:
                                 kwargs["locales"] = (variant.locale,)
                         except (TypeError, ValueError):
                             pass
-                        results = store.search(variant.text, **kwargs)
-                        variant_orders.append(self._video_ids_from_results(results))
-                    for order in variant_orders:
-                        for rank, video_id in enumerate(order, 1):
-                            per_prompt_scores[prompt_index][video_id] += 1.0 / (60 + rank)
+                        result_sets.append(store.search(variant.text, **kwargs))
+                if len(result_sets) != len(specifications):
+                    raise RuntimeError("lexical multi-search result count mismatch")
+                for (prompt_index, _variant), results in zip(
+                    specifications, result_sets, strict=True
+                ):
+                    processing = processings[prompt_index]
+                    decomposition = processing.decomposition
+                    for rank, result in enumerate(results, 1):
+                        payload = result.get("payload", result)
+                        video_id = payload.get("video_id") if isinstance(payload, Mapping) else None
+                        if not isinstance(video_id, str) or not video_id:
+                            continue
+                        matched = False
+                        if decomposition is not None:
+                            texts = self._payload_text_values(result)
+                            for entity in decomposition.named_entities:
+                                if self._exact_entity_match(texts, entity.lexical_terms):
+                                    identity = fold_entity_text(entity.text)
+                                    per_prompt_entity_videos[prompt_index][identity].add(video_id)
+                                    matched = True
+                        multiplier = 3.0 if matched else 1.0
+                        per_prompt_scores[prompt_index][video_id] += multiplier / (60 + rank)
                 self.last_channel_statuses[channel_name] = {
                     "state": "ready",
                     "reason_code": "query_completed",
@@ -527,7 +921,35 @@ class TRAKEPipeline:
             ordered = sorted(scores, key=lambda video_id: (-scores[video_id], video_id))
             for rank, video_id in enumerate(ordered, 1):
                 combined[video_id] += 1.0 / (60 + rank)
-        return tuple(sorted(combined, key=lambda video_id: (-combined[video_id], video_id)))
+        eligible: set[str] | None = None
+        if has_required:
+            required_sets: list[set[str]] = []
+            for prompt_index, entities in enumerate(required_by_prompt):
+                for entity in entities:
+                    required_sets.append(
+                        set(per_prompt_entity_videos[prompt_index].get(fold_entity_text(entity.text), set()))
+                    )
+            eligible = set.intersection(*required_sets) if ready_channels and required_sets else set()
+            diagnostics = dict(self.last_query_processing)
+            diagnostics["required_entity_status"] = (
+                "required_entity_match"
+                if eligible
+                else "required_entity_no_match"
+                if ready_channels
+                else "required_entity_evidence_unavailable"
+            )
+            self.last_query_processing = diagnostics
+        ordered_videos = tuple(
+            sorted(
+                (
+                    video_id
+                    for video_id in combined
+                    if eligible is None or video_id in eligible
+                ),
+                key=lambda video_id: (-combined[video_id], video_id),
+            )
+        )
+        return ordered_videos, eligible
 
     def _query_embeddings(
         self,
@@ -539,14 +961,22 @@ class TRAKEPipeline:
             request.global_description_en,
             *(stage.description_en for stage in request.stages),
         )
+        constraints = (
+            request.global_entity_constraints,
+            *(stage.entity_constraints for stage in request.stages),
+        )
         processings: list[QueryProcessing] = []
         variants_by_prompt: list[tuple[QueryVariant, ...]] = []
         adapter = self.query_adapter or QueryTextAdapter()
-        for text, override in zip(texts, overrides, strict=True):
+        for prompt_index, (text, override, entity_constraints) in enumerate(
+            zip(texts, overrides, constraints, strict=True)
+        ):
             processing = adapter.prepare(
                 text,
                 language_hint=request.query_language,
                 english_override=override,
+                entity_constraints=entity_constraints,
+                prompt_index=prompt_index,
             )
             variants = adapter.dense_variants(self.channel_name, processing)
             if not variants:
@@ -563,6 +993,11 @@ class TRAKEPipeline:
             query_sets.append(matrix[cursor:stop])
             cursor = stop
         global_processing = processings[0]
+        all_entities = [
+            entity
+            for processing in processings
+            for entity in processing.to_dict().get("entities", ())
+        ]
         self.last_query_processing = {
             **global_processing.to_dict(),
             "prompt_count": len(processings),
@@ -570,6 +1005,13 @@ class TRAKEPipeline:
                 1
                 for processing in processings
                 if processing.translation.translation_applied
+            ),
+            "entities": all_entities,
+            "entity_boost_enabled": bool(all_entities),
+            "required_entity_count": sum(
+                len(processing.decomposition.required_entities)
+                for processing in processings
+                if processing.decomposition is not None
             ),
             "channel_policies": {
                 self.channel_name: {
@@ -602,9 +1044,10 @@ class TRAKEPipeline:
     ) -> dict[str, tuple[_FrameVector, ...]]:
         if not candidate_videos:
             return {}
-        grouped: dict[str, dict[int, dict[str, tuple[int, np.ndarray]]]] = defaultdict(
-            lambda: defaultdict(dict)
-        )
+        grouped: dict[
+            str,
+            dict[int, dict[str, tuple[int, np.ndarray, str | None]]],
+        ] = defaultdict(lambda: defaultdict(dict))
         allowed = set(candidate_videos)
         for point in points:
             if not isinstance(point, Mapping):
@@ -616,6 +1059,12 @@ class TRAKEPipeline:
             point_batch_id = payload.get("batch_id")
             frame_idx = self._payload_int(payload, "source_frame_idx")
             timestamp_ms = self._payload_int(payload, "timestamp_ms")
+            raw_shot_id = payload.get("shot_id")
+            shot_id = (
+                raw_shot_id.strip()
+                if isinstance(raw_shot_id, str) and raw_shot_id.strip()
+                else None
+            )
             if point_batch_id != batch_id:
                 continue
             if not isinstance(video_id, str) or video_id not in allowed:
@@ -644,7 +1093,7 @@ class TRAKEPipeline:
             )
             grouped[video_id][frame_idx].setdefault(
                 identity,
-                (timestamp_ms, vector / norm),
+                (timestamp_ms, vector / norm, shot_id),
             )
 
         result: dict[str, tuple[_FrameVector, ...]] = {}
@@ -657,11 +1106,17 @@ class TRAKEPipeline:
                 norm = float(np.linalg.norm(merged))
                 if norm <= 0 or not np.isfinite(norm):
                     continue
+                duplicate_shots = {item[2] for item in duplicates}
                 frames.append(
                     _FrameVector(
                         source_frame_idx=frame_idx,
                         timestamp_ms=min(item[0] for item in duplicates),
                         vector=(merged / norm).astype(np.float32, copy=False),
+                        shot_id=(
+                            next(iter(duplicate_shots))
+                            if len(duplicate_shots) == 1
+                            else None
+                        ),
                     )
                 )
             frames.sort(key=lambda frame: (frame.timestamp_ms, frame.source_frame_idx))
@@ -746,15 +1201,25 @@ class TRAKEPipeline:
             else None
         )
         self.last_channel_statuses = {}
-        lexical_video_order = (
+        has_required_entities = any(
+            processing.decomposition is not None
+            and processing.decomposition.required_entities
+            for processing in processings
+        )
+        lexical_video_order, eligible_videos = (
             self._lexical_candidate_order(processings, batch_id)
             if exact_batch is not None
-            else ()
+            else ((), set() if has_required_entities else None)
         )
+        if exact_batch is None and has_required_entities:
+            diagnostics = dict(self.last_query_processing)
+            diagnostics["required_entity_status"] = "required_entity_evidence_unavailable"
+            self.last_query_processing = diagnostics
         stage_a, seed_points = self._candidate_scores(
             query_sets,
             batch_id,
             lexical_video_order,
+            eligible_videos,
         )
         frames_by_video = (
             {}
@@ -776,6 +1241,7 @@ class TRAKEPipeline:
             timestamps_ms: np.ndarray,
             stage_similarities: np.ndarray,
             global_score: float,
+            shot_ids: Sequence[str | None] | None = None,
         ) -> None:
             if (
                 source_frames.ndim != 1
@@ -792,6 +1258,11 @@ class TRAKEPipeline:
             alignment = strict_monotonic_alignment(
                 stage_similarities,
                 source_frames,
+                timestamps_ms=timestamps_ms,
+                shot_ids=shot_ids,
+                max_gap_ms=self.max_stage_gap_ms,
+                gap_penalty_per_second=self.temporal_gap_penalty_per_second,
+                shot_boundary_penalty=self.shot_boundary_penalty,
             )
             if alignment is None:
                 return
@@ -876,6 +1347,7 @@ class TRAKEPipeline:
                     timestamps_ms,
                     stage_similarities,
                     float(np.max(global_vectors @ matrix.T)),
+                    tuple(frame.shot_id for frame in frames),
                 )
         alignments.sort(
             key=lambda item: (

@@ -628,6 +628,21 @@ class WarmupService:
 
                 channels.append(self._channel_result(channel.name, warm_lexical))
 
+            advanced_reranker = getattr(self.pipeline, "advanced_reranker", None)
+            object_archive = getattr(advanced_reranker, "object_archive", None)
+            if object_archive is not None and callable(
+                getattr(object_archive, "warmup", None)
+            ):
+
+                def warm_object_evidence() -> None:
+                    diagnostics = object_archive.warmup()
+                    if diagnostics.get("archive_state") != "ready":
+                        raise LookupError("object evidence archive is unavailable")
+
+                channels.append(
+                    self._channel_result("object_evidence", warm_object_evidence)
+                )
+
             refiner = getattr(self.pipeline, "raw_refiner", None)
             has_refinable = False
             if (

@@ -5,6 +5,7 @@ from __future__ import annotations
 import gc
 import hashlib
 import threading
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,7 @@ import numpy as np
 from PIL import Image
 
 from src.contracts import TextEncodingDiagnostics
+from src.embedding.cuda_health import CUDAEncoderRestartRequired, is_fatal_cuda_error
 from src.embedding.text_chunks import chunk_text
 from src.utils.offline import enforce_huggingface_offline
 
@@ -59,6 +61,21 @@ class CLIPEncoder:
         self._preprocess: Any = None
         self._tokenizer: Any = None
         self._lifecycle_lock = threading.RLock()
+        self._cuda_circuit_open = False
+
+    @property
+    def cuda_restart_required(self) -> bool:
+        return self._cuda_circuit_open
+
+    def _ensure_cuda_healthy(self) -> None:
+        if self._cuda_circuit_open:
+            raise CUDAEncoderRestartRequired()
+
+    def _guard_cuda_error(self, error: RuntimeError) -> None:
+        if self.device.startswith("cuda") and is_fatal_cuda_error(error):
+            self._cuda_circuit_open = True
+            raise CUDAEncoderRestartRequired() from None
+        raise error
 
     @property
     def fingerprint(self) -> str:
@@ -113,13 +130,31 @@ class CLIPEncoder:
         self._tokenizer = open_clip.get_tokenizer(self.model_name)
         self._torch = torch
 
-    def encode_images(self, image_paths: list[str | Path]) -> np.ndarray:
+    @staticmethod
+    def _open_image(source: str | Path | bytes | Image.Image) -> Image.Image:
+        if isinstance(source, Image.Image):
+            return source.convert("RGB").copy()
+        if isinstance(source, bytes):
+            with Image.open(BytesIO(source)) as image:
+                return image.convert("RGB").copy()
+        with Image.open(source) as image:
+            return image.convert("RGB").copy()
+
+    def encode_images(
+        self, image_paths: list[str | Path | bytes | Image.Image]
+    ) -> np.ndarray:
         """Serialize model loading and inference across warm-up and queries."""
 
         with self._lifecycle_lock:
-            return self._encode_images_unlocked(image_paths)
+            self._ensure_cuda_healthy()
+            try:
+                return self._encode_images_unlocked(image_paths)
+            except RuntimeError as error:
+                self._guard_cuda_error(error)
 
-    def _encode_images_unlocked(self, image_paths: list[str | Path]) -> np.ndarray:
+    def _encode_images_unlocked(
+        self, image_paths: list[str | Path | bytes | Image.Image]
+    ) -> np.ndarray:
         """Encode images in bounded batches and return normalized float32 rows."""
 
         if not image_paths:
@@ -130,8 +165,11 @@ class CLIPEncoder:
             for start in range(0, len(image_paths), self.batch_size):
                 images = []
                 for path in image_paths[start : start + self.batch_size]:
-                    with Image.open(path) as image:
-                        images.append(self._preprocess(image.convert("RGB")))
+                    image = self._open_image(path)
+                    try:
+                        images.append(self._preprocess(image))
+                    finally:
+                        image.close()
                 batch = self._torch.stack(images).to(self.device)
                 encoded = self._model.encode_image(batch)
                 rows.append(encoded.float().cpu().numpy())
@@ -141,7 +179,11 @@ class CLIPEncoder:
         """Serialize model loading and inference across warm-up and queries."""
 
         with self._lifecycle_lock:
-            return self._encode_text_unlocked(text)
+            self._ensure_cuda_healthy()
+            try:
+                return self._encode_text_unlocked(text)
+            except RuntimeError as error:
+                self._guard_cuda_error(error)
 
     def _encode_text_unlocked(self, text: str | list[str]) -> np.ndarray:
         """Encode one or more text queries into normalized float32 rows."""
@@ -162,18 +204,22 @@ class CLIPEncoder:
         """Encode tokenizer-aware query chunks without silently dropping content."""
 
         with self._lifecycle_lock:
-            self._load_model()
-            context_limit = int(getattr(self._model, "context_length", 77))
-            content_limit = min(75, max(1, context_limit - 2))
-            chunks = chunk_text(
-                self._tokenizer,
-                text,
-                context_limit=context_limit,
-                content_limit=content_limit,
-                max_chunks=self.text_max_chunks,
-                overlap=min(self.text_chunk_overlap, content_limit - 1),
-            )
-            return self._encode_text_unlocked(list(chunks.texts)), chunks.diagnostics
+            self._ensure_cuda_healthy()
+            try:
+                self._load_model()
+                context_limit = int(getattr(self._model, "context_length", 77))
+                content_limit = min(75, max(1, context_limit - 2))
+                chunks = chunk_text(
+                    self._tokenizer,
+                    text,
+                    context_limit=context_limit,
+                    content_limit=content_limit,
+                    max_chunks=self.text_max_chunks,
+                    overlap=min(self.text_chunk_overlap, content_limit - 1),
+                )
+                return self._encode_text_unlocked(list(chunks.texts)), chunks.diagnostics
+            except RuntimeError as error:
+                self._guard_cuda_error(error)
 
     def compute_similarity(self, query_emb: np.ndarray, image_embs: np.ndarray) -> np.ndarray:
         """Compute cosine similarity for already normalized embeddings."""

@@ -15,6 +15,7 @@ warmup:
 
 readiness:
   cache_seconds: 10
+  cloud_import_completion_receipt: data/checkpoints/cloud-import/b01-import-complete.json
   accelerated_min_usable_vram_gib: 11.5
   default_batch_kind: native
   batches:
@@ -126,6 +127,10 @@ models:
     device: cpu
     compute_type: int8
     intra_threads: 8
+    request_timeout_seconds: 3
+    startup_timeout_seconds: 30
+    sentence_max_chars: 400
+    source_token_limit: 448
     max_decoding_length: 128
     memory_cache_entries: 2048
     disk_cache_entries: 10000
@@ -206,10 +211,12 @@ models:
     languages: [vi, en]
     use_gpu: false
   whisper:
+    profile: production
     model_size: large-v3-turbo
     hub_model_id: dropbox-dash/faster-whisper-large-v3-turbo
     revision: 0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf
     local_path: models/whisper/large-v3-turbo
+    asset_manifest: checksums/whisper-large-v3-turbo.sha256
     language: vi
     device: cuda
     compute_type: int8_float16
@@ -217,9 +224,48 @@ models:
     beam_size: 1
     retry_beam_size: 5
     vad_filter: true
+    vad_parameters:
+      min_silence_duration_ms: 500
+      speech_pad_ms: 200
+    condition_on_previous_text: true
     cache_dir: models/whisper
     local_files_only: true
     extract_audio_16khz: true
+  reference_provisioning:
+    rapidocr:
+      package_version: 3.9.2
+      engine: onnxruntime
+      ocr_version: PP-OCRv6
+      model_type: small
+      language: vi
+      model_dir: models/rapidocr/ppocrv6-small-multilingual
+      source_repo: DjB314/RapidOCR
+      source_revision: 04e88d0483f0bfcdd0f29429594244c10bfc2867
+      asset_manifest: checksums/rapidocr-reference.sha256
+      confidence_threshold: 0.50
+      min_text_characters: 2
+      local_files_only: true
+    whisper:
+      model_size: small
+      hub_model_id: Systran/faster-whisper-small
+      revision: 536b0662742c02347bc0e980a01041f333bce120
+      local_path: models/whisper/small
+      asset_manifest: checksums/whisper-small.sha256
+      language: vi
+      device: cpu
+      compute_type: int8
+      beam_size: 1
+      retry_beam_size: 1
+      vad_filter: true
+      local_files_only: true
+    resource_limits:
+      process_rss_gib: 3.5
+      gpu_process_gib: 2.5
+      sample_interval_seconds: 0.25
+    ocr_upsert_batch_size: 500
+    vector_upsert_batch_size: 256
+    siglip_initial_batch_size: 8
+    siglip_max_batch_size: 16
 services:
   gemini_vlm:
     api_key_env: GEMINI_API_KEY
@@ -266,8 +312,71 @@ services:
       metadata: aic_metadata_multilingual_v2
 
 retrieval:
+  # Canonical metadata only; scalar restores the per-hit lookup implementation.
+  metadata_resolution: asr_only_batched
   top_k: 100
   rrf_k: 60
+  semantic_views:
+    # Late fusion stays global-only until a locked-qrels record passes activation.
+    fusion: global_only
+    weights: {}
+    consensus_alpha: 0.0
+    tuning_record: outputs/evaluation/kis-semantic-view-tuning.json
+  candidate_rescue:
+    # Shadow executes and diagnoses rescue, but never changes returned ranks.
+    mode: shadow
+    sample_size: 50
+    min_unique_videos: 15
+    max_top_video_share: 0.25
+    max_video_hhi: 0.12
+    expanded_depth: 600
+    max_depth: 900
+    grouped_videos: 100
+    frames_per_video: 2
+    overfetch_weight: 0.4
+    grouped_weight: 0.8
+    tuning_record: outputs/evaluation/kis-candidate-rescue-tuning.json
+  video_local:
+    # Uses the already-warmed TRAKE cache; request handling never warms it.
+    # Kept available for research, but disabled at runtime because the combined
+    # three-feature shadow benchmark exceeded the 1.2x warm-p95 gate.
+    mode: "off"
+    source_channel: organizer_clip
+    candidate_videos: 12
+    frames_per_video: 5
+    weight: 0.6
+    support_window_ms: 8000
+    gaussian_sigma_ms: 4000
+    tuning_record: outputs/evaluation/kis-video-local-tuning.json
+  ocr_quality:
+    mode: shadow
+    sidecar_path: data/state/ocr-quality.sqlite3
+    min_multiplier: 0.65
+    max_multiplier: 1.10
+    candidate_limit: 200
+    tuning_record: outputs/evaluation/kis-ocr-quality-tuning.json
+  text_reranker:
+    # Model loading stays outside the default CPU/offline environment.
+    mode: "off"
+    model_name: BAAI/bge-reranker-v2-m3
+    candidate_limit: 50
+    eligible_channels: [ocr, asr, metadata]
+    tuning_record: outputs/evaluation/kis-text-reranker-tuning.json
+  interaction_log:
+    mode: shadow
+    path: outputs/evaluation/kis-interactions.jsonl
+    max_results: 100
+  intent_policies:
+    visual_dense: {rrf_k: 60, dense_share: 0.70, text_share: 0.30}
+    lexical_dominant: {rrf_k: 40, dense_share: 0.25, text_share: 0.75}
+    spatial_color: {rrf_k: 60, dense_share: 0.70, text_share: 0.30}
+  entity_routing:
+    extractor_version: vi-entity-rules-v1
+    lexical_multiplier: 3.0
+    bonus_alpha: 0.25
+    required_scope: video_all_lexical
+    max_entities_per_prompt: 16
+    max_entities_per_trake_query: 64
   text_query:
     max_chunks: 4
     overlap_tokens: 8
@@ -288,10 +397,69 @@ retrieval:
     asr: 0.7
     semantic_text: 0.7
     metadata: 0.4
+  asr_routing:
+    enabled: true
+    max_weight: 0.7
+    temporal_overlap_bonus: 0.3
+    temporal_padding_ms: 1000
+    qa_context_radius_ms: 30000
+    qa_context_max_characters: 4000
   tune_rrf_k: [20, 40, 60, 80]
   # A labeled report at this path overrides only k/depths/weights; a no-label
   # defaults report is intentionally ignored by the runtime.
   tuning_record: outputs/evaluation/retrieval-tuning.json
+  intent_tuning_record: outputs/evaluation/retrieval-intent-tuning.json
+  advanced_kis:
+    enabled: true
+    object_batch_id: aic25-b1-reference
+    object_archive: objects-aic25-b1.zip
+    object_confidence_threshold: 0.50
+    object_max_member_bytes: 1048576
+    object_cache_entries: 2048
+    object_cache_bytes: 16777216
+    # Largest measured head with transactional warm p95 <= 20 ms (2026-08-24).
+    spatial_candidate_depth: 64
+    spatial_beta: 0.35
+    color_candidate_depth: 8
+    color_absent_multiplier: 0.65
+    color_image_dimension: 224
+    color_workers: 2
+    color_cache_entries: 512
+    color_cache_bytes: 16777216
+    relation_beta: 0.40
+    spatial_ontology:
+      directional_margin: 0.03
+      directional_scale: 0.25
+      near_threshold: 0.35
+      far_min: 0.30
+      far_max: 0.70
+      inside_satisfied_coverage: 0.90
+      between_projection_min: 0.10
+      between_projection_max: 0.90
+      between_perpendicular_threshold: 0.20
+      depth_area_ratio: 1.20
+      depth_sigmoid_scale: 10.0
+      depth_vertical_tolerance: 0.05
+      perspective_weight: 0.50
+      nms_iou_threshold: 0.50
+      max_detections_per_node: 6
+      beam_width: 512
+    negation_confidence_threshold: 0.60
+    negation_multiplier: 0.10
+    strict_color_roi_threshold: 0.12
+    strict_color_beta: 0.25
+    strict_color_mismatch_multiplier: 0.10
+    cross_modal:
+      enabled: false
+      allowed_profiles: [accelerated]
+      candidate_depth: 20
+      max_object_crops: 2
+      calibration: rank
+      seed_weights:
+        base: 0.60
+        global: 0.25
+        crop: 0.15
+      tuning_record: outputs/evaluation/kis-cross-modal-tuning.json
   temporal_windows_ms: [4000, 8000]
   raw_refinement:
     enabled: true
@@ -321,9 +489,14 @@ retrieval:
     grouped_search_workers: 8
     vector_scroll_batch_size: 4096
     persist_trajectory_cache: true
-    trajectory_snapshot_schema_version: 1
+    trajectory_snapshot_schema_version: 2
     trajectory_snapshot_lock_timeout_seconds: 600
     global_weight: 0.25
+    # Penalize only the excess beyond two minutes; 0.001 costs 0.06 per
+    # additional minute. Shot cost applies only when trustworthy shot IDs exist.
+    max_stage_gap_ms: 120000
+    temporal_gap_penalty_per_second: 0.001
+    shot_boundary_penalty: 0.02
     min_stages: 2
     max_stages: 20
     raw_refinement_enabled: false

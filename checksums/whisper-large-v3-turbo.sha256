@@ -1,0 +1,5 @@
+b0253ea6c0d3bea6b1e19e91a02acfd3b53f4467362efcb5a3e6b16c9b3a9b7e  models/whisper/large-v3-turbo/config.json
+e76620f83d5f5b69efd3d87e3dc180c1bd21df9fbebacfd4335e5e1efcc018da  models/whisper/large-v3-turbo/model.bin
+7ccc62c6f2765af1f3b46c00c9b5894426835a05021c8b9c01eecb6dfb542711  models/whisper/large-v3-turbo/preprocessor_config.json
+297b13372ac43916285644fb9687add3cc62ee2a1adb60da3dc25cc94c1871fd  models/whisper/large-v3-turbo/tokenizer.json
+c69260f2ab26d659b7c398f9a2b2b48ed0df16c3b47d7326782fd9cba71690c1  models/whisper/large-v3-turbo/vocabulary.json

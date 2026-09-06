@@ -79,7 +79,7 @@ def test_cache_is_lazy_compact_and_rebuilds_when_fingerprint_changes() -> None:
     assert video.source_frame_indices.tolist() == [10, 20]
     assert video.vectors.flags.c_contiguous
     assert video.vectors.flags.writeable is False
-    assert first["nbytes"] == 2 * (2 * 4 + 8 + 8)
+    assert first["nbytes"] == 2 * (2 * 4 + 8 + 8 + 8)
     assert store.stream_calls == 1
     assert store.filters == [{"batch_id": "batch-1"}]
 

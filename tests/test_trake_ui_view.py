@@ -4,12 +4,17 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
+import app.streamlit_app as streamlit_app
 from app.streamlit_app import (
     _invalidate_trake_results,
+    _pin_trake_sequence,
     _trake_csv_bytes,
     _trake_readiness,
     _trake_response_dict,
     _trake_result_rows,
+    _trake_sequence_with_overrides,
     _vi_status,
 )
 
@@ -163,4 +168,113 @@ def test_trake_query_change_invalidates_old_results_and_export_identity() -> Non
         "trake_query_id": None,
         "trake_result_stage_count": None,
         "trake_export_cache": None,
+        "trake_pinned": [],
+        "trake_frame_overrides": {},
     }
+
+
+class _OverrideRepository:
+    _timestamps = {
+        5: 2_500,
+        10: 1_000,
+        15: 1_500,
+        20: 2_000,
+        25: 900,
+    }
+
+    def get_source_frame(self, batch_id, video_id, source_frame_idx):
+        timestamp_ms = self._timestamps.get(source_frame_idx)
+        if (
+            batch_id != "aic25-b1-reference"
+            or video_id != "L21_V001"
+            or timestamp_ms is None
+        ):
+            return None
+        return SimpleNamespace(timestamp_ms=timestamp_ms)
+
+
+def test_trake_overrides_re_resolve_canonical_timestamps_and_provenance() -> None:
+    selected = _result()
+    selected["stage_matches"][0]["timestamp_ms"] = 99_999
+    selected["stage_matches"][1]["timestamp_ms"] = 1
+    context = SimpleNamespace(artifact_repository=_OverrideRepository())
+
+    resolved = _trake_sequence_with_overrides(context, selected, {1: 15})
+
+    assert resolved["stage_matches"] == [
+        {
+            "stage_index": 1,
+            "source_frame_idx": 15,
+            "timestamp_ms": 1_500,
+        },
+        {
+            "stage_index": 2,
+            "source_frame_idx": 20,
+            "timestamp_ms": 2_000,
+            "similarity": 0.7,
+        },
+    ]
+    assert selected["stage_matches"][0]["source_frame_idx"] == 10
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({2: 5}, "strictly monotonic"),
+        ({2: 25}, "strictly monotonic"),
+        ({2: 999}, "not canonical"),
+    ],
+)
+def test_trake_overrides_reject_nonmonotonic_or_noncanonical_frames(
+    overrides: dict[int, int],
+    message: str,
+) -> None:
+    context = SimpleNamespace(artifact_repository=_OverrideRepository())
+
+    with pytest.raises(ValueError, match=message):
+        _trake_sequence_with_overrides(context, _result(), overrides)
+
+
+class _SessionState(dict):
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError as error:
+            raise AttributeError(name) from error
+
+    def __setattr__(self, name, value):
+        self[name] = value
+
+
+def test_pin_trake_sequence_replaces_same_video_and_keeps_contiguous_ranks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _result()
+    second = {
+        **_result(),
+        "rank": 2,
+        "video_id": "L21_V002",
+    }
+    replacement = {
+        **_result(),
+        "rank": 99,
+        "stage_matches": [
+            {"stage_index": 1, "source_frame_idx": 11, "timestamp_ms": 1_100},
+            {"stage_index": 2, "source_frame_idx": 21, "timestamp_ms": 2_100},
+        ],
+    }
+    state = _SessionState(
+        trake_pinned=[first, second],
+        trake_export_cache={"stale": True},
+    )
+    monkeypatch.setattr(streamlit_app, "st", SimpleNamespace(session_state=state))
+
+    _pin_trake_sequence(replacement)
+
+    assert [value["video_id"] for value in state["trake_pinned"]] == [
+        "L21_V002",
+        "L21_V001",
+    ]
+    assert [value["rank"] for value in state["trake_pinned"]] == [1, 2]
+    assert state["trake_pinned"][1]["stage_matches"][0]["source_frame_idx"] == 11
+    assert state["trake_export_cache"] is None

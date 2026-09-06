@@ -52,6 +52,12 @@ class FakeIndex:
     def get_stats(self):
         return {"numberOfDocuments": self.document_count}
 
+    def get_settings(self):
+        return {
+            "searchableAttributes": self.searchable_attributes,
+            "filterableAttributes": self.filterable_attributes,
+        }
+
 
 class FakeMeilisearchClient:
     def __init__(self, *, exists: bool = True) -> None:
@@ -60,6 +66,8 @@ class FakeMeilisearchClient:
         self.waited = []
         self.next_task_uid = 1
         self.failed_tasks = set()
+        self.multi_search_calls = []
+        self.multi_search_response = {"results": []}
 
     def new_task(self):
         uid = self.next_task_uid
@@ -76,11 +84,15 @@ class FakeMeilisearchClient:
         self.index = FakeIndex(self, primary_key=options["primaryKey"])
         return self.new_task()
 
-    def wait_for_task(self, task_uid, *, timeout_in_ms):
-        self.waited.append((task_uid, timeout_in_ms))
+    def wait_for_task(self, task_uid, *, timeout_in_ms, interval_in_ms):
+        self.waited.append((task_uid, timeout_in_ms, interval_in_ms))
         if task_uid in self.failed_tasks:
             return {"uid": task_uid, "status": "failed", "error": {"message": "bad task"}}
         return {"uid": task_uid, "status": "succeeded"}
+
+    def multi_search(self, queries):
+        self.multi_search_calls.append(list(queries))
+        return self.multi_search_response
 
 
 def make_store(client: FakeMeilisearchClient) -> TextStore:
@@ -108,6 +120,10 @@ def test_create_index_is_idempotent_and_configures_lexical_fields() -> None:
     assert "text_nfc" in client.index.searchable_attributes
     assert "text_accent_folded" in client.index.searchable_attributes
     assert "video_id" in client.index.filterable_attributes
+    assert len(client.waited) == 2
+
+    store.create_index()
+
     assert len(client.waited) == 2
 
 
@@ -227,6 +243,27 @@ def test_search_passes_an_explicit_vietnamese_locale() -> None:
     assert client.index.search_calls[-1][1]["locales"] == ["vie"]
 
 
+def test_multi_search_batches_entity_variants_in_one_request() -> None:
+    client = FakeMeilisearchClient(exists=True)
+    client.multi_search_response = {
+        "results": [
+            {"hits": [{"id": "a", "video_id": "v1", "_rankingScore": 0.9}]},
+            {"hits": [{"id": "b", "video_id": "v2", "_rankingScore": 0.8}]},
+        ]
+    }
+    store = make_store(client)
+
+    results = store.search_many(
+        (("truy vấn đầy đủ", ("vie",)), ("FANA Khánh Hòa", ("vie",))),
+        top_k=20,
+        filters='batch_id = "b1"',
+    )
+
+    assert [value[0]["id"] for value in results] == ["a", "b"]
+    assert len(client.multi_search_calls) == 1
+    assert client.multi_search_calls[0][1]["q"] == "FANA Khánh Hòa"
+
+
 def test_shadow_v2_settings_are_versioned_and_never_touch_live_v1() -> None:
     client = FakeMeilisearchClient(exists=True)
     live = make_store(client)
@@ -277,6 +314,26 @@ def test_shadow_copy_count_and_document_iteration_are_bounded() -> None:
         "limit": 10,
         "filter": 'batch_id = "b1"',
     }
+
+
+def test_filtered_count_uses_exact_facet_distribution_not_capped_estimate() -> None:
+    client = FakeMeilisearchClient(exists=True)
+    client.index.search_response = {
+        "hits": [],
+        "estimatedTotalHits": 1_000,
+        "facetDistribution": {"batch_id": {"b1": 1_067_830}},
+    }
+    store = make_store(client)
+
+    assert store.count_documents('batch_id = "b1"') == 1_067_830
+    assert client.index.search_calls[-1] == (
+        "",
+        {
+            "limit": 0,
+            "facets": ["batch_id"],
+            "filter": 'batch_id = "b1"',
+        },
+    )
 
 
 def test_availability_is_scoped_and_requires_a_document() -> None:

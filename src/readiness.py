@@ -15,7 +15,7 @@ import re
 import sqlite3
 import threading
 import time
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Protocol
@@ -130,6 +130,7 @@ class ReadinessReport:
     channels: tuple[ChannelReadiness, ...]
     checks: tuple[RuntimeCheck, ...]
     checked_at_unix: float
+    multimodal: Mapping[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -143,6 +144,7 @@ class ReadinessReport:
             "channels": [channel.to_dict() for channel in self.channels],
             "checks": [check.to_dict() for check in self.checks],
             "checked_at_unix": self.checked_at_unix,
+            "multimodal": dict(self.multimodal),
         }
 
 
@@ -255,6 +257,270 @@ def _profile_enabled(model: Mapping[str, Any], profile: str) -> bool:
         return False
     enabled_profiles = tuple(str(item) for item in model.get("enabled_profiles", ()))
     return not enabled_profiles or profile in enabled_profiles
+
+
+def _read_only_connection(path: Path) -> sqlite3.Connection:
+    return sqlite3.connect(f"file:{path.resolve().as_posix()}?mode=ro", uri=True)
+
+
+def multimodal_coverage_snapshot(
+    config: Mapping[str, Any],
+    batch_id: str,
+    channels: Iterable[ChannelReadiness],
+    *,
+    project_root: Path = PROJECT_ROOT,
+) -> dict[str, Any]:
+    """Project exact artifact/ledger progress without creating generated state."""
+
+    readiness = config.get("readiness", {})
+    batches = readiness.get("batches", {}) if isinstance(readiness, Mapping) else {}
+    specification = batches.get(batch_id, {}) if isinstance(batches, Mapping) else {}
+    expected_videos = int(specification.get("expected_videos", 0) or 0)
+    expected_frames = int(specification.get("expected_canonical_frames", 0) or 0)
+    expected_mapping_rows = int(specification.get("expected_mapping_rows", 0) or 0)
+    by_name = {channel.name: channel for channel in channels}
+    visual_count = int(by_name.get("visual").count or 0) if by_name.get("visual") else 0
+    organizer_count = (
+        int(by_name.get("organizer_clip").count or 0) if by_name.get("organizer_clip") else 0
+    )
+    ocr_documents = int(by_name.get("ocr").count or 0) if by_name.get("ocr") else 0
+    asr_documents = int(by_name.get("asr").count or 0) if by_name.get("asr") else 0
+    data = config.get("data", {})
+    ledger_path = _path(str(data.get("catalog_db", "")), project_root)
+    artifact_path = _path(str(data.get("artifact_db", "")), project_root)
+    frame_counts: dict[str, int] = {}
+    stage_rows: dict[str, list[tuple[str, str, str | None]]] = {
+        "ocr": [],
+        "siglip2": [],
+        "asr": [],
+    }
+    zero_transcript = 0
+    asr_source_available = 0
+    try:
+        if artifact_path.is_file():
+            with _read_only_connection(artifact_path) as connection:
+                frame_counts = {
+                    str(row[0]): int(row[1])
+                    for row in connection.execute(
+                        """
+                        SELECT video_id, COUNT(*) FROM canonical_frames
+                        WHERE batch_id = ? GROUP BY video_id
+                        """,
+                        (batch_id,),
+                    )
+                }
+        if ledger_path.is_file():
+            with _read_only_connection(ledger_path) as connection:
+                for logical, stage_name in (
+                    ("ocr", "reference_ocr"),
+                    ("siglip2", "reference_siglip2"),
+                    ("asr", "reference_asr"),
+                ):
+                    stage_rows[logical] = [
+                        (str(row[0]), str(row[1]), None if row[2] is None else str(row[2]))
+                        for row in connection.execute(
+                            """
+                            SELECT video_id, state, error FROM stages
+                            WHERE batch_id = ? AND stage_name = ?
+                            ORDER BY video_id
+                            """,
+                            (batch_id, stage_name),
+                        )
+                    ]
+                zero_transcript = int(
+                    connection.execute(
+                        """
+                        SELECT COUNT(DISTINCT video_id) FROM artifacts
+                        WHERE batch_id = ? AND stage_name = 'reference_asr'
+                          AND kind IN ('asr_no_audio', 'asr_zero_transcript')
+                        """,
+                        (batch_id,),
+                    ).fetchone()[0]
+                )
+                asr_source_available = int(
+                    connection.execute(
+                        """
+                        SELECT COUNT(*) FROM videos
+                        WHERE batch_id = ? AND TRIM(source_uri) <> ''
+                        """,
+                        (batch_id,),
+                    ).fetchone()[0]
+                )
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        return {
+            "status": "unknown",
+            "reason_code": "multimodal_progress_unavailable",
+            "expected_videos": expected_videos,
+            "expected_canonical_frames": expected_frames,
+        }
+
+    def completed(stage: str) -> tuple[str, ...]:
+        return tuple(video_id for video_id, state, _ in stage_rows[stage] if state == "completed")
+
+    ocr_completed = completed("ocr")
+    siglip_completed = completed("siglip2")
+    asr_completed = completed("asr")
+    ocr_scanned = sum(frame_counts.get(video_id, 0) for video_id in ocr_completed)
+    # Source availability is independent from ASR processing completion.
+    asr_failed = sum(state == "failed" for _, state, _ in stage_rows["asr"])
+    asr_missing = max(0, expected_videos - asr_source_available)
+    organizer_complete = expected_mapping_rows > 0 and organizer_count == expected_mapping_rows
+    siglip_complete = (
+        expected_frames > 0
+        and visual_count == expected_frames
+        and len(siglip_completed) == expected_videos
+    )
+    ocr_complete = expected_frames > 0 and ocr_scanned == expected_frames
+    ocr_usable = ocr_documents > 0 and bool(ocr_completed)
+    asr_complete = expected_videos > 0 and len(asr_completed) == expected_videos
+    full_multimodal_counts = {
+        "organizer_clip": organizer_count,
+        "siglip2": visual_count,
+        "ocr": ocr_documents,
+        "asr": asr_documents,
+    }
+    channel_complete = {
+        "organizer_clip": organizer_complete,
+        "siglip2": siglip_complete,
+        "ocr": ocr_complete and ocr_documents > 0,
+        "asr": asr_complete and asr_documents > 0 and asr_failed == 0,
+    }
+    missing_full_multimodal = tuple(
+        name for name in ("organizer_clip", "siglip2", "ocr", "asr") if not channel_complete[name]
+    )
+    advanced_kis = config.get("retrieval", {}).get("advanced_kis", {})
+    object_batch_id = str(advanced_kis.get("object_batch_id", ""))
+    object_archive_value = str(advanced_kis.get("object_archive", ""))
+    object_archive_path = _path(object_archive_value, project_root)
+    object_applicable = bool(object_batch_id == batch_id)
+    object_available = bool(object_applicable and object_archive_path.is_file())
+    object_state = (
+        "ready"
+        if object_available
+        else "archive_missing"
+        if object_applicable
+        else "not_applicable"
+    )
+    coverage_healthy = (
+        organizer_complete and siglip_complete and ocr_complete and asr_complete and asr_failed == 0
+    )
+    completion_value = readiness.get(
+        "cloud_import_completion_receipt",
+        "data/checkpoints/cloud-import/b01-import-complete.json",
+    )
+    completion_path = _path(str(completion_value), project_root)
+    completion_valid = False
+    completion_reason = "completion_receipt_missing"
+    completion_manifest_sha256: str | None = None
+    try:
+        receipt = json.loads(completion_path.read_text(encoding="utf-8"))
+        external_counts = receipt.get("external_counts")
+        manifest_value = receipt.get("manifest_path")
+        manifest_path = _path(str(manifest_value), project_root)
+        digest = hashlib.sha256()
+        with manifest_path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        completion_manifest_sha256 = digest.hexdigest()
+        completion_valid = bool(
+            receipt.get("contract") == "cloud-import-completion-v2"
+            and receipt.get("batch_id") == batch_id
+            and receipt.get("complete") is True
+            and tuple(receipt.get("completed_channels", ())) == ("siglip2", "ocr", "asr")
+            and isinstance(external_counts, Mapping)
+            and int(external_counts.get("siglip2", -1)) == visual_count
+            and int(external_counts.get("ocr", -1)) == ocr_documents
+            and int(external_counts.get("asr", -1)) == asr_documents
+            and completion_manifest_sha256 == receipt.get("manifest_sha256")
+        )
+        completion_reason = None if completion_valid else "completion_receipt_mismatch"
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        completion_valid = False
+    fully_healthy = coverage_healthy and completion_valid
+    full_multimodal_healthy = fully_healthy and not missing_full_multimodal
+    any_new_progress = bool(visual_count or ocr_completed or siglip_completed or asr_completed)
+    return {
+        "status": (
+            "healthy" if fully_healthy else "partial" if any_new_progress else "not_provisioned"
+        ),
+        "reason_code": (
+            None
+            if fully_healthy
+            else completion_reason
+            if coverage_healthy and not completion_valid
+            else "multimodal_coverage_incomplete"
+        ),
+        "capability_mode": ("full_multimodal" if full_multimodal_healthy else "multimodal_partial"),
+        "status_label": (
+            "HEALTHY · Full Multi-Modal"
+            if full_multimodal_healthy
+            else "DEGRADED · Multi-Modal Incomplete"
+        ),
+        "full_multimodal": {
+            "healthy": full_multimodal_healthy,
+            "required_channels": ("organizer_clip", "siglip2", "ocr", "asr"),
+            "unavailable_channels": missing_full_multimodal,
+            "usable_channels": tuple(
+                name
+                for name, usable in (
+                    ("organizer_clip", organizer_count > 0),
+                    ("siglip2", visual_count > 0),
+                    ("ocr", ocr_usable),
+                    ("asr", asr_documents > 0),
+                )
+                if usable
+            ),
+            "counts": full_multimodal_counts,
+            "completion_receipt": {
+                "valid": completion_valid,
+                "reason_code": completion_reason,
+                "manifest_sha256": completion_manifest_sha256,
+            },
+        },
+        "objects": {
+            "state": object_state,
+            "available": object_available,
+            "configured_batch_id": object_batch_id or None,
+            "required_for": ("absolute_spatial", "relative_spatial", "negation"),
+        },
+        "expected_videos": expected_videos,
+        "expected_canonical_frames": expected_frames,
+        "organizer_clip": {
+            "rows": organizer_count,
+            "expected_rows": expected_mapping_rows,
+            "consistent": organizer_complete,
+        },
+        "siglip2": {
+            "canonical_frames": visual_count,
+            "expected_frames": expected_frames,
+            "completed_videos": len(siglip_completed),
+            "consistent": siglip_complete,
+        },
+        "ocr": {
+            "scanned_canonical_frames": ocr_scanned,
+            "expected_frames": expected_frames,
+            "completed_videos": len(ocr_completed),
+            "text_documents": ocr_documents,
+            "consistent": ocr_complete,
+            "usable": ocr_usable,
+            "coverage_mode": "complete" if ocr_complete else "partial" if ocr_usable else "missing",
+            "coverage_ratio": (
+                min(1.0, ocr_scanned / expected_frames) if expected_frames > 0 else 0.0
+            ),
+        },
+        "asr": {
+            "source_videos": asr_source_available,
+            "completed_videos": len(asr_completed),
+            "zero_transcript_videos": zero_transcript,
+            # Compatibility alias for older clients. Zero transcript does not
+            # imply that the source video lacks an audio stream.
+            "no_audio_videos": zero_transcript,
+            "failed_videos": asr_failed,
+            "missing_source_videos": asr_missing,
+            "text_documents": asr_documents,
+            "consistent": asr_complete and asr_failed == 0,
+        },
+    }
 
 
 class ReadinessService:
@@ -423,16 +689,23 @@ class ReadinessService:
         qa = self._workflow(tuple(workflows.get("qa", ())), by_name, qa=True)
         checks = self._runtime_checks(mode)
         report = ReadinessReport(
-            profile,
-            batch_id,
-            self.selected_batch_id,
-            self.launch_identity,
-            mode,
-            kis,
-            qa,
-            channels,
-            checks,
-            now,
+            profile=profile,
+            batch_id=batch_id,
+            selected_batch_id=self.selected_batch_id,
+            launch_identity=self.launch_identity,
+            mode=mode,
+            kis=kis,
+            qa=qa,
+            channels=channels,
+            checks=checks,
+            checked_at_unix=now,
+            multimodal=multimodal_coverage_snapshot(
+                self.config,
+                batch_id,
+                channels,
+                project_root=self.project_root,
+            ),
+            # checked_at_unix is passed explicitly above.
         )
         with self._lock:
             self._cache[key] = (now, report)
@@ -457,9 +730,7 @@ class ReadinessService:
         by_name = {channel.name: channel for channel in report.channels}
         if workflow == "trake":
             unavailable = tuple(
-                name
-                for name in required
-                if name not in by_name or not by_name[name].usable
+                name for name in required if name not in by_name or not by_name[name].usable
             )
             if unavailable:
                 return WorkflowReadiness(WorkflowState.BLOCKED, required, unavailable)
@@ -630,8 +901,13 @@ class ReadinessService:
                 state = WorkflowState.BLOCKED
             elif unavailable:
                 retrieval_names = {
-                    "visual", "organizer_clip", "accelerated_visual", "semantic_text",
-                    "ocr", "asr", "metadata",
+                    "visual",
+                    "organizer_clip",
+                    "accelerated_visual",
+                    "semantic_text",
+                    "ocr",
+                    "asr",
+                    "metadata",
                 }
                 usable_retrieval = any(
                     name in retrieval_names and channel.state in _USABLE_STATES
@@ -780,11 +1056,7 @@ class ReadinessService:
                     f"{base}/collections/{collection}/points/count",
                     headers=headers,
                     json={
-                        "filter": {
-                            "must": [
-                                {"key": "batch_id", "match": {"value": batch_id}}
-                            ]
-                        },
+                        "filter": {"must": [{"key": "batch_id", "match": {"value": batch_id}}]},
                         "exact": True,
                     },
                 )
@@ -914,9 +1186,7 @@ class ReadinessService:
                 "index_not_configured",
                 "init_indexes",
             )
-        headers = (
-            {"Authorization": f"Bearer {meili['api_key']}"} if meili.get("api_key") else {}
-        )
+        headers = {"Authorization": f"Bearer {meili['api_key']}"} if meili.get("api_key") else {}
         base = str(meili.get("url", "")).rstrip("/")
         try:
             status, payload = self._request_json(
@@ -1104,7 +1374,11 @@ class ReadinessService:
                 "POST", f"{base_url}/api/show", json={"model": model}
             )
             capabilities = details.get("capabilities") if isinstance(details, Mapping) else None
-            if show_status != 200 or not isinstance(capabilities, list) or "vision" not in capabilities:
+            if (
+                show_status != 200
+                or not isinstance(capabilities, list)
+                or "vision" not in capabilities
+            ):
                 return ChannelReadiness(
                     "ollama_vlm",
                     applicability,

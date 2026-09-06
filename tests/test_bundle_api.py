@@ -76,7 +76,7 @@ def test_bundle_api_builds_metadata_and_download(tmp_path: Path) -> None:
             "batch_id": "batch",
             "entries": [
                 _entry("kis", "1", b"L21_V001,10\n"),
-                _entry("qa", "2", b"L21_V001,20,yes\n"),
+                _entry("qa", "2", b'L21_V001,20,"yes"\n'),
                 _entry("trake", "3", b"L21_V001,10,20\n", stage_count=2),
             ],
         }
@@ -146,3 +146,22 @@ def test_bundle_api_rejects_kis_source_rank_gap(tmp_path: Path) -> None:
         )
     assert caught.value.status_code == 422
     assert caught.value.detail["issues"][0]["code"] == "submission_rank_sequence_invalid"
+
+
+@pytest.mark.parametrize("query_id", (None, 7, True, {}, []))
+def test_bundle_api_rejects_non_string_query_ids(tmp_path: Path, query_id) -> None:
+    create = _endpoint(create_app(_context(tmp_path)), "/v1/submissions/bundles", "POST")
+    payload = _entry("kis", "1", b"L21_V001,10\n")
+    payload["query_id"] = query_id
+
+    with pytest.raises(HTTPException) as caught:
+        create(
+            {
+                "mode": "current",
+                "batch_id": "batch",
+                "entries": [payload],
+            }
+        )
+
+    assert caught.value.status_code == 422
+    assert caught.value.detail["code"] == "bundle_query_id_invalid"

@@ -1,5 +1,19 @@
 """Offline evaluation utilities."""
 
+from src.evaluation.qrels import (
+    IMPORTANT_INTENTS,
+    QRELS_SCHEMA_VERSION,
+    QRELS_TAGS,
+    LockedQrelsSplit,
+    QrelsManifest,
+    QrelsPack,
+    advanced_activation_gate,
+    build_locked_qrels_split,
+    load_qrels_pack,
+    qrels_coverage_report,
+    validate_production_qrels,
+)
+from src.evaluation.review_bundle import build_qrels_review_bundle
 from src.evaluation.textual_kis import (
     CrossValidationFold,
     EvaluationReport,
@@ -28,6 +42,16 @@ from src.evaluation.trake import (
     evaluate_trake_query,
     trake_alignment_score,
 )
+from src.evaluation.tuning import (
+    IntentPolicyTuningReport,
+    SemanticViewTuningCandidate,
+    SemanticViewTuningReport,
+    load_intent_policy_override,
+    load_semantic_view_policy,
+    observed_threshold_midpoints,
+    tune_intent_policies,
+    tune_semantic_view_policy,
+)
 from src.evaluation.visual_qa import (
     GroundTruthQAQuery,
     QAEvaluationPrediction,
@@ -44,11 +68,24 @@ from src.evaluation.visual_qa import (
 
 __all__ = [
     "CrossValidationFold",
+    "IMPORTANT_INTENTS",
+    "QRELS_SCHEMA_VERSION",
+    "QRELS_TAGS",
+    "QrelsManifest",
+    "QrelsPack",
+    "advanced_activation_gate",
+    "load_qrels_pack",
+    "qrels_coverage_report",
+    "validate_production_qrels",
     "EvaluationReport",
     "GroundTruthQAQuery",
     "GroundTruthInterval",
     "GroundTruthQuery",
     "HoldoutSplit",
+    "IntentPolicyTuningReport",
+    "LockedQrelsSplit",
+    "SemanticViewTuningCandidate",
+    "SemanticViewTuningReport",
     "Prediction",
     "QAEvaluationPrediction",
     "QAEvaluationReport",
@@ -62,6 +99,8 @@ __all__ = [
     "TRAKEQueryMetrics",
     "TRAKEStageInterval",
     "build_grouped_splits",
+    "build_qrels_review_bundle",
+    "build_locked_qrels_split",
     "evaluate_query",
     "evaluate_queries",
     "evaluate_trake_query",
@@ -74,8 +113,13 @@ __all__ = [
     "grouped_k_fold",
     "grouped_train_validation_test_split",
     "load_ground_truth",
+    "load_intent_policy_override",
+    "load_semantic_view_policy",
     "load_predictions",
     "qa_recall_at_k",
+    "observed_threshold_midpoints",
     "recall_at_k",
     "trake_alignment_score",
+    "tune_intent_policies",
+    "tune_semantic_view_policy",
 ]

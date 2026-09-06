@@ -47,10 +47,14 @@ class FakePipeline:
         }
         self.refine_error = refine_error
         self.search_calls: list[tuple[QueryRequest, int]] = []
+        self.search_refine_raw: list[bool] = []
         self.refine_calls: list[dict[str, Any]] = []
 
-    def search(self, request: QueryRequest, *, limit: int) -> list[dict[str, Any]]:
+    def search(
+        self, request: QueryRequest, *, limit: int, refine_raw: bool = True
+    ) -> list[dict[str, Any]]:
         self.search_calls.append((request, limit))
+        self.search_refine_raw.append(refine_raw)
         return [dict(item) for item in self.search_hits]
 
     def _plan(self, request: QueryRequest):
@@ -197,6 +201,7 @@ def test_search_validates_request_and_returns_editable_explicit_plan(tmp_path: P
     assert isinstance(request, QueryRequest)
     assert request.batch_filters == ("aic25-b1",)
     assert limit == 25
+    assert pipeline.search_refine_raw == [True]
     assert response["query_id"] == "kis-1"
     assert response["hits"][0]["rank"] == 1
     assert response["hits"][0]["video_id"] == hit["video_id"]
@@ -227,6 +232,18 @@ def test_search_defaults_and_validates_batches_before_retrieval(tmp_path: Path) 
         endpoint({"query_id": "kis-invalid-batch", "original_text": "query"})
     assert raised.value.status_code == 422
     assert len(pipeline.search_calls) == 1
+
+
+def test_search_rejects_control_only_text_before_retrieval(tmp_path: Path) -> None:
+    pipeline = FakePipeline()
+    endpoint = _endpoint(create_app(_context(tmp_path, pipeline)), "/v1/kis/search", "POST")
+
+    with pytest.raises(HTTPException) as raised:
+        endpoint({"query_id": "malformed", "original_text": "\x00\u202e\x01"})
+
+    assert raised.value.status_code == 422
+    assert raised.value.detail["code"] == "kis_request_invalid"
+    assert pipeline.search_calls == []
 
 
 def test_search_reports_channel_statuses_and_allows_mixed_empty_results(

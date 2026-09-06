@@ -18,7 +18,7 @@ from src.retrieval.trake_snapshot import (
     TRAKETrajectorySnapshotStore,
 )
 
-TRAKE_TRAJECTORY_CACHE_VERSION = "trake-trajectory-v3"
+TRAKE_TRAJECTORY_CACHE_VERSION = "trake-trajectory-v4-shot-bounded"
 
 
 class TRAKETrajectoryCacheError(RuntimeError):
@@ -32,6 +32,7 @@ class TRAKEVideoTrajectory:
     source_frame_indices: np.ndarray
     timestamps_ms: np.ndarray
     vectors: np.ndarray
+    shot_codes: np.ndarray | None = None
 
     def __len__(self) -> int:
         return int(self.source_frame_indices.shape[0])
@@ -43,6 +44,7 @@ class _BatchTrajectories:
     fingerprint: str
     source_frame_indices: np.ndarray
     timestamps_ms: np.ndarray
+    shot_codes: np.ndarray
     vectors: np.ndarray
     video_slices: Mapping[str, slice]
     source_point_count: int
@@ -55,6 +57,7 @@ class _BatchTrajectories:
             source_frame_indices=self.source_frame_indices[selected],
             timestamps_ms=self.timestamps_ms[selected],
             vectors=self.vectors[selected],
+            shot_codes=self.shot_codes[selected],
         )
 
     @property
@@ -67,6 +70,7 @@ class _BatchTrajectories:
             self.vectors.nbytes
             + self.source_frame_indices.nbytes
             + self.timestamps_ms.nbytes
+            + self.shot_codes.nbytes
         )
 
 
@@ -123,6 +127,20 @@ class TRAKETrajectoryCache:
             return int(value.strip())
         return None
 
+    @staticmethod
+    def _shot_code(value: object, frame_idx: int) -> int:
+        """Map a payload shot identity to a stable signed int64 code.
+
+        Missing shot identities intentionally receive a frame-unique negative
+        code so late interaction can never borrow support across an unknown
+        boundary.
+        """
+
+        if value is None or isinstance(value, bool) or str(value).strip() == "":
+            return -(frame_idx + 1)
+        digest = hashlib.sha256(str(value).strip().encode("utf-8")).digest()
+        return int.from_bytes(digest[:8], "big", signed=False) & ((1 << 63) - 1)
+
     def _default_fingerprint(self, batch_id: str) -> str:
         store = self.vector_store
         bound_store = store
@@ -178,6 +196,7 @@ class TRAKETrajectoryCache:
             fingerprint=snapshot.fingerprint,
             source_frame_indices=snapshot.source_frame_indices,
             timestamps_ms=snapshot.timestamps_ms,
+            shot_codes=snapshot.shot_codes,
             vectors=snapshot.vectors,
             video_slices=MappingProxyType(slices),
             source_point_count=snapshot.source_point_count,
@@ -203,7 +222,7 @@ class TRAKETrajectoryCache:
         # page. Metadata stores only page/row coordinates, avoiding 177k small
         # ndarray and normalized-hit objects on the reference batch.
         vector_batches: list[np.ndarray] = []
-        grouped: dict[str, list[tuple[int, int, int, int]]] = {}
+        grouped: dict[str, list[tuple[int, int, int, int, int]]] = {}
         source_point_count = 0
 
         def retain_payload(
@@ -231,6 +250,7 @@ class TRAKETrajectoryCache:
                     timestamp_ms,
                     vector_batch_index,
                     vector_row_index,
+                    self._shot_code(payload.get("shot_id"), frame_idx),
                 )
             )
 
@@ -282,7 +302,7 @@ class TRAKETrajectoryCache:
                 vector_batches.append(vector.reshape(1, self.vector_size))
                 retain_payload(point.get("payload", {}), batch_index, 0)
 
-        canonical: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+        canonical: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
         total_frames = 0
         for video_id in sorted(grouped):
             rows = grouped[video_id]
@@ -291,6 +311,7 @@ class TRAKETrajectoryCache:
             )
             frames = np.fromiter((row[0] for row in rows), dtype=np.int64)
             times = np.fromiter((row[1] for row in rows), dtype=np.int64)
+            shots = np.fromiter((row[4] for row in rows), dtype=np.int64)
             finite = np.all(np.isfinite(matrix), axis=1)
             norms = np.linalg.norm(matrix, axis=1)
             valid = finite & np.isfinite(norms) & (norms > 0)
@@ -299,26 +320,31 @@ class TRAKETrajectoryCache:
             matrix = matrix[valid] / norms[valid, None]
             frames = frames[valid]
             times = times[valid]
+            shots = shots[valid]
 
             # Organizer ordinals can map to the same canonical source frame.
             # Merge their normalized vectors before ordering in real time.
-            by_frame: dict[int, tuple[int, np.ndarray]] = {}
-            for frame_idx, timestamp_ms, vector in zip(
-                frames.tolist(), times.tolist(), matrix, strict=True
+            by_frame: dict[int, tuple[int, np.ndarray, int]] = {}
+            for frame_idx, timestamp_ms, vector, shot_code in zip(
+                frames.tolist(), times.tolist(), matrix, shots.tolist(), strict=True
             ):
                 existing = by_frame.get(frame_idx)
                 if existing is None:
-                    by_frame[frame_idx] = (timestamp_ms, vector.copy())
+                    by_frame[frame_idx] = (timestamp_ms, vector.copy(), shot_code)
                 else:
                     by_frame[frame_idx] = (
                         min(existing[0], timestamp_ms),
                         existing[1] + vector,
+                        existing[2] if existing[2] == shot_code else -(frame_idx + 1),
                     )
             merged_frames = np.fromiter(by_frame, dtype=np.int64)
             merged_times = np.fromiter(
                 (item[0] for item in by_frame.values()), dtype=np.int64
             )
             merged_vectors = np.stack([item[1] for item in by_frame.values()])
+            merged_shots = np.fromiter(
+                (item[2] for item in by_frame.values()), dtype=np.int64
+            )
             merged_norms = np.linalg.norm(merged_vectors, axis=1)
             merged_valid = np.isfinite(merged_norms) & (merged_norms > 0)
             if not np.any(merged_valid):
@@ -328,10 +354,12 @@ class TRAKETrajectoryCache:
             merged_vectors = (
                 merged_vectors[merged_valid] / merged_norms[merged_valid, None]
             ).astype(np.float32, copy=False)
+            merged_shots = merged_shots[merged_valid]
             order = np.lexsort((merged_frames, merged_times))
             merged_frames = merged_frames[order]
             merged_times = merged_times[order]
             merged_vectors = merged_vectors[order]
+            merged_shots = merged_shots[order]
 
             keep: list[int] = []
             previous_frame = -1
@@ -348,29 +376,33 @@ class TRAKETrajectoryCache:
                     merged_frames[keep],
                     merged_times[keep],
                     merged_vectors[keep],
+                    merged_shots[keep],
                 )
                 total_frames += len(keep)
 
         vectors = np.empty((total_frames, self.vector_size), dtype=np.float32)
         source_frames = np.empty(total_frames, dtype=np.int64)
         timestamps = np.empty(total_frames, dtype=np.int64)
+        shot_codes = np.empty(total_frames, dtype=np.int64)
         slices: dict[str, slice] = {}
         cursor = 0
         for video_id in sorted(canonical):
-            video_frames, video_times, video_vectors = canonical[video_id]
+            video_frames, video_times, video_vectors, video_shots = canonical[video_id]
             stop = cursor + len(video_frames)
             timestamps[cursor:stop] = video_times
             source_frames[cursor:stop] = video_frames
             vectors[cursor:stop] = video_vectors
+            shot_codes[cursor:stop] = video_shots
             slices[video_id] = slice(cursor, stop)
             cursor = stop
-        for array in (vectors, source_frames, timestamps):
+        for array in (vectors, source_frames, timestamps, shot_codes):
             array.setflags(write=False)
         return _BatchTrajectories(
             batch_id=batch_id,
             fingerprint=fingerprint,
             source_frame_indices=source_frames,
             timestamps_ms=timestamps,
+            shot_codes=shot_codes,
             vectors=vectors,
             video_slices=MappingProxyType(slices),
             source_point_count=source_point_count,
@@ -455,6 +487,7 @@ class TRAKETrajectoryCache:
                                         vectors=built.vectors,
                                         source_frame_indices=built.source_frame_indices,
                                         timestamps_ms=built.timestamps_ms,
+                                        shot_codes=built.shot_codes,
                                         video_ids=video_ids,
                                         video_offsets=offsets,
                                         source_point_count=built.source_point_count,

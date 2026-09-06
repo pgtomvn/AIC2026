@@ -10,7 +10,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.assets import freeze_assets
+from src.assets import freeze_assets, sha256_file, verify_asset_manifest
 from src.utils.io_helpers import load_config
 
 
@@ -30,6 +30,8 @@ def main(argv: list[str] | None = None) -> int:
             "text",
             "asr",
             "ocr",
+            "reference-asr",
+            "reference-ocr",
             "qwen",
             "florence",
             "translation",
@@ -52,7 +54,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.only:
         selected = set(args.only)
     else:
-        selected = {"visual", "text", "asr", "ocr"}
+        selected = {"visual", "text", "asr", "ocr", "reference-asr", "reference-ocr"}
         if models.get("query_translation", {}).get("enabled", False):
             selected.add("translation")
         if models.get("organizer_clip", {}).get("enabled", False):
@@ -150,7 +152,76 @@ def main(argv: list[str] | None = None) -> int:
                 "vocabulary.json",
             ),
         )
-        frozen_paths.add(local_path)
+        profile_manifest = _path(whisper["asset_manifest"])
+        checked, errors = verify_asset_manifest(profile_manifest, root=PROJECT_ROOT)
+        if errors or checked < 1:
+            detail = "; ".join(errors) if errors else "manifest is empty"
+            raise RuntimeError(f"production Whisper asset verification failed: {detail}")
+        frozen_paths.update((local_path, profile_manifest))
+    reference = models.get("reference_provisioning", {})
+    if "reference-asr" in selected:
+        whisper = reference["whisper"]
+        local_path = _path(whisper["local_path"])
+        snapshot_download(
+            repo_id=whisper["hub_model_id"],
+            revision=whisper["revision"],
+            local_dir=local_path,
+            max_workers=1,
+            allow_patterns=(
+                "config.json",
+                "model.bin",
+                "preprocessor_config.json",
+                "tokenizer.json",
+                "vocabulary.txt",
+            ),
+        )
+        manifest = _path(whisper["asset_manifest"])
+        freeze_assets((local_path,), root=PROJECT_ROOT, destination=manifest)
+        frozen_paths.update((local_path, manifest))
+    if "reference-ocr" in selected:
+        rapidocr = reference["rapidocr"]
+        try:
+            from huggingface_hub import hf_hub_download
+        except ImportError as error:
+            raise RuntimeError(
+                "competition dependencies are required to prepare RapidOCR"
+            ) from error
+        model_dir = _path(rapidocr["model_dir"])
+        model_dir.mkdir(parents=True, exist_ok=True)
+        remote_files = {
+            "v3.9.2/onnx/PP-OCRv6/det/PP-OCRv6_det_small.onnx":
+                "PP-OCRv6_det_small.onnx",
+            "v3.9.2/onnx/PP-OCRv6/rec/PP-OCRv6_rec_small.onnx":
+                "PP-OCRv6_rec_small.onnx",
+            "v3.9.2/onnx/PP-OCRv5/cls/ch_PP-LCNet_x0_25_textline_ori_cls_mobile.onnx":
+                "ch_PP-LCNet_x0_25_textline_ori_cls_mobile.onnx",
+            "v3.9.2/paddle/PP-OCRv6/rec/PP-OCRv6_rec_small/ppocrv6_dict.txt":
+                "ppocrv6_dict.txt",
+        }
+        expected_hashes = {
+            "PP-OCRv6_det_small.onnx":
+                "090f04abcd9d9a7498bc4ebf677e4cb9bdce1fe4197ddb7e529f1ef44e1ff94f",
+            "PP-OCRv6_rec_small.onnx":
+                "6f327246b50388f3c176ae304bd95767ea6dc0c9ae92153ef8cbe210b3c14884",
+            "ch_PP-LCNet_x0_25_textline_ori_cls_mobile.onnx":
+                "54379ae5174d026780215fc748a7f31910dee36818e63d49e17dc598ecc82df7",
+        }
+        for remote_name, local_name in remote_files.items():
+            downloaded = Path(
+                hf_hub_download(
+                    repo_id=rapidocr["source_repo"],
+                    revision=rapidocr["source_revision"],
+                    filename=remote_name,
+                )
+            )
+            target = model_dir / local_name
+            target.write_bytes(downloaded.read_bytes())
+            expected = expected_hashes.get(local_name)
+            if expected is not None and sha256_file(target) != expected:
+                raise RuntimeError("RapidOCR downloaded asset checksum mismatch")
+        manifest = _path(rapidocr["asset_manifest"])
+        freeze_assets((model_dir,), root=PROJECT_ROOT, destination=manifest)
+        frozen_paths.update((model_dir, manifest))
     if "ocr" in selected:
         ocr = models["ocr"]
         cache = _path(ocr["cache_dir"])

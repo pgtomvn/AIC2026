@@ -7,6 +7,7 @@ import io
 import json
 import os
 import re
+import secrets
 import shutil
 import tempfile
 import zipfile
@@ -111,7 +112,14 @@ def build_codabench_bundle(
     if final_run.exists():
         raise BundleBuildError("bundle_run_id_collision")
 
-    temporary = Path(tempfile.mkdtemp(prefix=f".{run_id}.", suffix=".tmp", dir=root))
+    # ``tempfile.mkdtemp`` creates a private ACL on Windows that a managed
+    # workspace token may be unable to traverse.  Preserve isolation with an
+    # unpredictable name while inheriting the already validated output ACL.
+    temporary = root / f".{run_id}.{secrets.token_hex(4)}.tmp"
+    try:
+        temporary.mkdir()
+    except FileExistsError:
+        raise BundleBuildError("bundle_temporary_path_collision") from None
     published = False
     try:
         submission_dir = temporary / "submission"

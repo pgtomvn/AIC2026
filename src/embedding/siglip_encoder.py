@@ -14,6 +14,7 @@ from PIL import Image
 
 from src.contracts import TextEncodingDiagnostics
 from src.embedding.clip_encoder import _normalize
+from src.embedding.cuda_health import CUDAEncoderRestartRequired, is_fatal_cuda_error
 from src.embedding.text_chunks import chunk_text
 from src.utils.offline import enforce_huggingface_offline
 
@@ -61,6 +62,21 @@ class SigLIP2Encoder:
         self._torch: Any = None
         self._embedding_dim: int | None = None
         self._lifecycle_lock = threading.RLock()
+        self._cuda_circuit_open = False
+
+    @property
+    def cuda_restart_required(self) -> bool:
+        return self._cuda_circuit_open
+
+    def _ensure_cuda_healthy(self) -> None:
+        if self._cuda_circuit_open:
+            raise CUDAEncoderRestartRequired()
+
+    def _guard_cuda_error(self, error: RuntimeError) -> None:
+        if self.device.startswith("cuda") and is_fatal_cuda_error(error):
+            self._cuda_circuit_open = True
+            raise CUDAEncoderRestartRequired() from None
+        raise error
 
     @property
     def fingerprint(self) -> str:
@@ -96,7 +112,7 @@ class SigLIP2Encoder:
         if self.revision is not None:
             common["revision"] = self.revision
         processor = AutoProcessor.from_pretrained(self.model_name, use_fast=False, **common)
-        model = AutoModel.from_pretrained(self.model_name, dtype=dtype, **common)
+        model = AutoModel.from_pretrained(self.model_name, torch_dtype=dtype, **common)
         model_text_limit = int(model.config.text_config.max_position_embeddings)
         if self.text_max_length > model_text_limit:
             raise ValueError(
@@ -138,7 +154,11 @@ class SigLIP2Encoder:
         """Serialize model loading and inference across warm-up and queries."""
 
         with self._lifecycle_lock:
-            return self._encode_images_unlocked(image_paths)
+            self._ensure_cuda_healthy()
+            try:
+                return self._encode_images_unlocked(image_paths)
+            except RuntimeError as error:
+                self._guard_cuda_error(error)
 
     def _encode_images_unlocked(
         self, image_paths: list[str | Path | bytes | Image.Image]
@@ -183,7 +203,11 @@ class SigLIP2Encoder:
         """Serialize model loading and inference across warm-up and queries."""
 
         with self._lifecycle_lock:
-            return self._encode_text_unlocked(text)
+            self._ensure_cuda_healthy()
+            try:
+                return self._encode_text_unlocked(text)
+            except RuntimeError as error:
+                self._guard_cuda_error(error)
 
     def _encode_text_unlocked(self, text: str | list[str]) -> np.ndarray:
         """Encode multilingual text with the matching SigLIP2 text tower."""
@@ -213,19 +237,23 @@ class SigLIP2Encoder:
         """Encode actual-token chunks and return explicit truncation diagnostics."""
 
         with self._lifecycle_lock:
-            self._load_model()
-            tokenizer = self._processor.tokenizer
-            special_tokens = int(tokenizer.num_special_tokens_to_add(pair=False))
-            content_limit = max(1, self.text_max_length - special_tokens)
-            chunks = chunk_text(
-                tokenizer,
-                text,
-                context_limit=self.text_max_length,
-                content_limit=content_limit,
-                max_chunks=self.text_max_chunks,
-                overlap=min(self.text_chunk_overlap, content_limit - 1),
-            )
-            return self._encode_text_unlocked(list(chunks.texts)), chunks.diagnostics
+            self._ensure_cuda_healthy()
+            try:
+                self._load_model()
+                tokenizer = self._processor.tokenizer
+                special_tokens = int(tokenizer.num_special_tokens_to_add(pair=False))
+                content_limit = max(1, self.text_max_length - special_tokens)
+                chunks = chunk_text(
+                    tokenizer,
+                    text,
+                    context_limit=self.text_max_length,
+                    content_limit=content_limit,
+                    max_chunks=self.text_max_chunks,
+                    overlap=min(self.text_chunk_overlap, content_limit - 1),
+                )
+                return self._encode_text_unlocked(list(chunks.texts)), chunks.diagnostics
+            except RuntimeError as error:
+                self._guard_cuda_error(error)
 
     def unload(self) -> None:
         """Serialize model release against warm-up and inference."""

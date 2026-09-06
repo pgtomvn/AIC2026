@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+from itertools import combinations
 from typing import Any
 
 import numpy as np
@@ -44,6 +45,131 @@ def test_strict_dp_rejects_invalid_sequences_and_short_videos() -> None:
         strict_monotonic_alignment(np.ones((2, 3)), (10, 10, 20))
     with pytest.raises(ValueError, match="finite"):
         strict_monotonic_alignment(np.array([[0.1, np.nan]]))
+
+
+def test_zero_penalties_preserve_original_alignment_semantics() -> None:
+    similarities = np.array(
+        [[0.8, 0.2, 1.0], [0.1, 0.2, 0.9]],
+        dtype=np.float32,
+    )
+    baseline = strict_monotonic_alignment(similarities, (10, 20, 30))
+
+    with_timeline_metadata = strict_monotonic_alignment(
+        similarities,
+        (10, 20, 30),
+        timestamps_ms=(100, 200, 300),
+        shot_ids=("shot-a", "shot-a", "shot-b"),
+        max_gap_ms=50,
+        gap_penalty_per_second=0.0,
+        shot_boundary_penalty=0.0,
+    )
+
+    assert with_timeline_metadata == baseline
+
+
+def test_temporal_gap_penalty_avoids_unrealistic_long_jump() -> None:
+    similarities = np.array(
+        [[0.9, 0.7, 0.0], [0.0, 0.6, 1.0]],
+        dtype=np.float32,
+    )
+    assert strict_monotonic_alignment(similarities, (10, 20, 30))[0] == (0, 2)
+
+    penalized = strict_monotonic_alignment(
+        similarities,
+        (10, 20, 30),
+        timestamps_ms=(0, 1_000, 101_000),
+        max_gap_ms=10_000,
+        gap_penalty_per_second=0.01,
+    )
+
+    assert penalized is not None
+    assert penalized[0] == (0, 1)
+    assert penalized[1] == pytest.approx(0.75)
+
+
+def test_shot_boundary_penalty_prefers_same_shot_sequence() -> None:
+    similarities = np.array(
+        [[0.9, 0.7, 0.0], [0.0, 0.6, 1.0]],
+        dtype=np.float32,
+    )
+
+    penalized = strict_monotonic_alignment(
+        similarities,
+        (10, 20, 30),
+        shot_ids=("shot-a", "shot-a", "shot-b"),
+        shot_boundary_penalty=0.5,
+    )
+
+    assert penalized is not None
+    assert penalized[0] == (0, 1)
+    assert penalized[1] == pytest.approx(0.75)
+
+
+def test_penalized_dp_validates_timestamps_and_policy() -> None:
+    similarities = np.ones((2, 3), dtype=np.float32)
+    with pytest.raises(ValueError, match="timestamps_ms is required"):
+        strict_monotonic_alignment(
+            similarities,
+            gap_penalty_per_second=0.1,
+            max_gap_ms=1_000,
+        )
+    with pytest.raises(ValueError, match="timestamps_ms must be strictly increasing"):
+        strict_monotonic_alignment(
+            similarities,
+            timestamps_ms=(0, 0, 1_000),
+        )
+    with pytest.raises(ValueError, match="max_gap_ms is required"):
+        strict_monotonic_alignment(
+            similarities,
+            timestamps_ms=(0, 1_000, 2_000),
+            gap_penalty_per_second=0.1,
+        )
+    with pytest.raises(ValueError, match="shot_boundary_penalty"):
+        strict_monotonic_alignment(
+            similarities,
+            shot_boundary_penalty=-0.1,
+        )
+
+
+def test_penalized_dp_matches_exhaustive_viterbi_objective() -> None:
+    similarities = np.array(
+        [
+            [0.81, 0.16, 0.34, 0.62, 0.27, 0.41],
+            [0.12, 0.78, 0.55, 0.31, 0.49, 0.22],
+            [0.09, 0.24, 0.45, 0.36, 0.73, 0.68],
+        ],
+        dtype=np.float64,
+    )
+    timestamps = (0, 2_000, 8_000, 16_000, 31_000, 48_000)
+    shots = ("a", "a", "b", "b", "c", "c")
+    max_gap_ms = 10_000
+    gap_cost = 0.004
+    shot_cost = 0.07
+
+    def objective(path: tuple[int, ...]) -> float:
+        score = sum(similarities[stage, frame] for stage, frame in enumerate(path))
+        for left, right in zip(path, path[1:]):
+            excess_ms = max(0, timestamps[right] - timestamps[left] - max_gap_ms)
+            score -= gap_cost * excess_ms / 1_000.0
+            if shots[left] != shots[right]:
+                score -= shot_cost
+        return float(score)
+
+    paths = tuple(combinations(range(similarities.shape[1]), similarities.shape[0]))
+    expected = max(paths, key=objective)
+    result = strict_monotonic_alignment(
+        similarities,
+        tuple(range(10, 70, 10)),
+        timestamps_ms=timestamps,
+        shot_ids=shots,
+        max_gap_ms=max_gap_ms,
+        gap_penalty_per_second=gap_cost,
+        shot_boundary_penalty=shot_cost,
+    )
+
+    assert result is not None
+    assert result[0] == expected
+    assert result[1] == pytest.approx(objective(expected) / similarities.shape[0])
 
 
 class _Encoder:
@@ -504,10 +630,19 @@ def test_pipeline_rejects_cross_space_dimension_mismatch() -> None:
 
 
 def test_compatibility_constructor_and_alignment_name() -> None:
-    pipeline = TRAKEPipeline(top_k_videos=5, global_weight=0.4)
+    pipeline = TRAKEPipeline(
+        top_k_videos=5,
+        global_weight=0.4,
+        max_stage_gap_ms=120_000,
+        temporal_gap_penalty_per_second=0.001,
+        shot_boundary_penalty=0.02,
+    )
 
     assert pipeline.top_k_videos == 5
     assert pipeline.global_weight == 0.4
+    assert pipeline.max_stage_gap_ms == 120_000
+    assert pipeline.temporal_gap_penalty_per_second == 0.001
+    assert pipeline.shot_boundary_penalty == 0.02
     positions, score = pipeline._dtw_align(
         np.eye(2, dtype=np.float32),
         np.eye(2, dtype=np.float32),
@@ -519,3 +654,7 @@ def test_compatibility_constructor_and_alignment_name() -> None:
         TRAKEPipeline(grouped_search_workers=13)
     with pytest.raises(ValueError, match="global_weight"):
         TRAKEPipeline(global_weight=1.1)
+    with pytest.raises(ValueError, match="max_stage_gap_ms is required"):
+        TRAKEPipeline(temporal_gap_penalty_per_second=0.1)
+    with pytest.raises(ValueError, match="shot_boundary_penalty"):
+        TRAKEPipeline(shot_boundary_penalty=-0.1)

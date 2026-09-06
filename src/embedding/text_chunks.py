@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -10,8 +9,6 @@ from typing import Any
 import numpy as np
 
 from src.contracts import TextEncodingDiagnostics
-
-_CLAUSE_BREAK = re.compile(r"(?<=[.!?…;:])\s+|\n+|(?<=,)\s+")
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,50 +67,28 @@ def _decode(tokenizer: Any, token_ids: Sequence[int]) -> str:
     return text
 
 
-def _clause_boundaries(tokenizer: Any, text: str, token_count: int) -> tuple[int, ...]:
-    clauses = [value for value in _CLAUSE_BREAK.split(text) if value]
-    if len(clauses) <= 1:
-        return ()
-    boundaries: list[int] = []
-    prefix = ""
-    for clause in clauses[:-1]:
-        prefix += clause
-        boundary = len(_token_ids(tokenizer, prefix))
-        if 0 < boundary < token_count:
-            boundaries.append(boundary)
-        prefix += " "
-    return tuple(sorted(set(boundaries)))
-
-
 def _all_spans(
     *,
     token_count: int,
     content_limit: int,
     overlap: int,
-    boundaries: Sequence[int],
 ) -> list[tuple[int, int]]:
-    spans: list[tuple[int, int]] = []
-    start = 0
-    while start < token_count:
-        maximum_end = min(token_count, start + content_limit)
-        candidates = [value for value in boundaries if start < value <= maximum_end]
-        end = max(candidates) if candidates and maximum_end < token_count else maximum_end
-        if end <= start:
-            end = maximum_end
-        spans.append((start, end))
-        if end >= token_count:
-            break
-        start = max(start + 1, end - overlap)
-    return spans
+    stride = content_limit - overlap
+    starts = list(range(0, token_count, stride))
+    last_start = max(0, token_count - content_limit)
+    if starts and starts[-1] + content_limit < token_count:
+        starts.append(last_start)
+    elif starts:
+        starts[-1] = last_start
+    return [(start, min(token_count, start + content_limit)) for start in sorted(set(starts))]
 
 
 def _select_spans(spans: Sequence[tuple[int, int]], maximum: int) -> list[tuple[int, int]]:
     if len(spans) <= maximum:
         return list(spans)
-    indices = {
-        round(position * (len(spans) - 1) / (maximum - 1))
-        for position in range(maximum)
-    }
+    if maximum == 1:
+        return [spans[0]]
+    indices = {round(position * (len(spans) - 1) / (maximum - 1)) for position in range(maximum)}
     if len(indices) < maximum:
         indices.update(index for index in range(len(spans)) if len(indices) < maximum)
     return [spans[index] for index in sorted(indices)[:maximum]]
@@ -153,14 +128,20 @@ def chunk_text(
                 query_truncated=False,
             ),
         )
-    boundaries = _clause_boundaries(tokenizer, text, len(token_ids))
     all_spans = _all_spans(
         token_count=len(token_ids),
         content_limit=content_limit,
         overlap=overlap,
-        boundaries=boundaries,
     )
-    selected = _select_spans(all_spans, max_chunks)
+    capacity = max_chunks * content_limit - (max_chunks - 1) * overlap
+    if len(token_ids) <= capacity:
+        selected = all_spans
+    elif max_chunks == 1:
+        selected = [(0, content_limit)]
+    else:
+        last_start = len(token_ids) - content_limit
+        starts = {round(index * last_start / (max_chunks - 1)) for index in range(max_chunks)}
+        selected = [(start, min(len(token_ids), start + content_limit)) for start in sorted(starts)]
     covered = set()
     for start, end in selected:
         covered.update(range(start, end))
@@ -204,9 +185,7 @@ def encode_query_mean(encoder: Any, text: str) -> np.ndarray:
         None,
     )
     vectors = (
-        diagnostic_encoder(text)[0]
-        if callable(diagnostic_encoder)
-        else encoder.encode_text(text)
+        diagnostic_encoder(text)[0] if callable(diagnostic_encoder) else encoder.encode_text(text)
     )
     return normalized_mean(np.asarray(vectors, dtype=np.float32))
 

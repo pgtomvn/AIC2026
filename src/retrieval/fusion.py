@@ -90,12 +90,31 @@ def weighted_rrf(
                 "rank": rank,
                 "raw_score": result.get("score", result.get("_rankingScore")),
             }
+            nested_ranks = result.get("channel_ranks")
+            if isinstance(nested_ranks, Mapping):
+                evidence_item["nested_channel_ranks"] = {
+                    str(name): int(value) for name, value in nested_ranks.items()
+                }
             # Keep compact lexical provenance needed by the UI.  In
             # particular, OCR polygons must survive frame resolution and RRF
             # instead of existing only in the backing text document.
-            for field in ("segment_id", "kind", "text_raw", "polygons"):
+            for field in (
+                "segment_id",
+                "kind",
+                "text_raw",
+                "start_ms",
+                "end_ms",
+                "confidence",
+                "model_version",
+                "polygons",
+            ):
                 if field in source:
                     evidence_item[field] = source[field]
+            matches = result.get("entity_matches", source.get("entity_matches"))
+            if isinstance(matches, (list, tuple)):
+                evidence_item["entity_matches"] = [
+                    dict(value) for value in matches if isinstance(value, Mapping)
+                ]
             evidence[key].append(evidence_item)
 
     fused: list[dict[str, Any]] = []
@@ -104,6 +123,14 @@ def weighted_rrf(
         item["score"] = float(score)
         item["channel_ranks"] = channel_ranks[key]
         item["evidence"] = evidence[key]
+        entity_matches: dict[str, dict[str, Any]] = {}
+        for value in evidence[key]:
+            for match in value.get("entity_matches", ()):
+                identity = match.get("identity") if isinstance(match, Mapping) else None
+                if isinstance(identity, str) and identity:
+                    entity_matches.setdefault(identity, dict(match))
+        if entity_matches:
+            item["entity_matches"] = list(entity_matches.values())
         fused.append(item)
     fused.sort(
         key=lambda item: (
@@ -131,8 +158,9 @@ def aggregate_temporal_windows(
         if timestamp is None:
             timeless.append(dict(item))
             continue
-        shot = str(item.get("shot_id", f"frame:{item['source_frame_idx']}"))
-        groups[(str(item["video_id"]), shot)].append(dict(item))
+        groups[(str(item["video_id"]), str(item.get("shot_id") or ""))].append(
+            dict(item)
+        )
 
     aggregated: list[dict[str, Any]] = []
     half = window_ms / 2
@@ -151,6 +179,24 @@ def aggregate_temporal_windows(
             representative["window_start_ms"] = max(0, int(anchor["timestamp_ms"] - half))
             representative["window_end_ms"] = int(anchor["timestamp_ms"] + half)
             representative["window_evidence_count"] = len(nearby)
+            merged_evidence: list[dict[str, Any]] = []
+            for item in nearby:
+                for raw_evidence in item.get("evidence", ()):
+                    if not isinstance(raw_evidence, Mapping):
+                        continue
+                    evidence_item = dict(raw_evidence)
+                    evidence_item["timestamp_ms"] = int(item["timestamp_ms"])
+                    merged_evidence.append(evidence_item)
+            if merged_evidence:
+                representative["evidence"] = merged_evidence
+            entity_matches: dict[str, dict[str, Any]] = {}
+            for item in nearby:
+                for match in item.get("entity_matches", ()):
+                    identity = match.get("identity") if isinstance(match, Mapping) else None
+                    if isinstance(identity, str) and identity:
+                        entity_matches.setdefault(identity, dict(match))
+            if entity_matches:
+                representative["entity_matches"] = list(entity_matches.values())
             aggregated.append(representative)
     aggregated.extend(timeless)
 

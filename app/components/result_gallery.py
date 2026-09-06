@@ -14,6 +14,7 @@ from app.components.cyberpunk_theme import hud_container_key, render_hud_readout
 ResultIdentity = tuple[str, str, int]
 ImageLoader = Callable[[dict[str, Any]], object | None]
 PinChangeHandler = Callable[[ResultIdentity, dict[str, Any], bool, str], None]
+FrameActionHandler = Callable[[dict[str, Any]], None]
 
 
 def result_identity(result: dict[str, Any]) -> ResultIdentity:
@@ -62,6 +63,8 @@ def render_result_gallery(
     image_loader: ImageLoader | None = None,
     pinned_identities: set[ResultIdentity] | None = None,
     on_pin_change: PinChangeHandler | None = None,
+    on_send_to_qa: FrameActionHandler | None = None,
+    on_open_scrubber: FrameActionHandler | None = None,
 ) -> list[dict[str, Any]]:
     """Render ranked results and return frames pinned by the operator."""
 
@@ -120,6 +123,25 @@ def render_result_gallery(
                     )
                 if st.checkbox("Ghim", **checkbox_kwargs):
                     selected.append(result)
+                action_digest = hashlib.sha256(
+                    "\0".join((identity[0], identity[1], str(identity[2]))).encode(
+                        "utf-8"
+                    )
+                ).hexdigest()[:20]
+                if on_send_to_qa is not None:
+                    if st.button(
+                        "🎯 Chuyển sang Visual Q&A",
+                        key=f"kis_to_qa_{action_digest}",
+                        width="stretch",
+                    ):
+                        on_send_to_qa(dict(result))
+                if on_open_scrubber is not None:
+                    if st.button(
+                        "⏱ Xem ±5 khung",
+                        key=f"kis_scrub_{action_digest}",
+                        width="stretch",
+                    ):
+                        on_open_scrubber(dict(result))
                 with st.expander("Bằng chứng"):
                     st.json(result.get("evidence", []), expanded=False)
     return selected

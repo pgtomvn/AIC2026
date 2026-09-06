@@ -188,6 +188,7 @@ def test_launch_identity_is_canonical_only_for_complete_matching_metadata() -> N
         "AIC_LAUNCHED_AT_UTC": "2026-08-02T05:00:00Z",
         "AIC_LAUNCH_LOCK_SHA256": "b" * 64,
         "AIC_RUNTIME_STAMP_SHA256": "a" * 64,
+        "AIC_SOURCE_CONTRACT_SHA256": "c" * 64,
         "OPENROUTER_API_KEY": "must-not-appear",
     }
 
@@ -197,6 +198,7 @@ def test_launch_identity_is_canonical_only_for_complete_matching_metadata() -> N
     assert identity["port"] == 8504
     assert identity["batch_id"] == "b2"
     assert identity["lock_sha256"] == "b" * 64
+    assert identity["source_contract_sha256"] == "c" * 64
     assert "must-not-appear" not in str(identity)
 
     environment["AIC_LAUNCH_BATCH"] = "another-batch"

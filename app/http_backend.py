@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
+from urllib.parse import quote
 
 import requests
+
+_SAFE_ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
 
 
 class BackendError(RuntimeError):
@@ -52,6 +56,7 @@ def _safe_error(response: Any) -> BackendError:
                 "requested_target_clusters",
                 "retrieved_clusters",
                 "retrieval_exhausted",
+                "correlation_id",
             ):
                 value = detail.get(name)
                 if isinstance(value, (bool, int, float, str)) or value is None:
@@ -80,7 +85,7 @@ def _safe_error(response: Any) -> BackendError:
                     if sanitized:
                         safe_issues.append(sanitized)
                 safe_detail["issues"] = safe_issues
-        elif isinstance(detail, str) and len(detail) <= 96:
+        elif isinstance(detail, str) and _SAFE_ERROR_CODE.fullmatch(detail):
             code = detail
     except Exception:
         pass
@@ -139,10 +144,12 @@ class _Pipeline:
         self.last_query_processing: dict[str, Any] = {}
 
     def search(self, request: Any, *, limit: int, refine_raw: bool = False) -> list[dict[str, Any]]:
-        del refine_raw
+        self.last_channel_statuses = {}
+        self.last_query_processing = {}
         payload = request.to_dict()
         payload["limit"] = limit
-        value = self.client.json("POST", "/v1/kis/search", payload=payload)
+        payload["refine_raw"] = bool(refine_raw)
+        value = self.client.json("POST", "/v1/kis/search", payload=payload, timeout_seconds=30)
         self.last_channel_statuses = dict(value.get("channel_statuses", {}))
         self.last_query_processing = dict(value.get("query_processing", {}))
         return [dict(item) for item in value.get("hits", ())]
@@ -219,6 +226,21 @@ class _QAPipeline:
                 except BackendError:
                     error.snapshot = None
             raise
+        normalized = self._normalize(value, request)
+        self.last_snapshot = normalized
+        if session_id:
+            self.aliases[session_id] = normalized["session_id"]
+        return list(normalized.get("candidates", ()))
+
+    def inject(self, request: Any, *, session_id: str | None = None) -> list[dict[str, Any]]:
+        """Create an authoritative one-frame QA session without running retrieval."""
+
+        value = self.client.json(
+            "POST",
+            "/v1/qa/inject",
+            payload=request.to_dict(),
+            timeout_seconds=30,
+        )
         normalized = self._normalize(value, request)
         self.last_snapshot = normalized
         if session_id:
@@ -368,6 +390,34 @@ class _Repository:
             for item in value.get("neighbors", ())
         )
 
+    def adjacent_frames(
+        self,
+        batch_id: str,
+        video_id: str,
+        source_frame_idx: int,
+        *,
+        radius: int = 5,
+    ) -> tuple[tuple[int, _Frame], ...]:
+        value = self.client.json(
+            "GET",
+            f"/v1/frames/{batch_id}/{video_id}/{source_frame_idx}/adjacent",
+            params={"radius": radius},
+        )
+        return tuple(
+            (
+                int(item["offset"]),
+                _Frame(
+                    str(item.get("batch_id", batch_id)),
+                    str(item.get("video_id", video_id)),
+                    int(item["source_frame_idx"]),
+                    int(item.get("timestamp_ms", 0)),
+                    item.get("shot_id"),
+                ),
+            )
+            for item in value.get("frames", ())
+        )
+
+
 
 class _ImageResolver:
     def __init__(self, client: _Client) -> None:
@@ -406,7 +456,12 @@ class _Readiness:
 
     def check(self, batch_id: str, *, mode: str = "app") -> _Report:
         return _Report(
-            self.client.json("GET", "/v1/readiness", params={"batch_id": batch_id, "mode": mode})
+            self.client.json(
+                "GET",
+                "/v1/readiness",
+                params={"batch_id": batch_id, "mode": mode},
+                timeout_seconds=3,
+            )
         )
 
     def workflow_readiness(self, report: _Report, workflow: str) -> _Report:
@@ -424,11 +479,11 @@ class _Warmup:
         self.client = client
 
     def start(self) -> bool:
-        value = self.client.json("POST", "/v1/runtime/warmup/start")
+        value = self.client.json("POST", "/v1/runtime/warmup/start", timeout_seconds=3)
         return str(value.get("state", "idle")) == "warming"
 
     def snapshot(self) -> dict[str, Any]:
-        return dict(self.client.json("GET", "/v1/runtime/warmup"))
+        return dict(self.client.json("GET", "/v1/runtime/warmup", timeout_seconds=3))
 
     def readiness_report(self) -> None:
         return None
@@ -454,7 +509,7 @@ class HttpRuntimeContext:
 
     def __init__(self, base_url: str, *, http: Any | None = None) -> None:
         client = _Client(base_url, http)
-        capabilities = client.json("GET", "/v1/runtime/capabilities")
+        capabilities = client.json("GET", "/v1/runtime/capabilities", timeout_seconds=3)
         self.client = client
         self.capabilities = capabilities
         self.selected_batch_id = str(capabilities["default_batch_id"])
@@ -490,7 +545,9 @@ class HttpRuntimeContext:
     def refresh_capabilities(self) -> dict[str, Any]:
         """Refresh provider status without constructing any local model runtime."""
 
-        self.capabilities = dict(self.client.json("GET", "/v1/runtime/capabilities"))
+        self.capabilities = dict(
+            self.client.json("GET", "/v1/runtime/capabilities", timeout_seconds=3)
+        )
         return self.capabilities
 
     def validate_batch_filters(self, values: Any = None) -> tuple[str, ...]:
@@ -536,6 +593,76 @@ class HttpRuntimeContext:
             raise BackendError("bundle_download_integrity_failed")
         metadata["data"] = data
         return metadata
+
+    def load_submission_staging(self) -> dict[str, Any]:
+        """Load the machine-global staged CSV snapshot from FastAPI."""
+
+        return dict(
+            self.client.json(
+                "GET",
+                "/v1/submissions/staging",
+                timeout_seconds=5,
+            )
+        )
+
+    def stage_submission_entry(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Validate and persist one staged CSV through the server trust boundary."""
+
+        return dict(
+            self.client.json(
+                "POST",
+                "/v1/submissions/staging/entries",
+                payload=payload,
+                timeout_seconds=30,
+            )
+        )
+
+    def delete_submission_entry(
+        self,
+        filename: str,
+        *,
+        expected_revision: int,
+    ) -> dict[str, Any]:
+        """Delete one exact staged filename under optimistic concurrency."""
+
+        safe_filename = quote(str(filename), safe="")
+        return dict(
+            self.client.json(
+                "DELETE",
+                f"/v1/submissions/staging/entries/{safe_filename}",
+                params={"expected_revision": expected_revision},
+                timeout_seconds=10,
+            )
+        )
+
+    def mutate_submission_rows(
+        self,
+        filename: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Append, replace, delete, or move one staged QA/TRAKE rank."""
+
+        safe_filename = quote(str(filename), safe="")
+        return dict(
+            self.client.json(
+                "POST",
+                f"/v1/submissions/staging/entries/{safe_filename}/rows",
+                payload=payload,
+                timeout_seconds=30,
+            )
+        )
+
+    def clear_submission_staging(self, *, expected_revision: int) -> dict[str, Any]:
+        """Publish an empty staging revision without deleting prior bundles."""
+
+        return dict(
+            self.client.json(
+                "DELETE",
+                "/v1/submissions/staging",
+                params={"expected_revision": expected_revision},
+                timeout_seconds=10,
+            )
+        )
 
 
 def build_http_runtime(base_url: str, *, http: Any | None = None) -> HttpRuntimeContext:

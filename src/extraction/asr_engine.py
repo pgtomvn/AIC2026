@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,9 @@ class ASREngine:
         model_revision: str | None = None,
         local_files_only: bool = True,
         low_confidence_logprob: float = -1.0,
+        profile_name: str = "reference",
+        vad_parameters: dict[str, int] | None = None,
+        condition_on_previous_text: bool = True,
     ) -> None:
         self.model_size = model_size
         self.language = language
@@ -44,7 +48,39 @@ class ASREngine:
         self.model_revision = model_revision
         self.local_files_only = local_files_only
         self.low_confidence_logprob = low_confidence_logprob
+        self.profile_name = str(profile_name).strip().casefold()
+        if self.profile_name not in {"production", "reference"}:
+            raise ValueError("ASR profile_name must be production or reference")
+        self.vad_parameters = {
+            str(key): int(value) for key, value in (vad_parameters or {}).items()
+        }
+        if any(value < 0 for value in self.vad_parameters.values()):
+            raise ValueError("ASR VAD parameters must be non-negative integers")
+        self.condition_on_previous_text = bool(condition_on_previous_text)
         self._model: Any = None
+
+    @property
+    def fingerprint(self) -> str:
+        """Return the immutable inference contract used by cloud receipts."""
+
+        payload = {
+            "profile": self.profile_name,
+            "model": self.model_size,
+            "revision": self.model_revision,
+            "language": self.language,
+            "device": self.device,
+            "compute_type": self.compute_type,
+            "beam_size": self.beam_size,
+            "retry_beam_size": self.retry_beam_size,
+            "vad_filter": self.vad_filter,
+            "vad_parameters": self.vad_parameters,
+            "condition_on_previous_text": self.condition_on_previous_text,
+            "word_timestamps": True,
+            "normalization": "nfc+accent-fold-v1",
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
 
     def _load_model(self) -> None:
         if self._model is not None:
@@ -108,6 +144,8 @@ class ASREngine:
             language=self.language,
             beam_size=self.beam_size,
             vad_filter=self.vad_filter,
+            vad_parameters=self.vad_parameters or None,
+            condition_on_previous_text=self.condition_on_previous_text,
             word_timestamps=True,
         )
         segments = [self._segment_record(segment) for segment in segments_iter]
@@ -122,6 +160,7 @@ class ASREngine:
                     language=self.language,
                     beam_size=self.retry_beam_size,
                     vad_filter=False,
+                    condition_on_previous_text=False,
                     word_timestamps=True,
                     clip_timestamps=[
                         segment["start_ms"] / 1000,
@@ -147,6 +186,8 @@ class ASREngine:
             "language_probability": float(getattr(info, "language_probability", 0.0)),
             "duration_sec": float(getattr(info, "duration", 0.0)),
             "model_version": self.model_size,
+            "model_fingerprint": self.fingerprint,
+            "profile": self.profile_name,
             "compute_type": self.compute_type,
         }
 

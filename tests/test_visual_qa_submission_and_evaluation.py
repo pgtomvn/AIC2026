@@ -77,17 +77,31 @@ def test_validate_and_export_qa_submission_normalizes_answer_atomically(tmp_path
         assert list(csv.reader(handle)) == [["L21_V001", "110", "5"]]
 
 
-def test_qa_submission_rejects_duplicate_frames_even_with_alternate_answers() -> None:
-    with pytest.raises(QASubmissionValidationError, match="duplicate canonical frame"):
+def test_qa_submission_allows_alternate_answers_but_rejects_exact_duplicates() -> None:
+    general = QACompetitionSpec.conservative_general_text()
+    with pytest.raises(QASubmissionValidationError, match="duplicate QA row"):
         validate_qa_submission(
             [
                 _prediction(rank=1, answer="five"),
-                _prediction(rank=2, answer="six"),
+                _prediction(rank=2, answer="five"),
             ],
+            spec=general,
             batch_id="aic25-b1-reference",
             is_batch_active=_active,
             is_canonical_source_frame=_persisted,
         )
+
+    alternate = validate_qa_submission(
+        (
+            _prediction(rank=1, answer="xã cam bắc"),
+            _prediction(rank=2, answer="cam bắc"),
+        ),
+        spec=general,
+        batch_id="aic25-b1-reference",
+        is_batch_active=_active,
+        is_canonical_source_frame=_persisted,
+    )
+    assert [item.answer for item in alternate] == ["xã cam bắc", "cam bắc"]
 
 
 def test_qa_submission_requires_batch_and_rejects_ordinal_provenance() -> None:

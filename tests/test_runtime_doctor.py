@@ -149,6 +149,7 @@ def test_launcher_contract_propagates_identity_and_never_kills_or_switches_ports
         "AIC_LAUNCHED_AT_UTC",
         "AIC_LAUNCH_LOCK_SHA256",
         "AIC_RUNTIME_STAMP_SHA256",
+        "AIC_SOURCE_CONTRACT_SHA256",
     ):
         assert f"$env:{name}" in source
     assert source.count("Assert-PortAvailable -RequestedPort") == 5
@@ -168,6 +169,9 @@ def test_launcher_contract_propagates_identity_and_never_kills_or_switches_ports
     assert 'Get-LocalEnvValue -Name "AIC_BATCH_ID"' in source
     assert 'Get-YamlRuntimeDefault -Name "profile"' in source
     assert 'Get-YamlRuntimeDefault -Name "batch"' in source
+    assert "source_contract_fingerprint" in source
+    assert "--server.fileWatcherType none" in source
+    assert "--server.runOnSave false" in source
 
 
 def test_streamlit_runtime_check_scans_logs_for_forbidden_diagnostics() -> None:

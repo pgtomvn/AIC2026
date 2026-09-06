@@ -1132,6 +1132,16 @@ class BatchVectorStore:
                 return True
         return False
 
+    def count(self, filters: Optional[dict[str, Any]] = None) -> int:
+        """Return the exact point count across selected batch collections."""
+
+        client = self._get_client()
+        total = 0
+        for name in self._selected_collection_names(filters):
+            if client.collection_exists(collection_name=name):
+                total += self._store(name).count(filters)
+        return total
+
     def vectors_for_frames(
         self,
         frame_keys: list[tuple[str, int]] | tuple[tuple[str, int], ...],

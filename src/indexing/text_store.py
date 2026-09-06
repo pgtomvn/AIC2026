@@ -7,7 +7,7 @@ Importing or constructing :class:`TextStore` does not contact the service.
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any, Optional
 from uuid import NAMESPACE_URL, uuid5
 
@@ -34,6 +34,7 @@ _FILTERABLE_ATTRIBUTES = [
 ]
 
 _TASK_TIMEOUT_MS = 120_000
+_TASK_POLL_INTERVAL_MS = 500
 _MEILI_ID = re.compile(r"[A-Za-z0-9_-]{1,511}\Z")
 
 VIETNAMESE_STOP_WORDS = (
@@ -121,6 +122,7 @@ class TextStore:
         task = self._get_client().wait_for_task(
             int(task_uid),
             timeout_in_ms=_TASK_TIMEOUT_MS,
+            interval_in_ms=_TASK_POLL_INTERVAL_MS,
         )
         status = self._task_value(task, "status")
         if status != "succeeded":
@@ -170,11 +172,27 @@ class TextStore:
 
         self._index = index
         self._primary_key = primary_key
-        searchable_task = index.update_searchable_attributes(_SEARCHABLE_ATTRIBUTES)
-        self._wait_for_task(searchable_task, "update searchable attributes")
         filterable_attributes = list(dict.fromkeys([primary_key, *_FILTERABLE_ATTRIBUTES]))
-        filterable_task = index.update_filterable_attributes(filterable_attributes)
-        self._wait_for_task(filterable_task, "update filterable attributes")
+        settings = index.get_settings()
+        if isinstance(settings, Mapping):
+            current_searchable = settings.get(
+                "searchableAttributes",
+                settings.get("searchable_attributes"),
+            )
+            current_filterable = settings.get(
+                "filterableAttributes",
+                settings.get("filterable_attributes"),
+            )
+        else:
+            current_searchable = getattr(settings, "searchable_attributes", None)
+            current_filterable = getattr(settings, "filterable_attributes", None)
+
+        if current_searchable != _SEARCHABLE_ATTRIBUTES:
+            searchable_task = index.update_searchable_attributes(_SEARCHABLE_ATTRIBUTES)
+            self._wait_for_task(searchable_task, "update searchable attributes")
+        if current_filterable != filterable_attributes:
+            filterable_task = index.update_filterable_attributes(filterable_attributes)
+            self._wait_for_task(filterable_task, "update filterable attributes")
 
     def configure_shadow_v2(self, profile: str) -> None:
         """Apply versioned multilingual settings to a non-live v2 index.
@@ -302,7 +320,10 @@ class TextStore:
         if not isinstance(hits, list):
             raise RuntimeError("Meilisearch returned a malformed search response")
 
-        results = []
+        return self._results_from_hits(hits)
+
+    def _results_from_hits(self, hits: Sequence[Any]) -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
         for rank, raw_hit in enumerate(hits, start=1):
             if not isinstance(raw_hit, Mapping):
                 raise RuntimeError("Meilisearch returned a non-object search hit")
@@ -320,6 +341,57 @@ class TextStore:
                 }
             )
         return results
+
+    def search_many(
+        self,
+        queries: Sequence[tuple[str, tuple[str, ...] | None]],
+        *,
+        top_k: int = 50,
+        filters: Optional[str] = None,
+    ) -> list[list[dict[str, Any]]]:
+        """Execute bounded lexical variants in one Meilisearch HTTP request."""
+
+        if isinstance(queries, (str, bytes)) or not isinstance(queries, Sequence):
+            raise TypeError("queries must be a sequence")
+        if not 1 <= len(queries) <= 128:
+            raise ValueError("queries must contain between 1 and 128 variants")
+        if top_k <= 0:
+            raise ValueError("top_k must be positive")
+        if filters is not None and not isinstance(filters, str):
+            raise TypeError("filters must be a Meilisearch filter expression string")
+        payload: list[dict[str, Any]] = []
+        for query, locales in queries:
+            if not isinstance(query, str):
+                raise TypeError("every query must be a string")
+            item: dict[str, Any] = {
+                "indexUid": self.index_name,
+                "q": query,
+                "limit": top_k,
+                "showRankingScore": True,
+            }
+            if filters:
+                item["filter"] = filters
+            if locales:
+                item["locales"] = list(locales)
+            payload.append(item)
+        client = self._get_client()
+        multi_search = getattr(client, "multi_search", None)
+        if not callable(multi_search):
+            return [
+                self.search(query, top_k=top_k, filters=filters, locales=locales)
+                for query, locales in queries
+            ]
+        response = multi_search(payload)
+        raw_results = response.get("results") if isinstance(response, Mapping) else getattr(response, "results", None)
+        if not isinstance(raw_results, (list, tuple)) or len(raw_results) != len(queries):
+            raise RuntimeError("Meilisearch returned a malformed multi-search response")
+        values: list[list[dict[str, Any]]] = []
+        for raw_result in raw_results:
+            hits = raw_result.get("hits") if isinstance(raw_result, Mapping) else getattr(raw_result, "hits", None)
+            if not isinstance(hits, (list, tuple)):
+                raise RuntimeError("Meilisearch returned malformed multi-search hits")
+            values.append(self._results_from_hits(hits))
+        return values
 
     def is_available(self, filters: Optional[str] = None) -> bool:
         """Return whether the index has at least one selected document.
@@ -357,12 +429,29 @@ class TextStore:
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise RuntimeError("Meilisearch stats are missing a valid document count")
             return value
-        options: dict[str, Any] = {"limit": 0}
+        # ``estimatedTotalHits`` is capped by Meilisearch's pagination
+        # ``maxTotalHits`` setting (1000 by default), so it is not an exact
+        # import/readiness contract.  ``batch_id`` is filterable and therefore
+        # facetable; its distribution reports the exact filtered population.
+        options: dict[str, Any] = {"limit": 0, "facets": ["batch_id"]}
         if filters:
             options["filter"] = filters
         response = index.search("", options)
         if not isinstance(response, Mapping):
             raise RuntimeError("Meilisearch returned a malformed count response")
+        distribution = response.get(
+            "facetDistribution",
+            response.get("facet_distribution"),
+        )
+        if isinstance(distribution, Mapping):
+            batch_counts = distribution.get("batch_id")
+            if isinstance(batch_counts, Mapping):
+                values = tuple(batch_counts.values())
+                if all(
+                    isinstance(value, int) and not isinstance(value, bool) and value >= 0
+                    for value in values
+                ):
+                    return sum(values)
         value = response.get("estimatedTotalHits", response.get("totalHits"))
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise RuntimeError("Meilisearch count response is missing a valid total")

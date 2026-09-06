@@ -924,6 +924,40 @@ class JobLedger:
             ).fetchone()
         return None if row is None else dict(row)
 
+    def list_video_ids(self, batch_id: str) -> tuple[str, ...]:
+        """List registered videos without exposing their source URIs."""
+
+        if not batch_id.strip():
+            raise ValueError("batch_id must be non-empty")
+        with closing(self._connection()) as connection:
+            rows = connection.execute(
+                "SELECT video_id FROM videos WHERE batch_id = ? ORDER BY video_id",
+                (batch_id,),
+            ).fetchall()
+        return tuple(str(row["video_id"]) for row in rows)
+
+    def stage_records(
+        self,
+        batch_id: str,
+        stage_name: str,
+    ) -> tuple[dict[str, Any], ...]:
+        """Return sanitized stage progress for readiness/checkpoint projections."""
+
+        if not batch_id.strip() or not stage_name.strip():
+            raise ValueError("batch_id and stage_name must be non-empty")
+        with closing(self._connection()) as connection:
+            rows = connection.execute(
+                """
+                SELECT video_id, state, attempts, fingerprint, started_at,
+                       completed_at, error, updated_at
+                FROM stages
+                WHERE batch_id = ? AND stage_name = ?
+                ORDER BY video_id
+                """,
+                (batch_id, stage_name),
+            ).fetchall()
+        return tuple(dict(row) for row in rows)
+
     def recover_interrupted(
         self,
         batch_id: str,

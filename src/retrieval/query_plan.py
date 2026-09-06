@@ -11,11 +11,32 @@ import re
 import unicodedata
 from dataclasses import asdict, dataclass, field
 
+from src.query.entity_extractor import EntityExtractor
+from src.query.query_decomposer import (
+    ProspectiveRelation,
+    SequenceConstraint,
+    prospective_relations,
+    sequence_constraints,
+)
+
+_ENTITY_EXTRACTOR = EntityExtractor()
+
 _QUOTED = re.compile(r"[\"“”'‘’]([^\"“”'‘’]{2,})[\"“”'‘’]")
 _TOKEN = re.compile(r"[^\W_]+(?:[-'][^\W_]+)*", re.UNICODE)
 _BEFORE = re.compile(r"\b(?:before|prior to|trước khi|trước đó)\b", re.IGNORECASE)
 _AFTER = re.compile(r"\b(?:after|following|sau khi|sau đó|tiếp theo)\b", re.IGNORECASE)
 _THEN = re.compile(r"\b(?:then|next|rồi|sau đó|tiếp theo)\b", re.IGNORECASE)
+_ASR_CUE = re.compile(
+    r"(?<!\w)(?:"
+    r"nói|đang nói|phát biểu|phỏng vấn|hỏi|trả lời|lời thoại|thuyết minh|"
+    r"đọc|hát|ca từ|người dẫn|nghe thấy|âm thanh|"
+    r"xin chào|chào mừng|tạm biệt|cảm ơn|"
+    r"say|says|said|speaking|speech|interview|ask|asks|answer|answers|"
+    r"dialogue|narration|narrator|lyrics|announce|announces|audio|"
+    r"hello|welcome|goodbye|thank you"
+    r")(?!\w)",
+    re.IGNORECASE,
+)
 
 # These lists intentionally cover common competition phrasing only.  They are
 # hints for channel weighting/evidence display, never query replacements.
@@ -100,6 +121,23 @@ _OBJECT_WORDS = frozenset(
 )
 
 
+def stable_unique(values: tuple[str, ...] | list[str]) -> tuple[str, ...]:
+    """Return NFC/case-insensitive unique values while preserving display order."""
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = normalize_nfc(value)
+        if not normalized:
+            continue
+        identity = normalized.casefold()
+        if identity in seen:
+            continue
+        seen.add(identity)
+        result.append(normalized)
+    return tuple(result)
+
+
 def normalize_nfc(text: str) -> str:
     """Return trimmed NFC-normalized Unicode without altering accents."""
 
@@ -129,7 +167,12 @@ class QueryPlan:
     before: str | None = None
     current: str | None = None
     after: str | None = None
+    sequence_constraints: tuple[SequenceConstraint, ...] = ()
+    prospective_relations: tuple[ProspectiveRelation, ...] = ()
     tokens: tuple[str, ...] = field(default_factory=tuple)
+    asr_intent: bool = False
+    asr_query: str = ""
+    asr_terms: tuple[str, ...] = field(default_factory=tuple)
 
     def to_dict(self) -> dict[str, object]:
         """Serialize the plan for API/UI editing."""
@@ -137,10 +180,21 @@ class QueryPlan:
         return asdict(self)
 
 
-def _split_temporal_clauses(text: str) -> tuple[str | None, str | None, str | None]:
+def _split_temporal_clauses(
+    text: str,
+    *,
+    ignored_spans: tuple[tuple[int, int], ...] = (),
+) -> tuple[str | None, str | None, str | None]:
     markers: list[tuple[int, int, str]] = []
     for kind, pattern in (("before", _BEFORE), ("after", _AFTER), ("then", _THEN)):
-        markers.extend((match.start(), match.end(), kind) for match in pattern.finditer(text))
+        markers.extend(
+            (match.start(), match.end(), kind)
+            for match in pattern.finditer(text)
+            if not any(
+                match.start() < ignored_end and ignored_start < match.end()
+                for ignored_start, ignored_end in ignored_spans
+            )
+        )
     markers.sort()
     if not markers:
         return None, text or None, None
@@ -164,24 +218,67 @@ def build_query_plan(text: str) -> QueryPlan:
     normalized = normalize_nfc(text)
     tokens = tuple(_TOKEN.findall(normalized))
     lowered = tuple(token.casefold() for token in tokens)
-    quoted = tuple(normalize_nfc(value) for value in _QUOTED.findall(normalized))
-    actions = tuple(
-        token for token, folded in zip(tokens, lowered, strict=True) if folded in _ACTION_WORDS
+    quoted = stable_unique(tuple(normalize_nfc(value) for value in _QUOTED.findall(normalized)))
+    actions = stable_unique(
+        tuple(
+            token for token, folded in zip(tokens, lowered, strict=True) if folded in _ACTION_WORDS
+        )
     )
-    attributes = tuple(
-        token for token, folded in zip(tokens, lowered, strict=True) if folded in _ATTRIBUTE_WORDS
+    attributes = stable_unique(
+        tuple(
+            token
+            for token, folded in zip(tokens, lowered, strict=True)
+            if folded in _ATTRIBUTE_WORDS
+        )
     )
-    objects = tuple(
-        token for token, folded in zip(tokens, lowered, strict=True) if folded in _OBJECT_WORDS
+    objects = stable_unique(
+        tuple(
+            token for token, folded in zip(tokens, lowered, strict=True) if folded in _OBJECT_WORDS
+        )
     )
-    # Capitalized multi-character tokens are useful entity hints.  Avoid
-    # interpreting the sentence-initial word as an entity on its own.
-    entities = tuple(
-        token
-        for index, token in enumerate(tokens)
-        if index > 0 and len(token) > 1 and token[0].isupper()
+    entities = tuple(entity.text for entity in _ENTITY_EXTRACTOR.extract(normalized))
+    numeric_terms = tuple(
+        token for token in tokens if any(character.isdigit() for character in token)
     )
-    before, current, after = _split_temporal_clauses(normalized)
+    asr_intent = bool(quoted or _ASR_CUE.search(normalized) or entities or numeric_terms)
+    asr_terms = stable_unique(
+        [
+            *quoted,
+            *entities,
+            *numeric_terms,
+        ]
+    )
+    asr_query = " ".join(quoted).strip() if quoted else normalized
+    prospective = prospective_relations(normalized)
+    sequences = tuple(
+        SequenceConstraint(
+            value.kind,
+            value.source_text,
+            value.member_label,
+            prospective[0].action if prospective else None,
+            value.confidence,
+        )
+        for value in sequence_constraints(normalized)
+    )
+    ignored_spans = tuple(
+        (match.start(), match.end())
+        for pattern in (
+            re.compile(r"\bone\s+(?:after|behind)\s+another\b", re.IGNORECASE),
+            re.compile(
+                r"\b(?P<label>[^\W_]+)\s+after\s+(?P=label)\b",
+                re.IGNORECASE | re.UNICODE,
+            ),
+            re.compile(
+                r"(?<!\w)(?:lần\s+lượt|nối\s+đuôi\s+nhau)(?!\w)",
+                re.IGNORECASE,
+            ),
+        )
+        for match in pattern.finditer(normalized)
+    )
+    before, current, after = _split_temporal_clauses(
+        normalized,
+        ignored_spans=ignored_spans,
+    )
     return QueryPlan(
         original_text=text,
         normalized_text=normalized,
@@ -194,5 +291,10 @@ def build_query_plan(text: str) -> QueryPlan:
         before=before,
         current=current,
         after=after,
+        sequence_constraints=sequences,
+        prospective_relations=prospective,
         tokens=tokens,
+        asr_intent=asr_intent,
+        asr_query=asr_query,
+        asr_terms=asr_terms,
     )

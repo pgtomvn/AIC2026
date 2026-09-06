@@ -16,9 +16,11 @@ from src.evaluation.tuning import (
     CachedChannelRanking,
     RetrievalTuningReport,
     load_cached_rankings,
+    load_intent_policy_override,
     load_tuning_override,
     persist_tuning_report,
     tune_cached_rankings,
+    tune_intent_policies,
 )
 from src.extraction.calibration import (
     load_calibration_selection,
@@ -147,6 +149,8 @@ def test_cached_tuning_optimizes_score_and_reports_cumulative_ablations(
     assert report.used_defaults is False
     assert report.selected_weights["ocr"] == 2.0
     assert report.best_metrics == {
+        "r_at_3": 1.0,
+        "mrr": 1.0,
         "mean_top_k_score": 1.0,
         "r_at_1": 1.0,
         "p95_latency_ms": 7.0,
@@ -181,6 +185,8 @@ def test_tuning_preserves_defaults_without_labels_and_cli_is_runnable(
     assert displayed["used_defaults"] is True
     assert output.is_file()
     assert load_tuning_override(output, expected_channels=tuple(displayed["selected"]["channel_weights"])) is None
+    with pytest.raises(ValueError, match="locked --qrels-manifest"):
+        tune_main(["--per-intent", "--output", str(tmp_path / "unsafe.json")])
 
 
 def test_runtime_consumes_only_valid_labeled_tuning_record(tmp_path: Path) -> None:
@@ -247,3 +253,75 @@ def test_cached_ranking_loader_validates_versioned_query_shape(tmp_path: Path) -
     path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ValueError, match="schema_version 1"):
         load_cached_rankings(path)
+
+
+def test_intent_policy_tuning_uses_bucketed_cached_rankings_and_fingerprint(
+    tmp_path: Path,
+) -> None:
+    def target(video: str) -> GroundTruthInterval:
+        return GroundTruthInterval(video, 10, 10)
+
+    ground_truth = (
+        GroundTruthQuery("visual", (target("L21_V001"),), intent_class="visual_dense"),
+        GroundTruthQuery("lexical", (target("L21_V002"),), intent_class="lexical_dominant"),
+        GroundTruthQuery("spatial", (target("L21_V003"),), intent_class="relative_spatial"),
+    )
+    cached = {
+        query.query_id: {
+            "visual": CachedChannelRanking(
+                (
+                    {
+                        "video_id": "L21_V001"
+                        if query.query_id == "visual"
+                        else "L21_V999",
+                        "source_frame_idx": 10,
+                    },
+                ),
+                5.0,
+            ),
+            "ocr": CachedChannelRanking(
+                (
+                    {
+                        "video_id": "L21_V999"
+                        if query.query_id == "visual"
+                        else ("L21_V002" if query.query_id == "lexical" else "L21_V003"),
+                        "source_frame_idx": 10,
+                    },
+                ),
+                2.0,
+            ),
+        }
+        for query in ground_truth
+    }
+
+    report = tune_intent_policies(
+        cached,
+        ground_truth,
+        dense_channels=("visual",),
+        default_rrf_k=60,
+        default_depths={"visual": 1, "ocr": 1},
+        default_weights={"visual": 1.0, "ocr": 1.0},
+        rrf_k_values=(60,),
+        weight_values={"visual": (0.0, 2.0), "ocr": (0.0, 2.0)},
+        qrels_provenance={
+            "content_sha256": "a" * 64,
+            "locked_test_sha256": "b" * 64,
+            "training_query_count": 3,
+        },
+    )
+
+    assert report.policies["visual_dense"]["dense_share"] == 1.0, report.bucket_reports[
+        "visual_dense"
+    ]["selected"]
+    assert report.policies["lexical_dominant"]["text_share"] == 1.0
+    assert report.policies["spatial_color"]["text_share"] == 1.0
+    persisted = persist_tuning_report(report, tmp_path / "intent-policies.json")
+    assert load_intent_policy_override(persisted) == report.policies
+    persisted_payload = json.loads(persisted.read_text(encoding="utf-8"))
+    assert persisted_payload["qrels_provenance"]["locked_test_sha256"] == "b" * 64
+
+    payload = persisted_payload
+    payload["intent_policies"]["visual_dense"]["rrf_k"] = 20
+    persisted.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="fingerprint"):
+        load_intent_policy_override(persisted)

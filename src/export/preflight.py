@@ -6,6 +6,12 @@ import re
 from dataclasses import dataclass
 from typing import Callable, Literal, Mapping, Sequence
 
+from src.codabench_query_id import (
+    codabench_query_filename,
+    codabench_query_id_collision_key,
+    codabench_query_id_sort_key,
+    normalize_codabench_query_id,
+)
 from src.official_submission import (
     OfficialSubmissionValidationError,
     ParsedSubmission,
@@ -15,8 +21,7 @@ from src.official_submission import (
 )
 
 CODABENCH_SPEC_ID = "codabench_10187_2025"
-BundleMode = Literal["all", "current"]
-_QUERY_ID = re.compile(r"^[0-9]{1,32}$")
+BundleMode = Literal["all", "current", "selection"]
 _FINGERPRINT = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -35,8 +40,8 @@ class BundleEntry:
     def __post_init__(self) -> None:
         if self.task not in {"kis", "qa", "trake"}:
             raise ValueError("task must be kis, qa, or trake")
-        if not isinstance(self.query_id, str) or _QUERY_ID.fullmatch(self.query_id) is None:
-            raise ValueError("query_id must contain 1-32 decimal digits")
+        normalized_query_id = normalize_codabench_query_id(self.query_id)
+        object.__setattr__(self, "query_id", normalized_query_id)
         if not isinstance(self.csv_bytes, bytes):
             raise TypeError("csv_bytes must be bytes")
         if not isinstance(self.batch_id, str) or not self.batch_id.strip():
@@ -69,7 +74,7 @@ class BundleEntry:
 
     @property
     def filename(self) -> str:
-        return f"query-{self.query_id}-{self.task}.csv"
+        return codabench_query_filename(self.query_id, self.task)
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,16 +204,17 @@ def _precheck_rows(
                 )
             )
 
-    seen_kis_qa: set[tuple[str, int]] = set()
+    seen_kis: set[tuple[str, int]] = set()
+    seen_qa: set[tuple[str, int, str]] = set()
     seen_trake_videos: set[str] = set()
     for index, values in enumerate(parsed.rows):
         row_number = index + 1
         line_number = _line(parsed, index)
         video_id = values[0]
         frames = tuple(int(value) for value in (values[1:-1] if entry.task == "qa" else values[1:]))
-        if entry.task in {"kis", "qa"}:
+        if entry.task == "kis":
             identity = (video_id, frames[0])
-            if identity in seen_kis_qa:
+            if identity in seen_kis:
                 raise BundleValidationError(
                     (
                         _issue(
@@ -221,7 +227,23 @@ def _precheck_rows(
                         ),
                     )
                 )
-            seen_kis_qa.add(identity)
+            seen_kis.add(identity)
+        elif entry.task == "qa":
+            identity = (video_id, frames[0], values[2])
+            if identity in seen_qa:
+                raise BundleValidationError(
+                    (
+                        _issue(
+                            entry,
+                            "submission_duplicate_answer",
+                            "the same canonical frame and answer are duplicated",
+                            row=row_number,
+                            line=line_number,
+                            suggestion="Remove the exact duplicate answer row",
+                        ),
+                    )
+                )
+            seen_qa.add(identity)
         elif video_id in seen_trake_videos:
             raise BundleValidationError(
                 (
@@ -303,12 +325,19 @@ def validate_bundle_entries(
     *,
     context: BundleValidationContext,
     mode: BundleMode = "all",
+    require_qa_answer_quotes: bool = False,
 ) -> tuple[ValidatedBundleEntry, ...]:
     """Validate all staged entries before filesystem publication begins."""
 
-    if mode not in {"all", "current"}:
+    if mode not in {"all", "current", "selection"}:
         raise BundleValidationError(
-            (_issue(None, "bundle_mode_invalid", "mode must be all or current"),)
+            (
+                _issue(
+                    None,
+                    "bundle_mode_invalid",
+                    "mode must be all, current, or selection",
+                ),
+            )
         )
     staged = tuple(entries)
     if not staged:
@@ -330,12 +359,12 @@ def validate_bundle_entries(
         raise BundleValidationError(
             (_issue(None, "bundle_mixed_batch", "bundle entries cannot mix batches"),)
         )
-    filenames = [entry.filename for entry in staged]
+    filenames = [entry.filename.casefold() for entry in staged]
     if len(filenames) != len(set(filenames)):
         raise BundleValidationError(
             (_issue(None, "bundle_duplicate_filename", "bundle filenames must be unique"),)
         )
-    query_ids = [entry.query_id for entry in staged]
+    query_ids = [codabench_query_id_collision_key(entry.query_id) for entry in staged]
     if len(query_ids) != len(set(query_ids)):
         raise BundleValidationError(
             (_issue(None, "bundle_duplicate_query_id", "query IDs must be unique"),)
@@ -356,13 +385,19 @@ def validate_bundle_entries(
 
     validated: list[ValidatedBundleEntry] = []
     issues: list[BundleValidationIssue] = []
-    for entry in sorted(staged, key=lambda item: (int(item.query_id), item.query_id, item.task)):
+    for entry in sorted(
+        staged,
+        key=lambda item: (codabench_query_id_sort_key(item.query_id), item.task),
+    ):
         try:
             parsed = parse_submission_bytes(
                 entry.csv_bytes,
                 filename=entry.filename,
                 task=entry.task,
                 spec_id=CODABENCH_SPEC_ID,
+                require_qa_answer_quotes=(
+                    require_qa_answer_quotes and entry.task == "qa"
+                ),
             )
             _precheck_rows(entry, parsed, context)
             validate_parsed_submission(
@@ -407,7 +442,7 @@ def entry_from_payload(value: Mapping[str, object]) -> BundleEntry:
 
     return BundleEntry(
         task=str(value.get("task", "")),  # type: ignore[arg-type]
-        query_id=str(value.get("query_id", "")),
+        query_id=value.get("query_id", ""),  # type: ignore[arg-type]
         csv_bytes=value.get("csv_bytes", b""),  # type: ignore[arg-type]
         batch_id=str(value.get("batch_id", "")),
         source_fingerprint=str(value.get("source_fingerprint", "")),

@@ -12,7 +12,11 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from src.contracts import QACompetitionSpec, QAPrediction
-from src.submission import CanonicalSourceFrameCheck, FrameIndexEvidence
+from src.submission import (
+    CanonicalSourceFrameCheck,
+    FrameIndexEvidence,
+    export_qa_csv,
+)
 
 
 class QASubmissionValidationError(ValueError):
@@ -161,9 +165,9 @@ def validate_qa_submission(
 ) -> tuple[QAPrediction, ...]:
     """Validate, normalize, rank, and deduplicate Visual Q&A predictions.
 
-    A canonical frame can carry only one answer. Alternate answers for the same
-    ``(video_id, source_frame_idx)`` therefore fail validation instead of using
-    multiple competition ranks.
+    Alternate normalized answers may intentionally target the same canonical
+    frame at different ranks.  Only an exact ``(video, frame, answer)`` row is
+    rejected because it cannot add submission coverage.
     """
 
     active_spec = spec or QACompetitionSpec.historical_numeric()
@@ -202,7 +206,7 @@ def validate_qa_submission(
         )
     except (TypeError, ValueError) as exc:
         raise QASubmissionValidationError(str(exc)) from exc
-    seen_frames: set[tuple[str, int]] = set()
+    seen_rows: set[tuple[str, int, str]] = set()
     seen_batches = {item.batch_id for item in parsed if item.batch_id is not None}
     if len(seen_batches) > 1:
         raise QASubmissionValidationError("results cannot mix batches")
@@ -244,12 +248,12 @@ def validate_qa_submission(
             raise QASubmissionValidationError(
                 f"{video_id}:{item.source_frame_idx} is not a canonical source frame"
             )
-        identity = (video_id, item.source_frame_idx)
-        if identity in seen_frames:
+        identity = (video_id, item.source_frame_idx, answer)
+        if identity in seen_rows:
             raise QASubmissionValidationError(
-                f"duplicate canonical frame: {video_id},{item.source_frame_idx}"
+                f"duplicate QA row: {video_id},{item.source_frame_idx},{answer}"
             )
-        seen_frames.add(identity)
+        seen_rows.add(identity)
         normalized.append(
             QAPrediction(
                 rank=rank,
@@ -290,8 +294,32 @@ def serialize_qa_submission(
         is_canonical_source_frame=is_canonical_source_frame,
         frame_index_evidence=frame_index_evidence,
     )
+    canonical_columns = ("video_name", "frame_idx", "answer")
+    if active_spec.output_columns == canonical_columns:
+        body = export_qa_csv(
+            (prediction.video_id, prediction.source_frame_idx, prediction.answer)
+            for prediction in predictions
+        )
+        if not active_spec.include_header:
+            return body.encode("utf-8")
+        header = io.StringIO(newline="")
+        csv.writer(
+            header,
+            lineterminator="\n",
+            quoting=csv.QUOTE_MINIMAL,
+            doublequote=True,
+        ).writerow(active_spec.output_columns)
+        return (header.getvalue() + body).encode("utf-8")
+
+    # Preserve the configurable column-order compatibility surface while the
+    # competition's canonical three-column path uses the shared exporter.
     buffer = io.StringIO(newline="")
-    writer = csv.writer(buffer, lineterminator="\n")
+    writer = csv.writer(
+        buffer,
+        lineterminator="\n",
+        quoting=csv.QUOTE_MINIMAL,
+        doublequote=True,
+    )
     if active_spec.include_header:
         writer.writerow(active_spec.output_columns)
     for prediction in predictions:

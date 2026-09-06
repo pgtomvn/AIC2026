@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from collections import defaultdict, deque
 from collections.abc import Mapping, Sequence
+from inspect import Parameter, signature
 from typing import Any, Protocol
 
 from src.contracts import FrameRecord, QACandidateFrame, QACandidateWindow
@@ -37,6 +38,7 @@ class TextualRetriever(Protocol):
         *,
         limit: int | None = None,
         refine_raw: bool = True,
+        advanced_rerank: bool = True,
     ) -> list[dict[str, Any]]: ...
 
 
@@ -126,24 +128,35 @@ class VisualQARetriever:
         top_k: int = 5,
         query_language: str = "auto",
         event_description_en: str | None = None,
+        entity_constraints: Sequence[Any] = (),
     ) -> tuple[QACandidateFrame, ...]:
         """Return canonical KIS hits without resolving media or invoking a VLM."""
 
         if not isinstance(event_description, str) or not event_description.strip():
             raise ValueError("event_description must be a non-empty string")
-        if isinstance(top_k, bool) or not isinstance(top_k, int) or not 1 <= top_k <= 20:
-            raise ValueError("top_k must be between 1 and 20")
+        if isinstance(top_k, bool) or not isinstance(top_k, int) or not 1 <= top_k <= 50:
+            raise ValueError("top_k must be between 1 and 50")
         filters = tuple(str(value) for value in batch_filters)
-        hits = self.textual_pipeline.search(
-            {
-                "original_text": event_description,
-                "batch_filters": filters,
-                "query_language": query_language,
-                "event_description_en": event_description_en,
-            },
-            limit=max(top_k, min(self.retrieval_depth, 100)),
-            refine_raw=False,
-        )
+        request = {
+            "original_text": event_description,
+            "batch_filters": filters,
+            "query_language": query_language,
+            "event_description_en": event_description_en,
+            "entity_constraints": tuple(entity_constraints),
+        }
+        search_kwargs: dict[str, Any] = {
+            "limit": max(top_k, min(self.retrieval_depth, 100)),
+            "refine_raw": False,
+        }
+        try:
+            parameters = tuple(signature(self.textual_pipeline.search).parameters.values())
+            supports_kwargs = any(value.kind is Parameter.VAR_KEYWORD for value in parameters)
+            names = {value.name for value in parameters}
+        except (TypeError, ValueError):
+            supports_kwargs, names = False, set()
+        if supports_kwargs or "advanced_rerank" in names:
+            search_kwargs["advanced_rerank"] = False
+        hits = self.textual_pipeline.search(request, **search_kwargs)
         candidates: list[QACandidateFrame] = []
         seen: set[tuple[str, str, int]] = set()
         for hit in hits:

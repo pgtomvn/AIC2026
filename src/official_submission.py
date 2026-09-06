@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Literal, Sequence
 
+from src.codabench_query_id import parse_codabench_query_filename
 from src.contracts import CompetitionSpec, QACompetitionSpec, TRAKECompetitionSpec
 from src.qa_submission import validate_qa_submission
 from src.submission import validate_submission
@@ -62,6 +63,7 @@ class ParsedSubmission:
     line_count: int
     stage_count: int | None = None
     physical_lines: tuple[int, ...] = ()
+    raw_records: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,9 +124,139 @@ def _spec_for(task: SubmissionTask, spec_id: str) -> object:
     return TRAKECompetitionSpec.historical_2025_provisional()
 
 
-_CODABENCH_FILENAME = re.compile(r"^query-([0-9]+)-(kis|qa|trake)\.csv$")
 _VIDEO_ID = re.compile(r"^L[0-9]{2}_V[0-9]{3}$")
 _FRAME_INDEX = re.compile(r"^[0-9]+$")
+
+
+def _raise_csv_lexical_error(
+    code: str,
+    message: str,
+    *,
+    line: int,
+) -> None:
+    raise OfficialSubmissionValidationError(code, message, line=max(1, line))
+
+
+def _validate_codabench_csv_lexemes(text: str) -> None:
+    """Validate RFC 4180 quotes and record separators."""
+
+    in_quotes = False
+    after_quote = False
+    at_field_start = True
+    record_newlines: set[str] = set()
+    line = 1
+    index = 0
+    while index < len(text):
+        character = text[index]
+        if in_quotes:
+            if character == '"':
+                if index + 1 < len(text) and text[index + 1] == '"':
+                    index += 2
+                    continue
+                in_quotes = False
+                after_quote = True
+            elif character == "\n":
+                line += 1
+            index += 1
+            continue
+
+        if after_quote:
+            if character == ",":
+                after_quote = False
+                at_field_start = True
+                index += 1
+                continue
+            if character == "\r":
+                if index + 1 >= len(text) or text[index + 1] != "\n":
+                    _raise_csv_lexical_error(
+                        "submission_newline_invalid",
+                        "submission contains a bare record-separator carriage return",
+                        line=line,
+                    )
+                record_newlines.add("crlf")
+                after_quote = False
+                at_field_start = True
+                line += 1
+                index += 2
+                continue
+            if character == "\n":
+                record_newlines.add("lf")
+                after_quote = False
+                at_field_start = True
+                line += 1
+                index += 1
+                continue
+            _raise_csv_lexical_error(
+                "submission_csv_invalid",
+                "characters after a closing quote are not valid CSV",
+                line=line,
+            )
+
+        if character == '"':
+            if not at_field_start:
+                _raise_csv_lexical_error(
+                    "submission_csv_invalid",
+                    "quotes inside an unquoted field must be escaped",
+                    line=line,
+                )
+            in_quotes = True
+            at_field_start = False
+            index += 1
+            continue
+        if character == ",":
+            at_field_start = True
+            index += 1
+            continue
+        if character == "\r":
+            if index + 1 >= len(text) or text[index + 1] != "\n":
+                _raise_csv_lexical_error(
+                    "submission_newline_invalid",
+                    "submission contains a bare record-separator carriage return",
+                    line=line,
+                )
+            record_newlines.add("crlf")
+            at_field_start = True
+            line += 1
+            index += 2
+            continue
+        if character == "\n":
+            record_newlines.add("lf")
+            at_field_start = True
+            line += 1
+            index += 1
+            continue
+        at_field_start = False
+        index += 1
+
+    if in_quotes:
+        _raise_csv_lexical_error(
+            "submission_csv_invalid",
+            "submission contains an unterminated quoted field",
+            line=line,
+        )
+    if len(record_newlines) > 1:
+        _raise_csv_lexical_error(
+            "submission_newline_invalid",
+            "submission mixes LF and CRLF record terminators",
+            line=line,
+        )
+
+
+def _qa_answer_was_quoted(record: str) -> bool:
+    field_starts = [0]
+    in_quotes = False
+    index = 0
+    while index < len(record):
+        character = record[index]
+        if character == '"':
+            if in_quotes and index + 1 < len(record) and record[index + 1] == '"':
+                index += 2
+                continue
+            in_quotes = not in_quotes
+        elif character == "," and not in_quotes:
+            field_starts.append(index + 1)
+        index += 1
+    return len(field_starts) == 3 and record[field_starts[2] :].startswith('"')
 
 
 def parse_submission_bytes(
@@ -133,6 +265,7 @@ def parse_submission_bytes(
     filename: str,
     task: SubmissionTask,
     spec_id: str,
+    require_qa_answer_quotes: bool = False,
 ) -> ParsedSubmission:
     """Parse one submission payload under an explicit versioned rule pack."""
 
@@ -146,8 +279,11 @@ def parse_submission_bytes(
         )
     codabench = spec_id == "codabench_10187_2025"
     if codabench:
-        match = _CODABENCH_FILENAME.fullmatch(filename)
-        if match is None or match.group(2) != task:
+        try:
+            _, filename_task = parse_codabench_query_filename(filename)
+        except (TypeError, ValueError):
+            filename_task = None
+        if filename_task != task:
             raise OfficialSubmissionValidationError(
                 "submission_filename_invalid",
                 "filename must match query-<id>-<task>.csv",
@@ -166,18 +302,6 @@ def parse_submission_bytes(
         raise OfficialSubmissionValidationError(
             "submission_newline_invalid", "submission must use LF newlines"
         )
-    if codabench:
-        without_crlf = data.replace(b"\r\n", b"")
-        if b"\r" in without_crlf:
-            raise OfficialSubmissionValidationError(
-                "submission_newline_invalid", "submission contains a bare carriage return"
-            )
-        has_crlf = b"\r\n" in data
-        has_lf = b"\n" in data.replace(b"\r\n", b"")
-        if has_crlf and has_lf:
-            raise OfficialSubmissionValidationError(
-                "submission_newline_invalid", "submission mixes LF and CRLF newlines"
-            )
     if data and not data.endswith(b"\n"):
         raise OfficialSubmissionValidationError(
             "submission_newline_invalid", "submission must end with LF"
@@ -188,6 +312,8 @@ def parse_submission_bytes(
         raise OfficialSubmissionValidationError(
             "submission_encoding_invalid", "submission must be valid UTF-8"
         ) from exc
+    if codabench:
+        _validate_codabench_csv_lexemes(text)
     reader = csv.reader(io.StringIO(text, newline=""), strict=True)
     try:
         rows_list: list[tuple[str, ...]] = []
@@ -224,6 +350,22 @@ def parse_submission_bytes(
             row=bad_index + 1,
             line=physical_lines[bad_index],
         )
+    text_lines = text.splitlines(keepends=True)
+    raw_records: list[str] = []
+    previous_line = 0
+    for line_number in physical_lines:
+        raw_records.append("".join(text_lines[previous_line:line_number]))
+        previous_line = line_number
+    if require_qa_answer_quotes and task == "qa":
+        for index, record in enumerate(raw_records):
+            if not _qa_answer_was_quoted(record):
+                raise OfficialSubmissionValidationError(
+                    "submission_qa_answer_quotes_required",
+                    "QA answer must be enclosed in double quotes",
+                    row=index + 1,
+                    line=physical_lines[index],
+                    suggestion='Serialize the row as video_id,frame_idx,"answer"',
+                )
     if codabench:
         if len(rows) > 100:
             raise OfficialSubmissionValidationError(
@@ -289,6 +431,7 @@ def parse_submission_bytes(
         line_count=len(rows),
         stage_count=expected_width - 1 if task == "trake" else None,
         physical_lines=tuple(physical_lines),
+        raw_records=tuple(raw_records),
     )
 
 
@@ -297,6 +440,7 @@ def parse_submission_csv(
     *,
     task: SubmissionTask,
     spec_id: str,
+    require_qa_answer_quotes: bool = False,
 ) -> ParsedSubmission:
     """Read and parse a submission file without changing its bytes."""
 
@@ -306,6 +450,7 @@ def parse_submission_csv(
         filename=source.name,
         task=task,
         spec_id=spec_id,
+        require_qa_answer_quotes=require_qa_answer_quotes,
     )
 
 

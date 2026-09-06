@@ -5,13 +5,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import re
 import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.codabench_query_id import parse_codabench_query_filename
 from src.evaluation.textual_kis import (
     GroundTruthInterval,
     evaluate_query,
@@ -57,6 +57,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--ground-truth", type=Path)
     parser.add_argument("--query-id")
     parser.add_argument("--score", action="store_true")
+    parser.add_argument(
+        "--require-qa-quotes",
+        action="store_true",
+        help="Require the QA answer field to be explicitly double-quoted",
+    )
     return parser
 
 
@@ -154,6 +159,7 @@ def main(argv: list[str] | None = None) -> int:
             args.submission,
             task=args.task,
             spec_id=args.spec,
+            require_qa_answer_quotes=args.require_qa_quotes,
         )
         config = load_config()
         artifact_path = args.artifact_db or _path(config["data"]["artifact_db"])
@@ -188,8 +194,16 @@ def main(argv: list[str] | None = None) -> int:
             return None if frame is None else frame.timestamp_ms
 
         if args.spec == CODABENCH_SPEC_ID:
-            match = re.fullmatch(r"query-([0-9]{1,32})-(kis|qa|trake)\.csv", parsed.filename)
-            if match is None:
+            try:
+                parsed_query_id, parsed_task = parse_codabench_query_filename(
+                    args.submission.name
+                )
+            except (TypeError, ValueError):
+                raise OfficialSubmissionValidationError(
+                    "submission_filename_invalid",
+                    "Codabench filename does not match its task",
+                ) from None
+            if parsed_task != args.task:
                 raise OfficialSubmissionValidationError(
                     "submission_filename_invalid",
                     "Codabench filename does not match its task",
@@ -197,7 +211,7 @@ def main(argv: list[str] | None = None) -> int:
             data = args.submission.read_bytes()
             entry = BundleEntry(
                 task=args.task,
-                query_id=match.group(1),
+                query_id=parsed_query_id,
                 csv_bytes=data,
                 batch_id=args.batch_id,
                 source_fingerprint=hashlib.sha256(data).hexdigest(),
@@ -212,6 +226,7 @@ def main(argv: list[str] | None = None) -> int:
                         get_canonical_timestamp_ms=timestamp,
                     ),
                     mode="current",
+                    require_qa_answer_quotes=args.require_qa_quotes,
                 )
             except BundleValidationError as error:
                 issue = error.issues[0]

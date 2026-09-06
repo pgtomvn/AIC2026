@@ -73,11 +73,11 @@ def test_channel_routing_preserves_original_and_never_sends_raw_vi_to_openclip()
         "a man wearing glasses"
     ]
     assert [item.text for item in adapter.dense_variants("visual", processing)] == [
-        "  người đàn ông đeo kính  ",
+        "người đàn ông đeo kính",
         "a man wearing glasses",
     ]
     assert [item.text for item in adapter.dense_variants("semantic_text", processing)] == [
-        "  người đàn ông đeo kính  "
+        "người đàn ông đeo kính"
     ]
     assert [item.text for item in adapter.lexical_variants("ocr", processing)] == [
         "người đàn ông đeo kính"
@@ -116,7 +116,7 @@ def test_manual_override_and_english_identity_preserve_exact_operator_text() -> 
         "a man wearing glasses"
     ]
     assert [value.text for value in adapter.dense_variants("visual", english)] == [
-        "  a man   wearing glasses  "
+        "a man wearing glasses"
     ]
 
 
@@ -220,7 +220,6 @@ def test_kis_fuses_bilingual_variants_inside_each_logical_channel() -> None:
         "organizer_clip",
         "semantic_text",
         "ocr",
-        "metadata",
     ]
     assert visual.calls == ["người đàn ông đọc bản tin", "a man reading news"]
     assert organizer.calls == ["a man reading news"]
@@ -230,6 +229,8 @@ def test_kis_fuses_bilingual_variants_inside_each_logical_channel() -> None:
         ("người đàn ông đọc bản tin", ("vie",)),
         ("a man reading news", ("eng",)),
     ]
+    assert pipeline.last_channel_statuses["metadata"]["result_count"] == 0
+    assert pipeline.last_channel_statuses["metadata"]["metadata_video_count"] == 1
 
 
 class _BatchEncoder:

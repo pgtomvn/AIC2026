@@ -6,11 +6,11 @@ from typing import Any
 
 import streamlit as st
 
-from src.retrieval.query_plan import build_query_plan
+from src.retrieval.query_plan import build_query_plan, stable_unique
 
 
 def _comma_values(value: str) -> tuple[str, ...]:
-    return tuple(item.strip() for item in value.split(",") if item.strip())
+    return stable_unique([item for item in value.split(",")])
 
 
 def render_text_encoding_diagnostics(statuses: dict[str, dict[str, Any]]) -> None:
@@ -29,8 +29,7 @@ def render_text_encoding_diagnostics(statuses: dict[str, dict[str, Any]]) -> Non
             )
         else:
             st.caption(
-                f"Kênh {channel_name} đã chia truy vấn thành {chunk_count} phần "
-                "để giữ đủ nội dung."
+                f"Kênh {channel_name} đã chia truy vấn thành {chunk_count} phần để giữ đủ nội dung."
             )
 
 
@@ -63,19 +62,25 @@ def render_query_input(
 
     with st.expander("Kế hoạch truy xuất có thể chỉnh sửa", expanded=False):
         if plan is not None:
-            st.caption(
-                f"Chuẩn hóa: {plan.normalized_text} · Bỏ dấu: {plan.accent_folded_text}"
-            )
+            st.caption(f"Chuẩn hóa: {plan.normalized_text} · Bỏ dấu: {plan.accent_folded_text}")
         quoted_text = st.text_input("Văn bản trích dẫn", key=f"{key_prefix}_quoted_text")
-        named_entities = st.text_input(
-            "Thực thể được nhắc đến", key=f"{key_prefix}_named_entities"
-        )
+        named_entities = st.text_input("Thực thể được nhắc đến", key=f"{key_prefix}_named_entities")
         objects = st.text_input("Đối tượng", key=f"{key_prefix}_objects")
         actions = st.text_input("Hành động", key=f"{key_prefix}_actions")
         attributes = st.text_input("Thuộc tính", key=f"{key_prefix}_attributes")
         before = st.text_input("Trước đó", key=f"{key_prefix}_before")
         current = st.text_input("Hiện tại", key=f"{key_prefix}_current")
         after = st.text_input("Sau đó", key=f"{key_prefix}_after")
+        mode = st.selectbox(
+            "Chế độ truy xuất văn bản",
+            ("automatic", "visual_only", "asr_only"),
+            format_func=lambda value: (
+                "Tự động đa kênh"
+                if value == "automatic"
+                else ("Chỉ hình ảnh" if value == "visual_only" else "Chỉ lời thoại ASR")
+            ),
+            key=f"{key_prefix}_mode",
+        )
     submitted = st.button(
         "Tìm kiếm",
         type="primary",
@@ -94,5 +99,6 @@ def render_query_input(
         "objects": _comma_values(objects),
         "actions": _comma_values(actions),
         "attributes": _comma_values(attributes),
+        "mode": mode,
         "submitted": submitted,
     }

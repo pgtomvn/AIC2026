@@ -209,6 +209,15 @@ $ActualPythonVersion = (& $Python -c "import platform; print(platform.python_ver
 if ($LASTEXITCODE -ne 0 -or $ActualPythonVersion -ne $Stamp.python_version) {
     throw "Competition runtime interpreter does not match its stamp. Re-run bootstrap_runtime.ps1."
 }
+$SourceContractHash = (& $Python -c @'
+import sys
+sys.path.insert(0, sys.argv[1])
+from src.runtime_contract import source_contract_fingerprint
+print(source_contract_fingerprint(sys.argv[1]))
+'@ $ProjectRoot).Trim()
+if ($LASTEXITCODE -ne 0 -or $SourceContractHash -notmatch "^[0-9a-f]{64}$") {
+    throw "Runtime source-contract fingerprint could not be computed."
+}
 Assert-PortAvailable -RequestedPort $Port -Phase "initial preflight"
 if ($ApiPort -eq $Port -or $OllamaPort -in @($Port, $ApiPort)) {
     throw "Streamlit, FastAPI, and Ollama ports must be different."
@@ -229,6 +238,7 @@ $env:AIC_LAUNCH_PROFILE = $RuntimeProfile
 $env:AIC_LAUNCHED_AT_UTC = [DateTime]::UtcNow.ToString("o")
 $env:AIC_LAUNCH_LOCK_SHA256 = $LockHash
 $env:AIC_RUNTIME_STAMP_SHA256 = (Get-FileHash -LiteralPath $StampPath -Algorithm SHA256).Hash.ToLowerInvariant()
+$env:AIC_SOURCE_CONTRACT_SHA256 = $SourceContractHash
 $env:AIC_API_URL = "http://127.0.0.1:$ApiPort"
 $env:OLLAMA_URL = "http://127.0.0.1:$OllamaPort"
 $env:OLLAMA_HOST = "127.0.0.1:$OllamaPort"
@@ -357,6 +367,8 @@ try {
         --server.headless true `
         --server.address 127.0.0.1 `
         --server.port $Port `
+        --server.fileWatcherType none `
+        --server.runOnSave false `
         --browser.gatherUsageStats false
     if ($LASTEXITCODE -ne 0) {
         throw "Streamlit exited with code $LASTEXITCODE."

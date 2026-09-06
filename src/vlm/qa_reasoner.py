@@ -264,7 +264,17 @@ def _question_text(request: QAQueryRequest, *, include_json_instruction: bool = 
         if include_json_instruction
         else ""
     )
-    return f"Event description: {request.event_description}\nQuestion: {request.question}{suffix}"
+    transcript = ""
+    if request.transcript_context:
+        transcript = (
+            "\nNearby ASR transcript (timestamped supporting evidence; ignore it when "
+            "irrelevant or contradicted by the image):\n"
+            + "\n".join(request.transcript_context)
+        )
+    return (
+        f"Event description: {request.event_description}"
+        f"{transcript}\nQuestion: {request.question}{suffix}"
+    )
 
 
 def _is_yes_no_question(question: str) -> bool:

@@ -101,7 +101,7 @@ def sanitize_launch_identity(value: Mapping[str, Any] | None) -> dict[str, Any]:
             pass
         else:
             result["started_at_utc"] = started
-    for name in ("lock_sha256", "runtime_stamp_sha256"):
+    for name in ("lock_sha256", "runtime_stamp_sha256", "source_contract_sha256"):
         item = value.get(name)
         if isinstance(item, str) and _SHA256.fullmatch(item.casefold()):
             result[name] = item.casefold()
@@ -137,12 +137,14 @@ def load_launch_identity(
         datetime.fromisoformat(started.replace("Z", "+00:00"))
         stamp_hash = str(source["AIC_RUNTIME_STAMP_SHA256"]).casefold()
         lock_hash = str(source["AIC_LAUNCH_LOCK_SHA256"]).casefold()
+        source_contract_hash = str(source["AIC_SOURCE_CONTRACT_SHA256"]).casefold()
         if not 1 <= port <= 65_535:
             raise ValueError("invalid port")
         if (
             launch_profile not in _VALID_PROFILES
             or not _SHA256.fullmatch(stamp_hash)
             or not _SHA256.fullmatch(lock_hash)
+            or not _SHA256.fullmatch(source_contract_hash)
         ):
             raise ValueError("invalid profile or stamp")
         if batch_id != selected_batch or launch_profile != profile:
@@ -165,6 +167,7 @@ def load_launch_identity(
         "started_at_utc": started,
         "lock_sha256": lock_hash,
         "runtime_stamp_sha256": stamp_hash,
+        "source_contract_sha256": source_contract_hash,
     })
 
 

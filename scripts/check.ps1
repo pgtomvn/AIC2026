@@ -7,7 +7,8 @@ param(
     [switch]$IncludeArchives,
     [switch]$IncludeLocalVLM,
     [switch]$IncludeGemini,
-    [switch]$AllowExternalFrameTransfer
+    [switch]$AllowExternalFrameTransfer,
+    [string]$PytestTempRoot = ""
 )
 
 Set-StrictMode -Version Latest
@@ -55,8 +56,13 @@ try {
     # A unique base avoids collisions when a cancelled verification process is
     # still releasing Windows file handles from a prior run.
     $pytestRunId = [guid]::NewGuid().ToString("N")
-    $pytestBaseTemp = Join-Path $ProjectRoot ".cache/pytest-run-$pytestRunId"
-    $pytestCache = Join-Path $ProjectRoot ".cache/pytest-cache-$pytestRunId"
+    $pytestRoot = if ($PytestTempRoot) {
+        [System.IO.Path]::GetFullPath($PytestTempRoot)
+    } else {
+        Join-Path $ProjectRoot ".cache"
+    }
+    $pytestBaseTemp = Join-Path $pytestRoot "aic2026-pytest-run-$pytestRunId"
+    $pytestCache = Join-Path $pytestRoot "aic2026-pytest-cache-$pytestRunId"
     New-Item -ItemType Directory -Force -Path (Split-Path $pytestBaseTemp -Parent) | Out-Null
     Invoke-Checked $UvExe run --frozen ruff check .
     Invoke-Checked $UvExe run --frozen pytest -q `

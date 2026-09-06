@@ -10,7 +10,7 @@ import unicodedata
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from typing import Any, Protocol
 
 from src.contracts import (
@@ -18,6 +18,7 @@ from src.contracts import (
     QACandidateFrame,
     QACandidateRequest,
     QACompetitionSpec,
+    QAFrameInjectionRequest,
     QAPrediction,
     QAQueryRequest,
     QASingleFrameAnswerRequest,
@@ -45,6 +46,22 @@ class QACandidateMediaUnavailableError(RuntimeError):
     def __init__(self, candidate_id: str) -> None:
         super().__init__("qa_candidate_media_unavailable")
         self.candidate_id = str(candidate_id)
+
+
+class QAInjectedFrameNotFoundError(LookupError):
+    """Raised when an injected source-frame identity is not canonical."""
+
+
+class QACandidateOutsideSessionError(ValueError):
+    """Raised when Stage 2 references a candidate not frozen in the QA session."""
+
+
+class QACandidateNotCanonicalError(RuntimeError):
+    """Raised when a persisted candidate no longer matches the canonical artifact row."""
+
+
+class QAManualAnswerValidationError(ValueError):
+    """Raised when an operator answer cannot satisfy the selected QA contract."""
 
 
 _OUTCOME_STATUSES = frozenset(
@@ -274,6 +291,8 @@ class VisualQAPipeline:
         max_inline_image_bytes: int = 20 * 1024 * 1024,
         reasoning_workers: int = 2,
         retrieval_fingerprint: str | Callable[[tuple[str, ...]], str] | None = None,
+        asr_context_radius_ms: int = 30_000,
+        asr_context_max_characters: int = 4_000,
     ) -> None:
         if not 1 <= top_k_retrieve <= 20:
             raise ValueError("top_k_retrieve must be between 1 and 20")
@@ -283,6 +302,10 @@ class VisualQAPipeline:
             raise ValueError("max_inline_image_bytes must be positive")
         if isinstance(reasoning_workers, bool) or not 1 <= reasoning_workers <= 2:
             raise ValueError("reasoning_workers must be one or two")
+        if asr_context_radius_ms < 0:
+            raise ValueError("ASR context radius must be non-negative")
+        if not 1 <= asr_context_max_characters <= 8_192:
+            raise ValueError("ASR context character budget must be between 1 and 8192")
         self.clip_encoder = clip_encoder
         self.vector_store = vector_store
         self.vlm_engine = vlm_engine
@@ -316,6 +339,8 @@ class VisualQAPipeline:
         self.competition_spec = specs[self.default_competition_spec_id]
         self.max_inline_image_bytes = int(max_inline_image_bytes)
         self.reasoning_workers = int(reasoning_workers)
+        self.asr_context_radius_ms = int(asr_context_radius_ms)
+        self.asr_context_max_characters = int(asr_context_max_characters)
         if retrieval_fingerprint is not None and not (
             isinstance(retrieval_fingerprint, str) or callable(retrieval_fingerprint)
         ):
@@ -325,6 +350,63 @@ class VisualQAPipeline:
         self._session_locks_guard = threading.Lock()
         self._cache_locks: dict[str, threading.RLock] = {}
         self._cache_locks_guard = threading.Lock()
+
+    @staticmethod
+    def _format_timestamp(timestamp_ms: int) -> str:
+        minutes, remainder = divmod(max(0, int(timestamp_ms)), 60_000)
+        seconds, milliseconds = divmod(remainder, 1_000)
+        return f"{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
+
+    def _asr_context(
+        self, batch_id: str, video_id: str, timestamp_ms: int
+    ) -> tuple[str, ...]:
+        """Return bounded chronological ASR evidence around a candidate frame."""
+
+        if self.retriever is None or self.asr_context_radius_ms <= 0:
+            return ()
+        repository = getattr(self.retriever, "frame_repository", None)
+        query = getattr(repository, "text_segments_in_range", None)
+        if not callable(query):
+            return ()
+        start_ms = max(0, int(timestamp_ms) - self.asr_context_radius_ms)
+        end_ms = int(timestamp_ms) + self.asr_context_radius_ms
+        try:
+            segments = query(
+                batch_id,
+                video_id,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                kind="asr",
+                index_ready_only=True,
+                limit=200,
+            )
+        except (LookupError, OSError, RuntimeError, ValueError):
+            return ()
+        lines: list[str] = []
+        used = 0
+        for segment in segments:
+            text = " ".join(str(getattr(segment, "text_nfc", "")).split())
+            if not text:
+                continue
+            line = (
+                f"[{self._format_timestamp(int(segment.start_ms))}-"
+                f"{self._format_timestamp(int(segment.end_ms))}] {text}"
+            )
+            remaining = self.asr_context_max_characters - used
+            if remaining <= 0:
+                break
+            if len(line) > remaining:
+                line = line[:remaining].rstrip()
+            if line:
+                lines.append(line)
+                used += len(line)
+        return tuple(lines)
+
+    def _with_asr_context(
+        self, request: QAQueryRequest, batch_id: str, video_id: str, timestamp_ms: int
+    ) -> QAQueryRequest:
+        context = self._asr_context(batch_id, video_id, timestamp_ms)
+        return replace(request, transcript_context=context)
 
     def _session_lock(self, session_id: str) -> threading.RLock:
         with self._session_locks_guard:
@@ -678,11 +760,21 @@ class VisualQAPipeline:
         ).hexdigest()
 
     @staticmethod
-    def _semantic_request_fingerprint(event: str, question: str) -> str:
+    def _semantic_request_fingerprint(
+        event: str,
+        question: str,
+        *,
+        transcript_context: Sequence[str] = (),
+    ) -> str:
         payload = {
-            "version": "qa-reason-request-v2",
+            "version": "qa-reason-request-v3",
             "event_description": unicodedata.normalize("NFC", event.strip()),
             "question": unicodedata.normalize("NFC", question.strip()),
+            "transcript_context": [
+                unicodedata.normalize("NFC", str(value).strip())
+                for value in transcript_context
+                if str(value).strip()
+            ],
         }
         return hashlib.sha256(
             json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
@@ -849,7 +941,10 @@ class VisualQAPipeline:
         images = tuple(_qa_image(image, index) for index, image in enumerate(resolved, 1))
         active_spec = self.competition_specs[request.answer_spec_id]
         inference_started = time.perf_counter()
-        response = reasoner.reason(request, images, active_spec)
+        provider_request = self._with_asr_context(
+            request, cluster.batch_id, cluster.video_id, cluster.timestamp_ms
+        )
+        response = reasoner.reason(provider_request, images, active_spec)
         ollama_inference_ms = (time.perf_counter() - inference_started) * 1_000
         reasoning = self._reasoning_result(response, active_spec)
         status = "answered" if reasoning["answerable"] else "unanswerable"
@@ -893,6 +988,7 @@ class VisualQAPipeline:
         batch_filters: Sequence[str] = (),
         query_language: str = "auto",
         event_description_en: str | None = None,
+        entity_constraints: Sequence[Any] = (),
     ) -> tuple[QACandidateFrame, ...]:
         """Run pure KIS retrieval and return canonical frames without media/VLM work."""
 
@@ -908,6 +1004,7 @@ class VisualQAPipeline:
                 top_k=top_k,
                 query_language=query_language,
                 event_description_en=event_description_en,
+                entity_constraints=entity_constraints,
             )
         )
 
@@ -920,9 +1017,10 @@ class VisualQAPipeline:
         retrieval_fingerprint: str,
         query_language: str,
         event_description_en: str | None,
+        entity_constraints: Sequence[Any] = (),
     ) -> str:
         payload = {
-            "version": "qa-single-frame-candidates-v3",
+            "version": "qa-single-frame-candidates-v4",
             "event_description": unicodedata.normalize("NFC", event_description.strip()),
             "batch_filters": sorted(set(batch_filters)),
             "top_k": top_k,
@@ -930,6 +1028,10 @@ class VisualQAPipeline:
             "retriever_type": f"{type(retriever).__module__}.{type(retriever).__qualname__}",
             "query_language": query_language,
             "event_description_en": event_description_en,
+            "entity_constraints": [
+                asdict(value) if is_dataclass(value) else dict(value)
+                for value in entity_constraints
+            ],
         }
         return hashlib.sha256(
             json.dumps(
@@ -985,6 +1087,7 @@ class VisualQAPipeline:
             retrieval_fingerprint,
             request.query_language,
             request.event_description_en,
+            request.entity_constraints,
         )
         cached = self.session_store.get_candidate_entry(cache_key)
         candidate_values = cached[0] if cached is not None else None
@@ -1002,6 +1105,7 @@ class VisualQAPipeline:
                 batch_filters=filters,
                 query_language=request.query_language,
                 event_description_en=request.event_description_en,
+                entity_constraints=request.entity_constraints,
             )
             textual = getattr(self.retriever, "textual_pipeline", None)
             raw_statuses = getattr(textual, "last_channel_statuses", {})
@@ -1050,6 +1154,93 @@ class VisualQAPipeline:
         )
         return candidates
 
+    def start_injected_session(
+        self,
+        request: QAFrameInjectionRequest,
+        *,
+        session_id: str | None = None,
+    ) -> QACandidateFrame:
+        """Validate one canonical image and freeze it in a new v3 QA session."""
+
+        if not isinstance(request, QAFrameInjectionRequest):
+            raise TypeError("request must be a QAFrameInjectionRequest")
+        if self.retriever is None or self.session_store is None:
+            raise RuntimeError("Visual Q&A retrieval/session dependencies are unavailable")
+        if self.image_resolver is None:
+            raise RuntimeError("Visual Q&A image resolver is unavailable")
+        repository = getattr(self.retriever, "frame_repository", None)
+        get_frame = getattr(repository, "get_frame", None)
+        if not callable(get_frame):
+            raise RuntimeError("canonical frame repository is unavailable")
+
+        frame = get_frame(request.batch_id, request.video_id, request.source_frame_idx)
+        if frame is None:
+            raise QAInjectedFrameNotFoundError("qa_injected_frame_not_found")
+        candidate_id = f"{frame.batch_id}:{frame.video_id}:{frame.source_frame_idx}"
+        media_started = time.perf_counter()
+        try:
+            resolved = self.image_resolver.resolve(frame)
+        except CanonicalImageError:
+            raise QACandidateMediaUnavailableError(candidate_id) from None
+        if (
+            resolved.batch_id != frame.batch_id
+            or resolved.video_id != frame.video_id
+            or resolved.source_frame_idx != frame.source_frame_idx
+            or resolved.timestamp_ms != frame.timestamp_ms
+        ):
+            raise QACandidateMediaUnavailableError(candidate_id)
+
+        candidate = QACandidateFrame(
+            candidate_id=candidate_id,
+            retrieval_rank=1,
+            retrieval_score=0.0,
+            batch_id=frame.batch_id,
+            video_id=frame.video_id,
+            source_frame_idx=frame.source_frame_idx,
+            timestamp_ms=frame.timestamp_ms,
+            shot_id=str(frame.shot_id or f"reference:{frame.source_frame_idx}"),
+            channel_ranks={},
+            evidence={"origin": request.source},
+        )
+        search_id = str(session_id or uuid.uuid4().hex)
+        session = self.session_store.create_session(
+            search_id,
+            request.to_dict(),
+            state={
+                "state_version": 3,
+                "status": "candidates_ready",
+                "answers": {},
+                "failures": {},
+                "predictions": [],
+                "channel_statuses": {},
+                "retrieval_errors": {},
+                "query_processing": {},
+            },
+        )
+        frozen = self.session_store.bind_session_candidates(
+            search_id, (candidate.to_dict(),)
+        )
+        if len(frozen) != 1:
+            raise QASessionStoreError("injected QA session did not freeze one candidate")
+        state = dict(session.state)
+        state.update(
+            {
+                "state_version": 3,
+                "status": "candidates_ready",
+                "candidate_retrieval_ms": 0.0,
+                "candidate_cache_status": "injected",
+                "candidate_media_validation_ms": round(
+                    (time.perf_counter() - media_started) * 1_000, 3
+                ),
+                "selected_candidate_id": candidate.candidate_id,
+                "candidate_origin": request.source,
+            }
+        )
+        self.session_store.update_state(
+            search_id, state, expected_revision=session.revision
+        )
+        return QACandidateFrame.from_dict(frozen[0])
+
     def answer_vqa_single_frame(
         self,
         selected_frame: FrameRecord,
@@ -1088,6 +1279,12 @@ class VisualQAPipeline:
             limit=1,
             reasoning_policy=reasoning_policy,
             allow_external_frame_transfer=allow_external_frame_transfer,
+        )
+        provider_request = self._with_asr_context(
+            provider_request,
+            selected_frame.batch_id,
+            selected_frame.video_id,
+            selected_frame.timestamp_ms,
         )
         frame_started = time.perf_counter()
         resolved = (
@@ -1159,15 +1356,28 @@ class VisualQAPipeline:
             None,
         )
         if candidate is None:
-            raise ValueError("candidate_id is not part of this QA session")
+            raise QACandidateOutsideSessionError(
+                "candidate_id is not part of this QA session"
+            )
         repository = getattr(self.retriever, "frame_repository", None)
         frame = repository.get_frame(
             candidate.batch_id, candidate.video_id, candidate.source_frame_idx
         ) if repository is not None else None
         if frame is None or frame.timestamp_ms != candidate.timestamp_ms:
-            raise ValueError("candidate frame is no longer canonical")
+            raise QACandidateNotCanonicalError(
+                "candidate frame is no longer canonical"
+            )
         stored_request = snapshot.get("request", {})
         event_description = str(stored_request.get("event_description") or "")
+        if request.answer_engine == "manual":
+            return self._answer_candidate_manually(
+                search_id,
+                snapshot=snapshot,
+                candidates=candidates,
+                candidate=candidate,
+                frame=frame,
+                request=request,
+            )
         active_reasoner = (
             self.florence_reasoner
             if request.answer_engine == "florence2"
@@ -1193,25 +1403,6 @@ class VisualQAPipeline:
             error = QACandidateMediaUnavailableError(candidate.candidate_id)
             self._persist_candidate_failure(search_id, candidate.candidate_id, error)
             raise error
-        request_payload = {
-            "version": "qa-single-frame-answer-v3",
-            "event_description": unicodedata.normalize("NFC", event_description.strip()),
-            "question": unicodedata.normalize("NFC", request.question.strip()),
-            "answer_spec_id": request.answer_spec_id,
-            "reasoning_policy": request.reasoning_policy,
-            "answer_engine": request.answer_engine,
-            "florence_task": request.florence_task,
-            "florence_target_label": request.florence_target_label,
-        }
-        request_fingerprint = hashlib.sha256(
-            json.dumps(request_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
-        ).hexdigest()
-        frame_fingerprint = {
-            "batch_id": frame.batch_id,
-            "video_id": frame.video_id,
-            "source_frame_idx": frame.source_frame_idx,
-            "sha256": resolved.content_sha256,
-        }
         provider_request = QAQueryRequest(
             query_id=search_id,
             event_description=event_description,
@@ -1223,6 +1414,29 @@ class VisualQAPipeline:
             reasoning_policy=request.reasoning_policy,
             allow_external_frame_transfer=request.allow_external_frame_transfer,
         )
+        provider_request = self._with_asr_context(
+            provider_request, frame.batch_id, frame.video_id, frame.timestamp_ms
+        )
+        request_payload = {
+            "version": "qa-single-frame-answer-v3",
+            "event_description": unicodedata.normalize("NFC", event_description.strip()),
+            "question": unicodedata.normalize("NFC", request.question.strip()),
+            "answer_spec_id": request.answer_spec_id,
+            "reasoning_policy": request.reasoning_policy,
+            "answer_engine": request.answer_engine,
+            "florence_task": request.florence_task,
+            "florence_target_label": request.florence_target_label,
+            "transcript_context": list(provider_request.transcript_context),
+        }
+        request_fingerprint = hashlib.sha256(
+            json.dumps(request_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        frame_fingerprint = {
+            "batch_id": frame.batch_id,
+            "video_id": frame.video_id,
+            "source_frame_idx": frame.source_frame_idx,
+            "sha256": resolved.content_sha256,
+        }
         identities = tuple(
             (
                 provider_name,
@@ -1349,6 +1563,155 @@ class VisualQAPipeline:
                 search_id, candidate.candidate_id, error
             )
             raise
+
+    def _answer_candidate_manually(
+        self,
+        search_id: str,
+        *,
+        snapshot: Mapping[str, Any],
+        candidates: Sequence[QACandidateFrame],
+        candidate: QACandidateFrame,
+        frame: FrameRecord,
+        request: QASingleFrameAnswerRequest,
+    ) -> dict[str, Any]:
+        """Persist one canonical operator answer without resolving media or calling a VLM."""
+
+        if self.session_store is None:
+            raise RuntimeError("Visual Q&A session dependencies are unavailable")
+        if request.answer_engine != "manual" or request.manual_answer is None:
+            raise QAManualAnswerValidationError("manual answer is required")
+        try:
+            spec = self.competition_specs[request.answer_spec_id]
+            normalized = spec.normalize_answer(request.manual_answer, request.question)
+        except (KeyError, TypeError, ValueError) as error:
+            raise QAManualAnswerValidationError("manual answer is invalid") from error
+        if len(normalized) > 100:
+            raise QAManualAnswerValidationError(
+                "manual answer must contain at most 100 Unicode code points"
+            )
+
+        state = dict(snapshot.get("state", {}))
+        answers = dict(state.get("answers", {}))
+        failures = dict(state.get("failures", {}))
+        existing = answers.get(candidate.candidate_id)
+        existing_prediction = (
+            existing.get("prediction") if isinstance(existing, Mapping) else None
+        )
+        if (
+            isinstance(existing_prediction, Mapping)
+            and existing_prediction.get("answer") == normalized
+            and existing_prediction.get("answer_source") == "operator"
+            and state.get("selected_candidate_id") == candidate.candidate_id
+        ):
+            return dict(existing)
+
+        previous_answers = []
+        if isinstance(existing_prediction, Mapping):
+            previous = existing_prediction.get("answer")
+            if isinstance(previous, str) and previous:
+                previous_answers.append(previous)
+        raw_answer = request.manual_answer
+        reasoning = {
+            "answer": normalized,
+            "raw_answer": raw_answer,
+            "answerable": True,
+            "evidence_frame_indices": [1],
+            "provider": "operator",
+            "model_name": None,
+            "requested_policy": "local_only",
+            "fallback_used": False,
+            "fallback_reason_code": None,
+            "latency_ms": 0.0,
+            "cache_status": "bypass",
+        }
+        prediction = QAPrediction(
+            rank=1,
+            batch_id=frame.batch_id,
+            video_id=frame.video_id,
+            source_frame_idx=frame.source_frame_idx,
+            timestamp_ms=frame.timestamp_ms,
+            answer=normalized,
+            raw_answer=raw_answer,
+            model_name=None,
+            confidence_score=max(0.0, min(1.0, 1.0 / max(1, candidate.retrieval_rank))),
+            answer_source="operator",
+            window_id=candidate.candidate_id,
+            evidence={
+                "candidate_id": candidate.candidate_id,
+                "retrieval_rank": candidate.retrieval_rank,
+                "retrieval_score": candidate.retrieval_score,
+                "evidence_frame_indices": [1],
+                "evidence_source_frame_indices": [frame.source_frame_idx],
+                "provider": "operator",
+                "requested_policy": "local_only",
+                "fallback_used": False,
+                "latency_ms": 0.0,
+                "answer_call_ms": 0.0,
+                "cache_status": "bypass",
+            },
+        ).to_dict()
+        answers[candidate.candidate_id] = {
+            "candidate_id": candidate.candidate_id,
+            "status": "answered",
+            "reasoning": reasoning,
+            "prediction": prediction,
+            "stage_timings": {
+                "frame_prepare_ms": 0.0,
+                "vlm_inference_ms": 0.0,
+                "answer_call_ms": 0.0,
+            },
+        }
+        predictions = [
+            value.get("prediction")
+            for _, value in sorted(
+                answers.items(),
+                key=lambda item: next(
+                    frozen.retrieval_rank
+                    for frozen in candidates
+                    if frozen.candidate_id == item[0]
+                ),
+            )
+            if isinstance(value, Mapping) and value.get("prediction") is not None
+        ]
+        for rank, value in enumerate(predictions, 1):
+            value["rank"] = rank
+        failures.pop(candidate.candidate_id, None)
+        state.update(
+            {
+                "state_version": 3,
+                "status": "answered",
+                "selected_candidate_id": candidate.candidate_id,
+                "answers": answers,
+                "failures": failures,
+                "predictions": predictions,
+            }
+        )
+        now = time.time()
+        audit = {
+            "previous_normalized_answers": previous_answers,
+            "original_raw_answer": (
+                existing_prediction.get("raw_answer")
+                if isinstance(existing_prediction, Mapping)
+                else None
+            ),
+            "provider": "operator",
+            "model_name": None,
+            "edited_raw_answer": raw_answer,
+            "normalized_answer": normalized,
+            "edited_at": now,
+            "manual_answer": True,
+        }
+        revision = snapshot.get("revision")
+        if isinstance(revision, bool) or not isinstance(revision, int):
+            raise QASessionStoreError("QA session revision is unavailable")
+        self.session_store.commit_manual_answer(
+            search_id,
+            state,
+            candidate_id=candidate.candidate_id,
+            edit=audit,
+            expected_revision=revision,
+        )
+        return dict(answers[candidate.candidate_id])
 
     def answer(
         self,
@@ -1595,10 +1958,7 @@ class VisualQAPipeline:
             for cluster in active_clusters
         ]
         sessions.expand_targets(str(session_value), targets)
-        request_fingerprint = self._semantic_request_fingerprint(event.strip(), question.strip())
-        provider_identities = self._provider_cache_identities(reasoner, provider_request)
         chain_fingerprint = self._provider_fingerprint(reasoner)
-        reasoning_lease_ttl = self._reasoning_lease_ttl(reasoner, provider_request)
         state["requested_target_clusters"] = requested_target
         state["retrieved_clusters"] = len(clusters)
         state["retrieval_exhausted"] = len(clusters) < requested_target
@@ -1628,6 +1988,23 @@ class VisualQAPipeline:
             cluster: QACandidateCluster,
         ) -> tuple[str, dict[str, Any], dict[str, Any] | None, str | None]:
             target_key = f"{cluster.batch_id}:{cluster.video_id}:{cluster.source_frame_idx}"
+            cluster_request = self._with_asr_context(
+                provider_request,
+                cluster.batch_id,
+                cluster.video_id,
+                cluster.timestamp_ms,
+            )
+            request_fingerprint = self._semantic_request_fingerprint(
+                event.strip(),
+                question.strip(),
+                transcript_context=cluster_request.transcript_context,
+            )
+            provider_identities = self._provider_cache_identities(
+                reasoner, cluster_request
+            )
+            reasoning_lease_ttl = self._reasoning_lease_ttl(
+                reasoner, cluster_request
+            )
             served_started = time.perf_counter()
             frame_prepare_ms = 0.0
             stage = "media"
@@ -1843,7 +2220,7 @@ class VisualQAPipeline:
                                     else:
                                         stage = "provider"
                                         response = reasoner.reason(
-                                            provider_request, images, active_spec
+                                            cluster_request, images, active_spec
                                         )
                                         stage = "response"
                                         reasoning = self._reasoning_result(
@@ -2094,7 +2471,10 @@ QACandidateWindow = QACandidateCluster
 
 __all__ = [
     "QACandidateMediaUnavailableError",
+    "QACandidateNotCanonicalError",
+    "QACandidateOutsideSessionError",
     "QACandidateWindow",
+    "QAManualAnswerValidationError",
     "QAReasoner",
     "QAWindowFrameRef",
     "QAWindowOutcome",

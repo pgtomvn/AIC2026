@@ -36,15 +36,24 @@ from app.components.query_input import (  # noqa: E402
 )
 from app.components.result_gallery import (  # noqa: E402
     ResultIdentity,
+    pin_widget_key,
     render_result_gallery,
     result_identity,
 )
 from app.http_backend import BackendError, build_http_runtime  # noqa: E402
 from src import PROJECT_ROOT  # noqa: E402
+from src.codabench_query_id import (  # noqa: E402
+    codabench_query_filename,
+    codabench_query_id_collision_key,
+    codabench_query_id_sort_key,
+    normalize_codabench_query_id,
+    parse_codabench_query_filename,
+)
 from src.contracts import (  # noqa: E402
     CompetitionSpec,
     QACandidateRequest,
     QACompetitionSpec,
+    QAFrameInjectionRequest,
     QAQueryRequest,
     QASingleFrameAnswerRequest,
     QueryRequest,
@@ -52,8 +61,16 @@ from src.contracts import (  # noqa: E402
     TRAKEStage,
 )
 from src.qa_submission import serialize_qa_submission  # noqa: E402
+from src.query.entity_extractor import (  # noqa: E402
+    EntityConstraint,
+    EntityExtractor,
+)
 from src.runtime import RuntimeContext  # noqa: E402
-from src.submission import FrameIndexEvidence  # noqa: E402
+from src.runtime_contract import source_contract_fingerprint  # noqa: E402
+from src.submission import (  # noqa: E402
+    FrameIndexEvidence,
+    format_qa_submission_row,
+)
 from src.trake_submission import (  # noqa: E402
     TRAKEFrameIndexEvidence,
     TRAKESubmissionValidationError,
@@ -74,6 +91,27 @@ _QA_FAILURE_CODES = frozenset(
         "provider_request_failed",
         "provider_response_invalid",
         "internal_reasoning_error",
+    }
+)
+
+_ENTITY_EXTRACTOR = EntityExtractor()
+_EXPECTED_RUNTIME_CONTRACT_VERSION = 6
+_EXPECTED_RUNTIME_CONTRACT_FEATURES = frozenset(
+    {
+        "entity_constraints.kis",
+        "entity_constraints.qa",
+        "entity_constraints.trake",
+        "qa.frame_injection",
+        "qa.top_k_50",
+        "kis.adaptive_rrf",
+        "kis.spatial_color_rerank",
+        "kis.temporal_adjacency",
+        "kis.relative_relation_graph",
+        "kis.soft_negation",
+        "kis.strict_color_binding",
+        "kis.experimental_cross_modal_calibration",
+        "dataset.multimodal_coverage",
+        "kis.full_spatial_ontology",
     }
 )
 _QA_PROVIDER_ERROR_CATEGORIES = frozenset(
@@ -157,6 +195,86 @@ def _render_query_processing(value: Any) -> None:
     if not isinstance(value, dict) or not value:
         return
     language = str(value.get("detected_language") or "unknown")
+    intent = str(value.get("intent") or "visual_dense")
+    effective_k = value.get("effective_rrf_k")
+    weights = value.get("effective_channel_weights")
+    if intent in {"visual_dense", "lexical_dominant", "spatial_color"}:
+        detail = f"Intent: {intent}"
+        if isinstance(effective_k, int) and not isinstance(effective_k, bool):
+            detail += f" · RRF k={effective_k}"
+        if isinstance(weights, dict) and weights:
+            detail += " · " + ", ".join(
+                f"{name}={float(weight):.2f}"
+                for name, weight in sorted(weights.items())
+                if isinstance(weight, (int, float)) and not isinstance(weight, bool)
+            )
+        st.caption("⌁ " + detail)
+    constraints = [
+        *(
+            value.get("spatial_constraints")
+            if isinstance(value.get("spatial_constraints"), list)
+            else []
+        ),
+        *(
+            value.get("color_constraints")
+            if isinstance(value.get("color_constraints"), list)
+            else []
+        ),
+    ]
+    if constraints:
+        labels = []
+        for constraint in constraints[:16]:
+            if not isinstance(constraint, dict):
+                continue
+            subject = str(constraint.get("subject") or "?")
+            target = constraint.get("zone", constraint.get("color", "?"))
+            state = "BOUND" if constraint.get("bound") else "DIAGNOSTIC"
+            labels.append(f"[{subject} → {target} · {state}]")
+        if labels:
+            st.caption("▦ Spatial/Color: " + " ".join(labels))
+    relation_labels = []
+    for constraint in value.get("relative_constraints", ()):
+        if not isinstance(constraint, dict):
+            continue
+        third = (
+            f" & {constraint.get('second_object', '?')}"
+            if constraint.get("arity") == 3
+            else ""
+        )
+        kind = (
+            " · HEURISTIC 2D"
+            if constraint.get("verification_type") == "heuristic_2d"
+            else ""
+        )
+        relation_labels.append(
+            f"[{constraint.get('subject', '?')} {constraint.get('relation', '?')} "
+            f"{constraint.get('object', '?')}{third}{kind}]"
+        )
+    for constraint in value.get("negation_constraints", ()):
+        if not isinstance(constraint, dict):
+            continue
+        color = f" {constraint['color']}" if constraint.get("color") else ""
+        relation_labels.append(f"[KHÔNG:{color} {constraint.get('subject', '?')}]")
+    if relation_labels:
+        st.caption("⌖ Relation/Negation: " + " ".join(relation_labels[:16]))
+    ambiguous = value.get("ambiguous_relations")
+    if isinstance(ambiguous, list) and ambiguous:
+        st.caption(
+            "⌁ Quan hệ BETWEEN cần nêu rõ vật ở giữa và đủ hai vật mốc; "
+            "cụm mơ hồ hiện chỉ dùng cho truy vấn dense/lexical."
+        )
+    unsupported = value.get("unsupported_relations")
+    if isinstance(unsupported, list) and unsupported:
+        names = ", ".join(
+            str(item.get("relation"))
+            for item in unsupported
+            if isinstance(item, dict) and item.get("relation")
+        )
+        if names:
+            st.warning(
+                "Quan hệ chưa hỗ trợ chỉ được ghi diagnostics, không tác động ranking: " + names
+            )
+
     english = value.get("english_text")
     if value.get("translation_applied") and isinstance(english, str) and english:
         source = str(value.get("translation_source") or "offline")
@@ -172,6 +290,64 @@ def _render_query_processing(value: Any) -> None:
             "Bộ dịch Việt–Anh chưa sẵn sàng; các kênh OpenCLIP tiếng Anh được bỏ qua "
             "an toàn, còn kênh tiếng Việt vẫn tiếp tục hoạt động."
         )
+    entities = value.get("entities")
+    if isinstance(entities, list) and entities:
+        labels = []
+        for entity in entities[:16]:
+            if not isinstance(entity, dict) or not isinstance(entity.get("text"), str):
+                continue
+            mode = "BẮT BUỘC" if entity.get("mode") == "required" else "TÙY CHỌN"
+            matched = " · MATCH" if entity.get("boost_applied") else ""
+            labels.append(f"[{entity['text']} · {mode}{matched}]")
+        if labels:
+            st.caption("🏷️ Phân tích thực thể: " + " ".join(labels))
+    required_status = value.get("required_entity_status")
+    if required_status == "required_entity_evidence_unavailable":
+        st.warning("Không có kênh OCR/ASR/metadata khả dụng để xác minh thực thể bắt buộc.")
+    elif required_status == "required_entity_no_match":
+        st.info("Không có video thỏa đồng thời tất cả thực thể bắt buộc.")
+
+
+def _render_entity_controls(
+    text: str,
+    *,
+    state_key: str,
+    scope: str,
+    on_change: Any = None,
+) -> tuple[EntityConstraint, ...]:
+    """Render stable Optional/Required controls for deterministic entities."""
+
+    entities = _ENTITY_EXTRACTOR.extract(text) if isinstance(text, str) else ()
+    raw_modes = st.session_state.get(state_key, {})
+    modes = dict(raw_modes) if isinstance(raw_modes, dict) else {}
+    prefix = f"{scope}:"
+    active_keys = {f"{prefix}{entity.identity}" for entity in entities}
+    modes = {
+        key: value
+        for key, value in modes.items()
+        if not key.startswith(prefix) or key in active_keys
+    }
+    constraints: list[EntityConstraint] = []
+    if entities:
+        st.caption("🏷️ Phân tích thực thể · nhấn badge để đổi Tùy chọn/Bắt buộc")
+        columns = st.columns(min(4, len(entities)))
+        for index, entity in enumerate(entities):
+            identity_key = f"{prefix}{entity.identity}"
+            mode = "required" if modes.get(identity_key) == "required" else "optional"
+            constraints.append(EntityConstraint(entity.text, mode))
+            digest = hashlib.sha256(identity_key.encode("utf-8")).hexdigest()[:12]
+            label = (
+                f"🏷️ {entity.text} · {'BẮT BUỘC' if mode == 'required' else 'TÙY CHỌN'}"
+            )
+            with columns[index % len(columns)]:
+                if st.button(label, key=f"entity_mode_{digest}", width="stretch"):
+                    modes[identity_key] = "optional" if mode == "required" else "required"
+                    st.session_state[state_key] = modes
+                    if callable(on_change):
+                        on_change()
+                    st.rerun()
+    st.session_state[state_key] = modes
+    return tuple(constraints)
 
 
 def _active_workflow() -> str:
@@ -295,9 +471,15 @@ def _initialize_state() -> None:
         "kis_last_request": None,
         "kis_pin_widget_keys": [],
         "kis_export_cache": None,
+        "kis_working_fingerprint": None,
+        "kis_scrub_anchor": None,
+        "kis_scrub_frames": [],
+        "kis_scrub_offset": 0,
+        "kis_last_failure": None,
         "kis_query_language": "auto",
         "kis_translation_edit": False,
         "kis_english_override": "",
+        "kis_entity_modes": {},
         "qa_predictions": [],
         "qa_pinned": [],
         "qa_edits": [],
@@ -326,7 +508,20 @@ def _initialize_state() -> None:
         "qa_query_language": "auto",
         "qa_translation_edit": False,
         "qa_event_description_en": "",
+        "qa_entity_modes": {},
+        "qa_answer_drafts": {},
+        "qa_final_answer_candidate_id": None,
+        "qa_pending_answer_update": None,
+        "vqa_final_answer_input": "",
+        "vqa_injected_frame": None,
+        "vqa_selected_candidate": None,
+        "vqa_manual_video_id": "",
+        "vqa_manual_frame_idx": 0,
+        "qa_top_k": 5,
+        "qa_candidate_page": 1,
+        "qa_injection_notice": None,
         "trake_results": [],
+        "trake_pinned": [],
         "trake_response": None,
         "trake_query_id": None,
         "trake_stage_count": 2,
@@ -338,7 +533,14 @@ def _initialize_state() -> None:
         "trake_query_language": "auto",
         "trake_translation_edit": False,
         "trake_global_description_en": "",
+        "trake_entity_modes": {},
+        "trake_frame_overrides": {},
+        "trake_adjust_stage": 1,
         "codabench_staging": {},
+        "codabench_staging_revision": 0,
+        "codabench_staging_updated_at": None,
+        "codabench_staging_hydrated": False,
+        "codabench_staging_error": None,
         "codabench_entry_errors": {},
         "codabench_bundle_cache": None,
         "codabench_bundle_mode": "all",
@@ -348,6 +550,123 @@ def _initialize_state() -> None:
     }
     for name, value in defaults.items():
         st.session_state.setdefault(name, value)
+
+
+def _request_contract_fields(value: type[Any]) -> frozenset[str]:
+    dataclass_fields = getattr(value, "__dataclass_fields__", None)
+    if isinstance(dataclass_fields, dict):
+        return frozenset(str(name) for name in dataclass_fields)
+    model_fields = getattr(value, "model_fields", None)
+    if isinstance(model_fields, dict):
+        return frozenset(str(name) for name in model_fields)
+    return frozenset()
+
+
+def _runtime_contract_issues(context: RuntimeContext) -> tuple[str, ...]:
+    """Return stable reasons why this process must be restarted."""
+
+    issues: list[str] = []
+    required_fields = (
+        (QueryRequest, "entity_constraints"),
+        (QAQueryRequest, "entity_constraints"),
+        (QACandidateRequest, "entity_constraints"),
+        (QAFrameInjectionRequest, "source_frame_idx"),
+        (TRAKEQueryRequest, "global_entity_constraints"),
+        (TRAKEStage, "entity_constraints"),
+    )
+    for request_type, field_name in required_fields:
+        if field_name not in _request_contract_fields(request_type):
+            issues.append(f"request_field_missing:{request_type.__name__}.{field_name}")
+
+    if not bool(getattr(context, "is_remote", False)):
+        return tuple(issues)
+
+    capabilities = getattr(context, "capabilities", None)
+    runtime_contract = (
+        capabilities.get("runtime_contract") if isinstance(capabilities, dict) else None
+    )
+    if not isinstance(runtime_contract, dict):
+        issues.append("api_contract_missing")
+        return tuple(issues)
+    if runtime_contract.get("version") != _EXPECTED_RUNTIME_CONTRACT_VERSION:
+        issues.append("api_contract_version_mismatch")
+    features = runtime_contract.get("features")
+    feature_set = {
+        str(value) for value in features
+    } if isinstance(features, list) else set()
+    if not _EXPECTED_RUNTIME_CONTRACT_FEATURES.issubset(feature_set):
+        issues.append("api_contract_feature_missing")
+
+    launch_hash = os.environ.get("AIC_SOURCE_CONTRACT_SHA256", "").casefold()
+    api_hash = str(runtime_contract.get("source_contract_sha256") or "").casefold()
+    if launch_hash:
+        current_hash = source_contract_fingerprint().casefold()
+        if current_hash != launch_hash:
+            issues.append("source_contract_drift")
+        if api_hash != launch_hash:
+            issues.append("api_source_contract_mismatch")
+    elif os.environ.get("AIC_LAUNCH_CONTRACT") == "run_app-v2":
+        issues.append("launch_source_contract_missing")
+    return tuple(dict.fromkeys(issues))
+
+
+def _render_runtime_contract_block(context: RuntimeContext) -> bool:
+    """Block mixed-version processes without logging a false application crash."""
+
+    issues = _runtime_contract_issues(context)
+    if not issues:
+        return False
+    st.markdown(
+        render_hud_header(
+            "[ SYSTEM LOCK ] // RUNTIME CONTRACT",
+            "Runtime cần được khởi động lại",
+            "UI, API hoặc request schema đang thuộc các phiên bản khác nhau.",
+        ),
+        unsafe_allow_html=True,
+    )
+    st.error(
+        "Mã `runtime_contract_mismatch`: yêu cầu chưa được gửi và dữ liệu phiên/staging "
+        "không bị xóa. Hãy dừng stack AIC hiện tại rồi chạy lại launcher chuẩn."
+    )
+    profile = str(getattr(context, "config", {}).get("profile", "laptop"))
+    batch_id = str(getattr(context, "selected_batch_id", "aic25-b1-reference"))
+    st.code(
+        f".\\scripts\\run_app.ps1 -Profile {profile} -BatchId {batch_id} "
+        "-ApiPort 8080 -Port 8504",
+        language="powershell",
+    )
+    st.caption("Chẩn đoán: " + ", ".join(f"`{value}`" for value in issues))
+    return True
+
+
+_RECOVERY_PREFIXES = ("kis_", "qa_", "trake_", "query_", "vqa_")
+
+
+def _reset_operator_session() -> None:
+    """Clear volatile workflow state while preserving audited submission artifacts."""
+
+    for key in tuple(st.session_state):
+        if key.startswith(_RECOVERY_PREFIXES):
+            st.session_state.pop(key, None)
+    st.session_state.active_workflow = "kis"
+    st.session_state.qa_external_transfer_consent = False
+    st.session_state["_aic_recovery_notice"] = True
+
+
+def _render_recovery_control() -> None:
+    with st.sidebar:
+        st.button(
+            "🔄 Khôi phục hệ thống (Reset Session State)",
+            key="aic_reset_session_state",
+            on_click=_reset_operator_session,
+            width="stretch",
+            help=(
+                "Xóa state tìm kiếm tạm thời nhưng giữ Codabench staging và bundle. "
+                "Thao tác này không khởi động lại backend hoặc CUDA."
+            ),
+        )
+        if st.session_state.pop("_aic_recovery_notice", False):
+            st.success("Đã khôi phục state giao diện; dữ liệu nộp bài vẫn được giữ nguyên.")
 
 
 def _pinned_identity_set(items: list[dict[str, Any]]) -> set[ResultIdentity]:
@@ -391,6 +710,7 @@ def _change_kis_pin(
     keys.add(widget_key)
     st.session_state.kis_pin_widget_keys = sorted(keys)
     st.session_state.kis_export_cache = None
+    st.session_state.kis_working_fingerprint = _kis_working_source_fingerprint()
 
 
 def _clear_kis_pins() -> None:
@@ -401,6 +721,153 @@ def _clear_kis_pins() -> None:
     st.session_state.kis_pin_widget_keys = []
     st.session_state.kis_pinned = []
     st.session_state.kis_export_cache = None
+    st.session_state.kis_working_fingerprint = None
+
+
+def _open_kis_scrubber(item: dict[str, Any]) -> None:
+    """Select one authoritative KIS result for on-demand ordinal navigation."""
+
+    try:
+        identity = result_identity(item)
+    except (KeyError, TypeError, ValueError):
+        return
+    st.session_state.kis_scrub_anchor = {
+        "batch_id": identity[0],
+        "video_id": identity[1],
+        "source_frame_idx": identity[2],
+        "rank": int(item.get("rank", 0) or 0),
+    }
+    st.session_state.kis_scrub_frames = []
+    st.session_state.kis_scrub_offset = 0
+
+
+def _pin_temporal_neighbor(
+    anchor: dict[str, Any],
+    frame: Any,
+    offset: int,
+) -> None:
+    item = {
+        "batch_id": str(frame.batch_id),
+        "video_id": str(frame.video_id),
+        "source_frame_idx": int(frame.source_frame_idx),
+        "timestamp_ms": int(frame.timestamp_ms),
+        "shot_id": str(frame.shot_id or f"frame:{frame.source_frame_idx}"),
+        "provenance": {
+            "source": "temporal_neighbor",
+            "offset": int(offset),
+            "anchor_video_id": str(anchor["video_id"]),
+            "anchor_source_frame_idx": int(anchor["source_frame_idx"]),
+        },
+        "evidence": {
+            "items": [
+                {
+                    "channel": "temporal_neighbor",
+                    "identity_method": "canonical_ordinal",
+                }
+            ]
+        },
+    }
+    identity = result_identity(item)
+    widget_key = pin_widget_key(identity)
+    st.session_state[widget_key] = True
+    _change_kis_pin(identity, item, True, widget_key)
+
+
+def _render_kis_temporal_scrubber(context: RuntimeContext) -> None:
+    anchor = st.session_state.get("kis_scrub_anchor")
+    if not isinstance(anchor, dict):
+        return
+    identity = (
+        str(anchor.get("batch_id", "")),
+        str(anchor.get("video_id", "")),
+        int(anchor.get("source_frame_idx", -1)),
+    )
+    digest = hashlib.sha256(
+        "\0".join((identity[0], identity[1], str(identity[2]))).encode("utf-8")
+    ).hexdigest()[:16]
+    with st.container(key=f"kis-temporal-scrubber-{digest}", border=True):
+        st.markdown("### Temporal scrubber · ordinal canonical ±5")
+        st.caption(
+            f"Anchor {identity[1]} · source frame {identity[2]} · "
+            "không dùng phép cộng/trừ source frame."
+        )
+        values = st.session_state.get("kis_scrub_frames")
+        if not isinstance(values, list) or not values:
+            try:
+                with st.spinner("Đang tải metadata khung hình lân cận..."):
+                    pairs = context.artifact_repository.adjacent_frames(
+                        identity[0],
+                        identity[1],
+                        identity[2],
+                        radius=5,
+                    )
+                values = [
+                    {
+                        "offset": int(offset),
+                        "frame": frame,
+                    }
+                    for offset, frame in pairs
+                ]
+                st.session_state.kis_scrub_frames = values
+            except Exception:
+                st.warning("Không thể tải vùng lân cận canonical cho khung hình này.")
+                values = []
+        quick = st.columns(5)
+        for column, offset in zip(quick, (-2, -1, 0, 1, 2), strict=True):
+            with column:
+                if st.button(
+                    f"{offset:+d}",
+                    key=f"kis_scrub_quick_{digest}_{offset}",
+                    width="stretch",
+                ):
+                    st.session_state.kis_scrub_offset = offset
+                    st.rerun()
+        selected_offset = st.slider(
+            "Offset ordinal",
+            min_value=-5,
+            max_value=5,
+            step=1,
+            key="kis_scrub_offset",
+        )
+        selected = next(
+            (
+                value
+                for value in values
+                if isinstance(value, dict) and value.get("offset") == selected_offset
+            ),
+            None,
+        )
+        if selected is None:
+            st.info("Offset này là alias trùng hoặc nằm ngoài biên video; không có frame riêng.")
+        else:
+            frame = selected["frame"]
+            st.code(
+                f"{frame.video_id},{frame.source_frame_idx} · "
+                f"{frame.timestamp_ms / 1000:.3f}s · offset {selected_offset:+d}",
+                language=None,
+            )
+            image = _source_frame_image(
+                context,
+                frame.batch_id,
+                frame.video_id,
+                frame.source_frame_idx,
+            )
+            if image is not None:
+                st.image(image, width="stretch")
+                if st.button(
+                    "📌 Ghim khung lân cận này",
+                    key=f"kis_scrub_pin_{digest}_{selected_offset}",
+                    width="stretch",
+                ):
+                    _pin_temporal_neighbor(anchor, frame, selected_offset)
+                    st.success("Đã thêm khung lân cận vào danh sách KIS đang ghim.")
+            else:
+                st.warning("Ảnh canonical của khung lân cận hiện không khả dụng.")
+        if st.button("Đóng scrubber", key=f"kis_scrub_close_{digest}"):
+            st.session_state.kis_scrub_anchor = None
+            st.session_state.kis_scrub_frames = []
+            st.rerun()
+
 
 
 def _kis_export_snapshot(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -433,6 +900,28 @@ def _result_fingerprint(*, workflow: str, batch_id: str, rows: list[dict[str, An
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _kis_working_source_fingerprint() -> str | None:
+    pins = [
+        dict(value)
+        for value in st.session_state.get("kis_pinned", ())
+        if isinstance(value, dict)
+    ]
+    batch_ids = {
+        str(value.get("batch_id"))
+        for value in pins
+        if isinstance(value.get("batch_id"), str) and value.get("batch_id")
+    }
+    if not pins or len(batch_ids) != 1:
+        return None
+    batch_id = next(iter(batch_ids))
+    return _result_fingerprint(
+        workflow="kis",
+        batch_id=batch_id,
+        rows=_kis_export_snapshot(pins),
+    )
+
 
 
 def _submission_identities(rows: list[dict[str, Any]]) -> list[tuple[str, int]]:
@@ -676,6 +1165,42 @@ def _render_readiness(context: RuntimeContext) -> None:
     else:
         st.success(message)
 
+    multimodal = report.get("multimodal", {})
+    if isinstance(multimodal, dict) and multimodal:
+        status_label = str(multimodal.get("status_label") or "").strip()
+        full_multimodal = multimodal.get("full_multimodal", {})
+        if status_label and isinstance(full_multimodal, dict):
+            unavailable = tuple(
+                str(value)
+                for value in full_multimodal.get("unavailable_channels", ())
+                if str(value).strip()
+            )
+            detail = status_label
+            if unavailable:
+                detail += " · Kênh chưa sẵn sàng: " + ", ".join(unavailable)
+            if bool(full_multimodal.get("healthy", False)):
+                st.success(detail)
+            else:
+                st.warning(detail)
+        mm_status = str(multimodal.get("status", "unknown"))
+        siglip = multimodal.get("siglip2", {})
+        ocr = multimodal.get("ocr", {})
+        asr = multimodal.get("asr", {})
+        if all(isinstance(value, dict) for value in (siglip, ocr, asr)):
+            st.caption(
+                "MULTIMODAL // "
+                f"{mm_status.upper()} · SigLIP2 "
+                f"{int(siglip.get('canonical_frames', 0) or 0):,}/"
+                f"{int(siglip.get('expected_frames', 0) or 0):,} · OCR scanned "
+                f"{int(ocr.get('scanned_canonical_frames', 0) or 0):,}/"
+                f"{int(ocr.get('expected_frames', 0) or 0):,} · ASR source "
+                f"{int(asr.get('source_videos', 0) or 0):,}/"
+                f"{int(multimodal.get('expected_videos', 0) or 0):,} · processed "
+                f"{int(asr.get('completed_videos', 0) or 0):,} · zero-transcript "
+                f"{int(asr.get('zero_transcript_videos', asr.get('no_audio_videos', 0)) or 0):,} · missing "
+                f"{int(asr.get('missing_source_videos', 0) or 0):,}"
+            )
+
     rows = _readiness_rows(report)
     required_failures = [
         row
@@ -868,8 +1393,13 @@ def _render_warmup_sidebar(context: RuntimeContext) -> None:
     )
     previous_usability = st.session_state.get("_aic_warmup_workflow_usability")
     st.session_state["_aic_warmup_workflow_usability"] = usability
-    if previous_usability is not None and previous_usability != usability:
-        st.rerun(scope="app")
+    if previous_usability is not None:
+        became_usable = any(
+            not bool(previous[1]) and bool(current[1])
+            for previous, current in zip(previous_usability, usability, strict=False)
+        )
+        if became_usable:
+            st.rerun(scope="app")
     label = _WARMUP_VI.get(state, "Không xác định")
     with st.sidebar:
         st.markdown(
@@ -899,15 +1429,7 @@ def _render_warmup_sidebar(context: RuntimeContext) -> None:
 
 def _render_kis(context: RuntimeContext) -> None:
     st.subheader("Tìm kiếm sự kiện đã biết bằng văn bản")
-    settings_col, results_col, refinement_col = st.columns((1, 1, 1))
-    with settings_col:
-        mode = st.radio(
-            "Chế độ KIS",
-            ("interactive", "automatic"),
-            format_func=lambda value: "Tương tác" if value == "interactive" else "Tự động",
-            horizontal=True,
-            key="kis_mode",
-        )
+    results_col, refinement_col = st.columns((1, 1))
     with results_col:
         top_k = st.slider("Số kết quả KIS", 1, 100, 20, key="kis_top_k")
     with refinement_col:
@@ -915,6 +1437,11 @@ def _render_kis(context: RuntimeContext) -> None:
 
     runtime_ready = _warmup_search_usable(context)
     values = render_query_input(disabled=not runtime_ready)
+    kis_entity_constraints = _render_entity_controls(
+        str(values.get("text", "")),
+        state_key="kis_entity_modes",
+        scope="kis",
+    )
     language_col, override_col = st.columns((1, 2))
     with language_col:
         query_language = st.selectbox(
@@ -954,7 +1481,7 @@ def _render_kis(context: RuntimeContext) -> None:
                 request = QueryRequest(
                     query_id=str(uuid4()),
                     original_text=values["text"],
-                    mode=mode,
+                    mode=str(values.get("mode", "automatic")),
                     batch_filters=batch_filters,
                     limit=top_k,
                     before_clause=values["before_clause"],
@@ -967,6 +1494,7 @@ def _render_kis(context: RuntimeContext) -> None:
                     attributes=values["attributes"],
                     query_language=query_language,
                     english_text_override=english_override or None,
+                    entity_constraints=kis_entity_constraints,
                 )
                 with st.spinner("Đang tìm trên các kênh vector và từ khóa..."):
                     st.session_state.kis_results = context.pipeline.search(
@@ -974,8 +1502,20 @@ def _render_kis(context: RuntimeContext) -> None:
                     )
                     st.session_state.kis_last_request = request
                     st.session_state.kis_history.append(values["text"])
+                    st.session_state.kis_last_failure = None
+            except (TypeError, ValueError):
+                st.session_state.kis_last_failure = {
+                    "code": "kis_request_invalid",
+                    "recoverable": True,
+                }
+            except BackendError as error:
+                st.session_state.kis_last_failure = {
+                    "code": error.code,
+                    "correlation_id": error.detail.get("correlation_id"),
+                    "recoverable": error.recoverable,
+                }
             except Exception as error:
-                _report_ui_error(
+                event_id = _report_ui_error(
                     error,
                     workflow="kis",
                     stage="search",
@@ -985,6 +1525,25 @@ def _render_kis(context: RuntimeContext) -> None:
                     query_or_session_id=(request.query_id if request is not None else None),
                     started_at=search_started,
                 )
+                st.session_state.kis_last_failure = {
+                    "code": getattr(error, "code", "kis_search_failed"),
+                    "correlation_id": (
+                        getattr(error, "detail", {}).get("correlation_id")
+                        if isinstance(getattr(error, "detail", None), dict)
+                        else event_id
+                    ),
+                }
+
+    failure = st.session_state.get("kis_last_failure")
+    if isinstance(failure, dict):
+        correlation = str(failure.get("correlation_id") or "")
+        st.warning(
+            "Yêu cầu KIS chưa hoàn tất. Bạn có thể sửa truy vấn và thử lại"
+            + (f" · Mã: `{correlation}`" if correlation else ".")
+        )
+        if st.button("Đóng cảnh báo", key="kis_dismiss_failure"):
+            st.session_state.kis_last_failure = None
+            st.rerun()
 
     channel_statuses = getattr(context.pipeline, "last_channel_statuses", {})
     if isinstance(channel_statuses, dict) and channel_statuses:
@@ -1012,38 +1571,13 @@ def _render_kis(context: RuntimeContext) -> None:
             image_loader=lambda item: _kis_image_loader(context, item),
             pinned_identities=_pinned_identity_set(st.session_state.kis_pinned),
             on_pin_change=_change_kis_pin,
+            on_send_to_qa=lambda item: _bridge_kis_result_to_qa(context, item),
+            on_open_scrubber=_open_kis_scrubber,
         )
 
     if st.session_state.kis_results and st.session_state.kis_last_request is not None:
         if context.artifact_repository is not None:
-            with st.expander("Xem các khung hình lân cận"):
-                neighbor_choices = {
-                    f"#{item['rank']} {item['video_id']}:{item['source_frame_idx']}": item
-                    for item in st.session_state.kis_results[:20]
-                    if item.get("batch_id")
-                }
-                if neighbor_choices:
-                    label = st.selectbox("Ứng viên", list(neighbor_choices), key="kis_neighbor")
-                    candidate = neighbor_choices[label]
-                    neighbors = context.artifact_repository.neighbors(
-                        candidate["batch_id"],
-                        candidate["video_id"],
-                        int(candidate.get("timestamp_ms", 0)),
-                        radius_ms=4_000,
-                        limit=25,
-                    )
-                    st.dataframe(
-                        [
-                            {
-                                "source_frame_idx": frame.source_frame_idx,
-                                "timestamp_ms": frame.timestamp_ms,
-                                "shot_id": frame.shot_id,
-                            }
-                            for frame in neighbors
-                        ],
-                        width="stretch",
-                        hide_index=True,
-                    )
+            _render_kis_temporal_scrubber(context)
 
         with st.expander("Phản hồi mức độ liên quan"):
             choices = {
@@ -1100,6 +1634,26 @@ def _render_kis(context: RuntimeContext) -> None:
         width="stretch",
         hide_index=True,
     )
+    unpin_columns = st.columns(min(4, len(st.session_state.kis_pinned)))
+    for index, item in enumerate(list(st.session_state.kis_pinned), start=1):
+        identity = result_identity(item)
+        digest = hashlib.sha256(
+            "\0".join((identity[0], identity[1], str(identity[2]))).encode("utf-8")
+        ).hexdigest()[:12]
+        with unpin_columns[(index - 1) % len(unpin_columns)]:
+            if st.button(
+                f"Bỏ ghim #{index}",
+                key=f"kis_unpin_{digest}",
+                width="stretch",
+            ):
+                _change_kis_pin(
+                    identity,
+                    item,
+                    False,
+                    pin_widget_key(identity),
+                )
+                st.rerun()
+
     batch_ids = {
         str(item["batch_id"]) for item in st.session_state.kis_pinned if item.get("batch_id")
     }
@@ -1433,8 +1987,174 @@ def _apply_qa_snapshot(snapshot: dict[str, Any] | None) -> dict[str, Any] | None
         item["answer_source"] = "operator"
         item["evidence"] = evidence
     st.session_state.qa_predictions = predictions
-    st.session_state.qa_result = predictions[0] if predictions else None
+    selected_id = str(st.session_state.get("qa_selected_candidate_id") or "")
+    selected_prediction = next(
+        (
+            item
+            for item in predictions
+            if str(item.get("window_id") or "") == selected_id
+        ),
+        None,
+    )
+    st.session_state.qa_result = selected_prediction or (predictions[0] if predictions else None)
     return snapshot
+
+
+def _apply_injected_qa_snapshot(
+    snapshot: dict[str, Any],
+    *,
+    source: str,
+) -> dict[str, Any]:
+    """Replace volatile candidate state only after FastAPI accepted an injection."""
+
+    _apply_qa_snapshot(snapshot)
+    candidates = [
+        dict(value)
+        for value in snapshot.get("candidates", ())
+        if isinstance(value, dict)
+    ]
+    if len(candidates) != 1:
+        raise BackendError("backend_response_invalid")
+    candidate = candidates[0]
+    st.session_state.qa_selected_candidate_id = str(candidate["candidate_id"])
+    st.session_state.vqa_selected_candidate = dict(candidate)
+    st.session_state.vqa_injected_frame = {
+        "batch_id": str(candidate["batch_id"]),
+        "video_id": str(candidate["video_id"]),
+        "source_frame_idx": int(candidate["source_frame_idx"]),
+        "source": source,
+    }
+    st.session_state.qa_request = None
+    st.session_state.qa_pinned = []
+    st.session_state.qa_export_cache = None
+    st.session_state.qa_answer_drafts = {}
+    st.session_state.qa_final_answer_candidate_id = None
+    st.session_state.qa_pending_answer_update = None
+    st.session_state.vqa_final_answer_input = ""
+    st.session_state.qa_candidate_page = 1
+    st.session_state.qa_last_failure = None
+    st.session_state.qa_injection_notice = {
+        "video_id": str(candidate["video_id"]),
+        "source_frame_idx": int(candidate["source_frame_idx"]),
+        "source": source,
+    }
+    return candidate
+
+
+def _inject_qa_frame(
+    context: RuntimeContext,
+    request: QAFrameInjectionRequest,
+) -> dict[str, Any]:
+    """Call the authoritative injection endpoint and apply its returned snapshot."""
+
+    injector = getattr(context.qa_pipeline, "inject", None)
+    if not callable(injector):
+        raise BackendError("runtime_contract_mismatch")
+    injector(request)
+    snapshot = getattr(context.qa_pipeline, "last_snapshot", None)
+    if not isinstance(snapshot, dict):
+        raise BackendError("backend_response_invalid")
+    return _apply_injected_qa_snapshot(snapshot, source=request.source)
+
+
+def _bridge_kis_result_to_qa(context: RuntimeContext, result: dict[str, Any]) -> None:
+    """Bridge one KIS result through FastAPI, then switch the active workflow."""
+
+    last_request = st.session_state.get("kis_last_request")
+    event_description = str(getattr(last_request, "original_text", "") or "").strip()
+    batch_id = str(result.get("batch_id") or _selected_batch_id(context) or "")
+    try:
+        request = QAFrameInjectionRequest(
+            query_id=str(uuid4()),
+            batch_id=batch_id,
+            video_id=str(result.get("video_id") or ""),
+            source_frame_idx=int(result["source_frame_idx"]),
+            source="kis_bridge",
+            event_description=event_description,
+        )
+        _inject_qa_frame(context, request)
+        st.session_state.qa_event_description = event_description
+        st.session_state._pending_active_workflow = "qa"
+        st.rerun()
+    except (BackendError, TypeError, ValueError, KeyError) as error:
+        st.session_state.kis_last_failure = {
+            "code": getattr(error, "code", "qa_frame_injection_invalid"),
+            "recoverable": True,
+        }
+        st.rerun()
+
+
+def _qa_persisted_answer(candidate_id: str) -> str:
+    for item in reversed(st.session_state.get("qa_predictions", ())):
+        if not isinstance(item, dict):
+            continue
+        evidence = item.get("evidence", {})
+        evidence = evidence if isinstance(evidence, dict) else {}
+        if str(item.get("window_id") or evidence.get("candidate_id")) == candidate_id:
+            answer = item.get("answer")
+            return answer if isinstance(answer, str) else ""
+    return ""
+
+
+def _sync_qa_answer_draft(candidate_id: str) -> None:
+    """Switch the editable answer without losing another candidate's draft."""
+
+    drafts = dict(st.session_state.get("qa_answer_drafts", {}))
+    pending = st.session_state.get("qa_pending_answer_update")
+    if (
+        isinstance(pending, dict)
+        and pending.get("candidate_id") == candidate_id
+        and isinstance(pending.get("answer"), str)
+    ):
+        answer = str(pending["answer"])
+        drafts[candidate_id] = answer
+        st.session_state.vqa_final_answer_input = answer
+        st.session_state.qa_final_answer_candidate_id = candidate_id
+        st.session_state.qa_pending_answer_update = None
+        st.session_state.qa_answer_drafts = drafts
+        return
+    previous = st.session_state.get("qa_final_answer_candidate_id")
+    if isinstance(previous, str) and previous:
+        current = st.session_state.get("vqa_final_answer_input")
+        if isinstance(current, str):
+            drafts[previous] = current
+    if previous != candidate_id:
+        st.session_state.vqa_final_answer_input = drafts.get(
+            candidate_id, _qa_persisted_answer(candidate_id)
+        )
+        st.session_state.qa_final_answer_candidate_id = candidate_id
+    st.session_state.qa_answer_drafts = drafts
+
+
+def _capture_qa_answer_draft() -> None:
+    candidate_id = st.session_state.get("qa_final_answer_candidate_id")
+    answer = st.session_state.get("vqa_final_answer_input")
+    if not isinstance(candidate_id, str) or not isinstance(answer, str):
+        return
+    drafts = dict(st.session_state.get("qa_answer_drafts", {}))
+    drafts[candidate_id] = answer
+    st.session_state.qa_answer_drafts = drafts
+
+
+def _set_qa_answer_draft(candidate_id: str, answer: str) -> None:
+    drafts = dict(st.session_state.get("qa_answer_drafts", {}))
+    drafts[candidate_id] = answer
+    st.session_state.qa_answer_drafts = drafts
+    st.session_state.qa_final_answer_candidate_id = candidate_id
+    st.session_state.vqa_final_answer_input = answer
+
+
+def _queue_qa_answer_draft(candidate_id: str, answer: str) -> None:
+    """Queue a widget value produced after its current-run instantiation."""
+
+    drafts = dict(st.session_state.get("qa_answer_drafts", {}))
+    drafts[candidate_id] = answer
+    st.session_state.qa_answer_drafts = drafts
+    st.session_state.qa_final_answer_candidate_id = candidate_id
+    st.session_state.qa_pending_answer_update = {
+        "candidate_id": candidate_id,
+        "answer": answer,
+    }
 
 
 def _load_qa_snapshot(context: RuntimeContext, search_id: str) -> dict[str, Any] | None:
@@ -1492,9 +2212,14 @@ def _apply_qa_edit(context: RuntimeContext, window_id: str, edited: str) -> None
 
 
 def _pin_qa_prediction(prediction: dict) -> None:
-    identity = (prediction["video_id"], prediction["source_frame_idx"])
+    identity = (
+        prediction["video_id"],
+        prediction["source_frame_idx"],
+        prediction["answer"],
+    )
     pinned = {
-        (item["video_id"], item["source_frame_idx"]): item for item in st.session_state.qa_pinned
+        (item["video_id"], item["source_frame_idx"], item["answer"]): item
+        for item in st.session_state.qa_pinned
     }
     pinned[identity] = dict(prediction)
     st.session_state.qa_pinned = list(pinned.values())[:100]
@@ -1812,6 +2537,37 @@ def _qa_exportable_pins(pinned: list[dict], answered_window_ids: set[str] | None
     ]
 
 
+def _build_qa_export_cache(
+    context: RuntimeContext,
+    *,
+    rows: list[dict[str, Any]],
+    batch_id: str,
+    filename: str,
+) -> dict[str, Any]:
+    """Build one immutable QA CSV snapshot through the canonical validator."""
+
+    request = st.session_state.qa_request
+    if request is None or not hasattr(request, "answer_spec_id"):
+        raise ValueError("the QA answer specification is unavailable")
+    ranked = [dict(item, rank=index) for index, item in enumerate(rows, 1)]
+    spec = QACompetitionSpec.for_spec_id(request.answer_spec_id)
+    canonical_check, evidence, _ = _submission_validation_context(context, batch_id, ranked)
+    data = serialize_qa_submission(
+        ranked,
+        spec=spec,
+        batch_id=batch_id,
+        is_batch_active=context.ledger.is_batch_active,
+        is_canonical_source_frame=canonical_check,
+        frame_index_evidence=evidence,
+    )
+    return {
+        "fingerprint": _result_fingerprint(workflow="qa", batch_id=batch_id, rows=ranked),
+        "filename": filename,
+        "data": data,
+        "sha256": hashlib.sha256(data).hexdigest(),
+    }
+
+
 def _render_qa_export(
     context: RuntimeContext,
     *,
@@ -1851,28 +2607,13 @@ def _render_qa_export(
         if st.button("Kiểm tra và chuẩn bị CSV hỏi đáp", key="qa_export"):
             started = time.monotonic()
             try:
-                request = st.session_state.qa_request
-                if request is None:
-                    raise ValueError("the QA answer specification is unavailable")
-                spec = QACompetitionSpec.for_spec_id(request.answer_spec_id)
-                canonical_check, evidence, _ = _submission_validation_context(
-                    context, batch_id, rows
-                )
                 filename = f"visual-qa-{str(st.session_state.qa_search_id)[:8]}.csv"
-                data = serialize_qa_submission(
-                    rows,
-                    spec=spec,
+                cached = _build_qa_export_cache(
+                    context,
+                    rows=rows,
                     batch_id=batch_id,
-                    is_batch_active=context.ledger.is_batch_active,
-                    is_canonical_source_frame=canonical_check,
-                    frame_index_evidence=evidence,
+                    filename=filename,
                 )
-                cached = {
-                    "fingerprint": fingerprint,
-                    "filename": filename,
-                    "data": data,
-                    "sha256": hashlib.sha256(data).hexdigest(),
-                }
                 st.session_state.qa_export_cache = cached
             except Exception as error:
                 st.session_state.qa_export_cache = None
@@ -2349,6 +3090,11 @@ def _render_qa(context: RuntimeContext) -> None:
         key="qa_event_description",
         placeholder="Ví dụ: A man is broadcasting TV news.",
     )
+    qa_entity_constraints = _render_entity_controls(
+        event_description,
+        state_key="qa_entity_modes",
+        scope="qa",
+    )
     qa_language_col, qa_override_col = st.columns((1, 2))
     with qa_language_col:
         qa_query_language = st.selectbox(
@@ -2380,8 +3126,77 @@ def _render_qa(context: RuntimeContext) -> None:
         key="qa_question",
         placeholder="Ví dụ: Does the man wear glasses?",
     )
+    submission_query_id = st.text_input(
+        "Query ID nộp bài · Visual Q&A",
+        key="codabench_query_id_qa",
+        placeholder="Ví dụ: p1-15, 01, round1_01",
+    )
     batch_id = _selected_batch_id(context)
     st.caption(f"Batch hiện hành: `{batch_id or 'chưa chọn'}`")
+
+    top_k = st.select_slider(
+        "Số lượng ứng viên Stage 1 (Top-K)",
+        options=(5, 10, 15, 20, 30, 50),
+        key="qa_top_k",
+    )
+
+    with st.expander("🛠️ Nạp khung hình thủ công / Nhập ID trực tiếp"):
+        manual_video_id = st.text_input(
+            "Tên Video (Video ID)",
+            key="vqa_manual_video_id",
+            placeholder="L01_V028",
+        )
+        manual_source_frame_idx = st.number_input(
+            "Source Frame Index",
+            min_value=0,
+            step=1,
+            key="vqa_manual_frame_idx",
+            help="Đây là source_frame_idx canonical, không phải keyframe ordinal.",
+        )
+        manual_load = st.button(
+            "🔍 Nạp & Xem trước khung hình",
+            key="qa_inject_manual_frame",
+            disabled=not bool(batch_id and manual_video_id.strip()),
+            width="stretch",
+        )
+        if manual_load:
+            try:
+                injection = QAFrameInjectionRequest(
+                    query_id=str(uuid4()),
+                    batch_id=str(batch_id),
+                    video_id=manual_video_id.strip(),
+                    source_frame_idx=int(manual_source_frame_idx),
+                    source="manual",
+                    event_description=(
+                        event_description.strip()
+                        or "operator-selected canonical frame"
+                    ),
+                )
+                with st.spinner("Đang xác minh canonical frame và ảnh nguồn..."):
+                    _inject_qa_frame(context, injection)
+                st.rerun()
+            except (TypeError, ValueError):
+                st.session_state.qa_last_failure = {
+                    "code": "qa_frame_injection_invalid",
+                    "recoverable": True,
+                }
+            except BackendError as error:
+                st.session_state.qa_last_failure = {
+                    "code": error.code,
+                    "correlation_id": error.detail.get("correlation_id"),
+                    "recoverable": error.recoverable,
+                }
+
+    injection_notice = st.session_state.get("qa_injection_notice")
+    if isinstance(injection_notice, dict):
+        source_label = (
+            "KIS" if injection_notice.get("source") == "kis_bridge" else "nhập thủ công"
+        )
+        st.success(
+            "Đã nạp frame "
+            f"{injection_notice.get('video_id')} "
+            f"(source frame {injection_notice.get('source_frame_idx')}) từ {source_label}."
+        )
 
     retrieve_clicked = st.button(
         "1. Truy xuất khung hình – KIS Search",
@@ -2390,46 +3205,83 @@ def _render_qa(context: RuntimeContext) -> None:
         disabled=not bool(event_description.strip() and batch_id),
     )
     if retrieve_clicked:
-        request = QACandidateRequest(
-            query_id=str(uuid4()),
-            event_description=event_description,
-            batch_filters=(batch_id,),
-            top_k=5,
-            query_language=qa_query_language,
-            event_description_en=qa_event_description_en or None,
-        )
-        st.session_state.qa_search_id = None
-        st.session_state.qa_request = request
-        st.session_state.qa_candidates = []
-        st.session_state.qa_answers = []
-        st.session_state.qa_predictions = []
-        st.session_state.qa_result = None
-        st.session_state.qa_selected_candidate_id = None
-        st.session_state.qa_pinned = []
-        st.session_state.qa_export_cache = None
-        with st.spinner("Đang truy xuất Top-5 khung hình bằng KIS..."):
-            try:
+        request: QACandidateRequest | None = None
+        try:
+            request = QACandidateRequest(
+                query_id=str(uuid4()),
+                event_description=event_description,
+                batch_filters=(batch_id,),
+                top_k=int(top_k),
+                query_language=qa_query_language,
+                event_description_en=qa_event_description_en or None,
+                entity_constraints=qa_entity_constraints,
+            )
+            with st.spinner(f"Đang truy xuất Top-{int(top_k)} khung hình bằng KIS..."):
                 context.qa_pipeline.retrieve(request)
                 snapshot = getattr(context.qa_pipeline, "last_snapshot", None)
                 if snapshot is None:
                     raise BackendError("backend_response_invalid")
-                _apply_qa_snapshot(snapshot)
-            except BackendError as error:
-                _report_ui_error(
-                    error,
-                    workflow="qa",
-                    stage="retrieve",
-                    batch_id=batch_id,
-                    query_or_session_id=request.query_id,
-                )
-            except Exception as error:
-                _report_ui_error(
-                    error,
-                    workflow="qa",
-                    stage="retrieve",
-                    batch_id=batch_id,
-                    query_or_session_id=request.query_id,
-                )
+            st.session_state.qa_request = request
+            st.session_state.qa_pinned = []
+            st.session_state.qa_export_cache = None
+            st.session_state.qa_answer_drafts = {}
+            st.session_state.qa_final_answer_candidate_id = None
+            st.session_state.qa_pending_answer_update = None
+            st.session_state.vqa_final_answer_input = ""
+            st.session_state.vqa_injected_frame = None
+            st.session_state.vqa_selected_candidate = None
+            st.session_state.qa_injection_notice = None
+            st.session_state.qa_candidate_page = 1
+            st.session_state.qa_last_failure = None
+            _apply_qa_snapshot(snapshot)
+        except (TypeError, ValueError):
+            st.session_state.qa_last_failure = {
+                "code": "qa_retrieval_request_invalid",
+                "recoverable": True,
+            }
+        except BackendError as error:
+            st.session_state.qa_last_failure = {
+                "code": error.code,
+                "correlation_id": error.detail.get("correlation_id"),
+                "recoverable": error.recoverable,
+            }
+        except Exception as error:
+            event_id = _report_ui_error(
+                error,
+                workflow="qa",
+                stage="retrieve",
+                batch_id=batch_id,
+                query_or_session_id=(request.query_id if request is not None else None),
+            )
+            st.session_state.qa_last_failure = {
+                "code": "qa_retrieval_unavailable",
+                "correlation_id": event_id,
+                "recoverable": True,
+            }
+
+    active_failure = st.session_state.get("qa_last_failure")
+    if isinstance(active_failure, dict):
+        failure_code = str(active_failure.get("code") or "qa_retrieval_unavailable")
+        correlation = str(active_failure.get("correlation_id") or "")
+        if failure_code == "qa_injected_frame_not_found":
+            st.warning(
+                "Không tìm thấy video/source frame canonical đã nhập trong batch hiện hành."
+            )
+        elif failure_code == "qa_candidate_media_unavailable":
+            st.warning(
+                "Canonical frame tồn tại nhưng ảnh nguồn đang thiếu hoặc hỏng. "
+                "Không có frame lân cận nào được thay thế âm thầm."
+            )
+        else:
+            st.warning(
+                "Visual Q&A chưa hoàn tất (`"
+                + failure_code
+                + "`). Candidate và câu trả lời trước đó vẫn được giữ"
+                + (f" · Mã: `{correlation}`" if correlation else ".")
+            )
+        if st.button("Đóng cảnh báo QA", key="qa_dismiss_active_failure"):
+            st.session_state.qa_last_failure = None
+            st.rerun()
 
     candidates = [
         dict(value)
@@ -2445,6 +3297,31 @@ def _render_qa(context: RuntimeContext) -> None:
         if selected not in candidate_ids:
             selected = candidate_ids[0]
             st.session_state.qa_selected_candidate_id = selected
+        page_size = 12
+        total_pages = max(1, (len(candidates) + page_size - 1) // page_size)
+        current_page = int(st.session_state.get("qa_candidate_page", 1))
+        current_page = min(max(current_page, 1), total_pages)
+        st.session_state.qa_candidate_page = current_page
+        if total_pages > 1:
+            current_page = st.select_slider(
+                "Trang candidate",
+                options=tuple(range(1, total_pages + 1)),
+                key="qa_candidate_page",
+                format_func=lambda value: f"Trang {value}/{total_pages}",
+            )
+        else:
+            st.caption("Trang candidate 1/1")
+        page_start = (int(current_page) - 1) * page_size
+        visible_candidates = candidates[page_start : page_start + page_size]
+        selected_candidate = next(
+            value for value in candidates if str(value["candidate_id"]) == str(selected)
+        )
+        image_candidates = list(visible_candidates)
+        if all(
+            str(value["candidate_id"]) != str(selected)
+            for value in visible_candidates
+        ):
+            image_candidates.append(selected_candidate)
         candidate_images = {
             str(candidate["candidate_id"]): _source_frame_image(
                 context,
@@ -2452,7 +3329,7 @@ def _render_qa(context: RuntimeContext) -> None:
                 str(candidate["video_id"]),
                 int(candidate["source_frame_idx"]),
             )
-            for candidate in candidates
+            for candidate in image_candidates
         }
         snapshot_state = dict(st.session_state.get("qa_snapshot") or {})
         candidate_failures = snapshot_state.get("failures", {})
@@ -2471,9 +3348,36 @@ def _render_qa(context: RuntimeContext) -> None:
         st.success(
             f"Đã truy xuất {len(candidates)} candidate trong {retrieval_ms:.0f} ms; chưa gọi VLM."
         )
-        for offset in range(0, len(candidates), 3):
-            columns = st.columns(min(3, len(candidates) - offset))
-            for column, candidate in zip(columns, candidates[offset : offset + 3], strict=True):
+        selected_origin = str(
+            dict(selected_candidate.get("evidence", {})).get("origin") or "kis_retrieval"
+        )
+        with st.container(
+            key=hud_container_key("qa-selected-preview", str(selected)),
+            border=True,
+        ):
+            st.markdown(
+                render_hud_readout(
+                    "KHUNG HÌNH ĐƯỢC CHỌN ĐỂ TRẢ LỜI",
+                    str(selected_candidate["video_id"]),
+                    tone="green",
+                ),
+                unsafe_allow_html=True,
+            )
+            selected_image = candidate_images.get(str(selected))
+            if selected_image is not None:
+                st.image(selected_image, width="stretch")
+            else:
+                st.warning("Ảnh canonical của candidate đang chọn hiện không khả dụng.")
+            st.caption(
+                f"Nguồn: {selected_origin} · source frame "
+                f"{selected_candidate['source_frame_idx']} · "
+                f"{int(selected_candidate['timestamp_ms']) / 1000:.2f}s"
+            )
+        for offset in range(0, len(visible_candidates), 4):
+            columns = st.columns(min(4, len(visible_candidates) - offset))
+            for column, candidate in zip(
+                columns, visible_candidates[offset : offset + 4], strict=True
+            ):
                 with column:
                     with st.container(
                         key=hud_container_key("qa-card", candidate["candidate_id"]),
@@ -2520,7 +3424,6 @@ def _render_qa(context: RuntimeContext) -> None:
                 (
                     f"#{value['retrieval_rank']} · {value['video_id']} · "
                     f"frame {value['source_frame_idx']} · {int(value['timestamp_ms']) / 1000:.2f}s"
-                    f"{' · ảnh không khả dụng' if candidate_images.get(str(value['candidate_id'])) is None else ''}"
                     for value in candidates
                     if value["candidate_id"] == candidate_id
                 ),
@@ -2528,6 +3431,10 @@ def _render_qa(context: RuntimeContext) -> None:
             ),
             key="qa_selected_candidate_id",
         )
+        selected_candidate = next(
+            value for value in candidates if str(value["candidate_id"]) == str(selected)
+        )
+        st.session_state.vqa_selected_candidate = dict(selected_candidate)
 
         primary_engine = st.selectbox(
             "Bộ máy trả lời single-frame",
@@ -2638,6 +3545,9 @@ def _render_qa(context: RuntimeContext) -> None:
                 limit=100,
                 reasoning_policy=reasoning_policy,
                 allow_external_frame_transfer=consent,
+                query_language=qa_query_language,
+                event_description_en=qa_event_description_en or None,
+                entity_constraints=qa_entity_constraints,
             )
             with st.spinner("Đang suy luận trên đúng một khung hình..."):
                 try:
@@ -2648,6 +3558,13 @@ def _render_qa(context: RuntimeContext) -> None:
                     if snapshot is None:
                         raise BackendError("backend_response_invalid")
                     _apply_qa_snapshot(snapshot)
+                    answered = st.session_state.get("qa_result")
+                    if (
+                        isinstance(answered, dict)
+                        and str(answered.get("window_id")) == str(selected)
+                        and isinstance(answered.get("answer"), str)
+                    ):
+                        _set_qa_answer_draft(str(selected), str(answered["answer"]))
                 except BackendError as error:
                     if error.snapshot is not None:
                         _apply_qa_snapshot(error.snapshot)
@@ -2676,6 +3593,187 @@ def _render_qa(context: RuntimeContext) -> None:
                         query_or_session_id=st.session_state.qa_search_id,
                     )
 
+        _sync_qa_answer_draft(str(selected))
+        st.text_input(
+            "✍️ Câu trả lời chính thức (Tùy chỉnh / Xem trước)",
+            key="vqa_final_answer_input",
+            max_chars=256,
+            on_change=_capture_qa_answer_draft,
+            help=(
+                "Câu trả lời sẽ được chuẩn hóa NFC, gộp khoảng trắng, bỏ dấu câu ngoài "
+                "và chuyển thành chữ thường trước khi stage."
+            ),
+        )
+        normalized_submission_id = _normalized_codabench_query_id(submission_query_id)
+        manual_answer = str(st.session_state.get("vqa_final_answer_input", ""))
+        selected_candidate_for_preview = next(
+            (
+                value
+                for value in candidates
+                if str(value.get("candidate_id")) == str(selected)
+            ),
+            None,
+        )
+        if manual_answer.strip() and selected_candidate_for_preview is not None:
+            try:
+                preview_answer = QACompetitionSpec.for_spec_id(
+                    answer_spec_id
+                ).normalize_answer(manual_answer, question)
+                manual_preview = format_qa_submission_row(
+                    str(selected_candidate_for_preview["video_id"]),
+                    int(selected_candidate_for_preview["source_frame_idx"]),
+                    preview_answer,
+                )
+            except (TypeError, ValueError):
+                manual_preview = None
+            if manual_preview is not None:
+                st.caption("Submission Line Preview")
+                st.code(manual_preview, language=None)
+        staged_qa_entry: dict[str, Any] | None = None
+        staged_qa_rows: list[list[str]] = []
+        if normalized_submission_id is not None:
+            staged_name = _codabench_filename(normalized_submission_id, "qa")
+            candidate_entry = st.session_state.get("codabench_staging", {}).get(staged_name)
+            if isinstance(candidate_entry, dict):
+                staged_qa_entry = candidate_entry
+                staged_qa_rows = _staged_row_values(candidate_entry)
+        qa_stage_action = st.radio(
+            "Cách ghi vào bảng xếp hạng QA",
+            ("append", "update"),
+            key="qa_stage_action",
+            horizontal=True,
+            format_func=lambda value: (
+                "Ghim vào Rank tiếp theo" if value == "append" else "Cập nhật một Rank"
+            ),
+            disabled=not staged_qa_rows,
+        )
+        qa_update_rank: int | None = None
+        if qa_stage_action == "update" and staged_qa_rows:
+            qa_update_rank = st.selectbox(
+                "Rank QA cần cập nhật",
+                tuple(range(1, len(staged_qa_rows) + 1)),
+                key="qa_stage_update_rank",
+                format_func=lambda value: f"Rank #{value}",
+            )
+        manual_disabled = (
+            normalized_submission_id is None
+            or not question.strip()
+            or not manual_answer.strip()
+            or (qa_stage_action == "append" and len(staged_qa_rows) >= 100)
+        )
+        manual_label_id = normalized_submission_id or "<Query ID chưa hợp lệ>"
+        manual_action_label = (
+            f"Cập nhật Rank #{qa_update_rank}"
+            if qa_stage_action == "update" and qa_update_rank is not None
+            else "Ghim vào Rank tiếp theo"
+        )
+        if st.button(
+            f"📌 {manual_action_label} (Query ID: {manual_label_id})",
+            key="qa_confirm_manual_and_stage",
+            disabled=manual_disabled,
+            width="stretch",
+        ):
+            assert normalized_submission_id is not None
+            selected_candidate = next(
+                value for value in candidates if value["candidate_id"] == selected
+            )
+            manual_request = QASingleFrameAnswerRequest(
+                candidate_id=str(selected),
+                question=question,
+                answer_spec_id=answer_spec_id,
+                reasoning_policy="local_only",
+                allow_external_frame_transfer=False,
+                answer_engine="manual",
+                manual_answer=manual_answer,
+            )
+            st.session_state.qa_request = QAQueryRequest(
+                query_id=str(st.session_state.qa_search_id),
+                event_description=event_description,
+                question=question,
+                mode="interactive",
+                answer_spec_id=answer_spec_id,
+                batch_filters=(str(selected_candidate["batch_id"]),),
+                limit=1,
+                reasoning_policy="local_only",
+                allow_external_frame_transfer=False,
+                query_language=qa_query_language,
+                event_description_en=qa_event_description_en or None,
+                entity_constraints=qa_entity_constraints,
+            )
+            try:
+                context.qa_pipeline.answer_candidate(
+                    str(st.session_state.qa_search_id), manual_request
+                )
+                snapshot = getattr(context.qa_pipeline, "last_snapshot", None)
+                if snapshot is None:
+                    raise BackendError("backend_response_invalid")
+                _apply_qa_snapshot(snapshot)
+                authoritative = st.session_state.get("qa_result")
+                if (
+                    not isinstance(authoritative, dict)
+                    or str(authoritative.get("window_id")) != str(selected)
+                    or not isinstance(authoritative.get("answer"), str)
+                ):
+                    raise BackendError("backend_response_invalid")
+                _pin_qa_prediction(dict(authoritative))
+                batch = str(authoritative["batch_id"])
+                single_row_cache = _build_qa_export_cache(
+                    context,
+                    rows=[dict(authoritative)],
+                    batch_id=batch,
+                    filename=f"visual-qa-{str(st.session_state.qa_search_id)[:8]}.csv",
+                )
+                st.session_state.qa_export_cache = single_row_cache
+                current_entry = {
+                    "task": "qa",
+                    "batch_id": batch,
+                    "data": single_row_cache["data"],
+                    "source_fingerprint": single_row_cache["fingerprint"],
+                    "stage_count": None,
+                    "row_count": 1,
+                    "source_ranks": None,
+                }
+                staged_filename = _append_or_update_codabench_row(
+                    context,
+                    task="qa",
+                    query_id=normalized_submission_id,
+                    current=current_entry,
+                    row_data=single_row_cache["data"],
+                    update_rank=qa_update_rank if qa_stage_action == "update" else None,
+                )
+                st.success(
+                    f"Đã {manual_action_label.lower()} trong `{staged_filename}` "
+                    "mà không gọi VLM."
+                )
+            except BackendError as error:
+                if error.snapshot is not None:
+                    _apply_qa_snapshot(error.snapshot)
+                if error.code == "qa_manual_answer_invalid":
+                    st.warning("Câu trả lời manual không hợp lệ hoặc vượt quá 100 ký tự.")
+                else:
+                    _report_ui_error(
+                        error,
+                        workflow="qa",
+                        stage="manual_answer",
+                        batch_id=batch_id,
+                        query_or_session_id=st.session_state.qa_search_id,
+                    )
+            except ValueError as error:
+                message = (
+                    "Query ID đã trùng với entry khác trong bundle."
+                    if str(error) == "bundle_query_id_collision"
+                    else "Không thể chuẩn bị CSV manual từ candidate đã chọn."
+                )
+                st.warning(message)
+            except Exception as error:
+                _report_ui_error(
+                    error,
+                    workflow="qa",
+                    stage="manual_answer",
+                    batch_id=batch_id,
+                    query_or_session_id=st.session_state.qa_search_id,
+                )
+
     result = st.session_state.get("qa_result")
     if isinstance(result, dict):
         st.subheader("Kết quả single-frame")
@@ -2684,10 +3782,16 @@ def _render_qa(context: RuntimeContext) -> None:
                 render_hud_readout("VLM ANSWER", result["answer"], tone="green"),
                 unsafe_allow_html=True,
             )
-            st.code(
-                f"{result['video_id']}, {result['source_frame_idx']}, {result['answer']}",
-                language=None,
-            )
+            try:
+                output_preview = format_qa_submission_row(
+                    str(result["video_id"]),
+                    int(result["source_frame_idx"]),
+                    str(result["answer"]),
+                )
+            except (TypeError, ValueError):
+                output_preview = "Không thể tạo preview CSV đã xác minh"
+            st.caption("Submission Line Preview")
+            st.code(output_preview, language=None)
             evidence = dict(result.get("evidence", {}))
             provider = evidence.get("provider", result.get("answer_source", "unknown"))
             response_ms = float(
@@ -2888,10 +3992,79 @@ def _invalidate_trake_results(state: Any | None = None) -> None:
     target = st.session_state if state is None else state
     target["trake_response"] = None
     target["trake_results"] = []
+    target["trake_pinned"] = []
     target["trake_query_id"] = None
     target["trake_result_stage_count"] = None
     target["trake_export_cache"] = None
+    target["trake_frame_overrides"] = {}
     target.pop("trake_selected_candidate", None)
+
+
+def _trake_sequence_with_overrides(
+    context: RuntimeContext,
+    selected: dict[str, Any],
+    overrides: dict[int, int],
+) -> dict[str, Any]:
+    """Resolve an operator-edited sequence back to canonical timestamps."""
+
+    batch_id = str(selected.get("batch_id", ""))
+    video_id = str(selected.get("video_id", ""))
+    raw_matches = selected.get("stage_matches", ())
+    if not batch_id or not video_id or not isinstance(raw_matches, (list, tuple)):
+        raise ValueError("invalid TRAKE candidate")
+    repository = getattr(context, "artifact_repository", None)
+    getter = getattr(repository, "get_source_frame", None)
+    if not callable(getter):
+        raise ValueError("canonical repository unavailable")
+    matches: list[dict[str, Any]] = []
+    for expected_stage, raw in enumerate(raw_matches, start=1):
+        if not isinstance(raw, dict):
+            raise ValueError("invalid TRAKE stage match")
+        stage_index = int(raw.get("stage_index", expected_stage))
+        if stage_index != expected_stage:
+            raise ValueError("TRAKE stages are not contiguous")
+        source_frame_idx = int(
+            overrides.get(stage_index, int(raw.get("source_frame_idx", -1)))
+        )
+        frame = getter(batch_id, video_id, source_frame_idx)
+        if frame is None:
+            raise ValueError("selected frame is not canonical")
+        match = {
+            "stage_index": stage_index,
+            "source_frame_idx": source_frame_idx,
+            "timestamp_ms": int(frame.timestamp_ms),
+        }
+        similarity = raw.get("similarity")
+        if (
+            source_frame_idx == int(raw.get("source_frame_idx", -1))
+            and isinstance(similarity, (int, float))
+            and not isinstance(similarity, bool)
+        ):
+            match["similarity"] = float(raw["similarity"])
+        matches.append(match)
+    frames = [int(value["source_frame_idx"]) for value in matches]
+    timestamps = [int(value["timestamp_ms"]) for value in matches]
+    if any(left >= right for left, right in zip(frames, frames[1:])) or any(
+        left >= right for left, right in zip(timestamps, timestamps[1:])
+    ):
+        raise ValueError("edited TRAKE sequence must remain strictly monotonic")
+    return {**selected, "stage_matches": matches}
+
+
+def _pin_trake_sequence(sequence: dict[str, Any]) -> None:
+    """Keep one explicit operator-selected sequence per video in local state."""
+
+    video_id = str(sequence.get("video_id", ""))
+    pinned = [
+        dict(value)
+        for value in st.session_state.get("trake_pinned", ())
+        if isinstance(value, dict) and str(value.get("video_id")) != video_id
+    ]
+    pinned.append(dict(sequence))
+    st.session_state.trake_pinned = [
+        {**value, "rank": rank} for rank, value in enumerate(pinned[:100], start=1)
+    ]
+    st.session_state.trake_export_cache = None
 
 
 def _render_trake(context: RuntimeContext) -> None:
@@ -2904,11 +4077,22 @@ def _render_trake(context: RuntimeContext) -> None:
     )
     batch_id = _selected_batch_id(context)
     st.caption(f"Batch hiện hành: `{batch_id or 'chưa chọn'}`")
-    st.text_area(
+    st.text_input(
+        "Query ID nộp bài TRAKE",
+        key="codabench_query_id_trake",
+        placeholder="Ví dụ: p1-4",
+    )
+    global_description_input = st.text_area(
         "Mô tả toàn bộ sự kiện",
         key="trake_global_description",
         on_change=_invalidate_trake_results,
         placeholder="Ví dụ: Một người bước vào cửa hàng, chọn sản phẩm rồi thanh toán và rời đi.",
+    )
+    global_entity_constraints = _render_entity_controls(
+        global_description_input,
+        state_key="trake_entity_modes",
+        scope="global",
+        on_change=_invalidate_trake_results,
     )
     trake_language_col, trake_override_col = st.columns((1, 2))
     with trake_language_col:
@@ -2940,14 +4124,21 @@ def _render_trake(context: RuntimeContext) -> None:
     stage_count = max(2, min(20, int(st.session_state.trake_stage_count)))
     st.session_state.trake_stage_count = stage_count
     st.markdown("**Các giai đoạn theo thứ tự**")
+    stage_entity_constraints: dict[int, tuple[EntityConstraint, ...]] = {}
     for stage_index in range(1, stage_count + 1):
         key = f"trake_stage_{stage_index}"
         st.session_state.setdefault(key, "")
-        st.text_input(
+        stage_text = st.text_input(
             f"Giai đoạn {stage_index}",
             key=key,
             on_change=_invalidate_trake_results,
             placeholder=f"Mô tả hành động ở giai đoạn {stage_index}",
+        )
+        stage_entity_constraints[stage_index] = _render_entity_controls(
+            stage_text,
+            state_key="trake_entity_modes",
+            scope=f"stage:{stage_index}",
+            on_change=_invalidate_trake_results,
         )
         if trake_edit_translation:
             english_key = f"trake_stage_en_{stage_index}"
@@ -3040,6 +4231,7 @@ def _render_trake(context: RuntimeContext) -> None:
                                 ).strip()
                                 or None
                             ),
+                            entity_constraints=stage_entity_constraints.get(index, ()),
                         )
                         for index, description in enumerate(descriptions, start=1)
                     ),
@@ -3050,6 +4242,7 @@ def _render_trake(context: RuntimeContext) -> None:
                         str(st.session_state.get("trake_global_description_en", "")).strip()
                         or None
                     ),
+                    global_entity_constraints=global_entity_constraints,
                 )
                 with st.spinner("Đang truy xuất video và căn chỉnh chuỗi giai đoạn..."):
                     response = context.trake_pipeline.search(
@@ -3104,7 +4297,23 @@ def _render_trake(context: RuntimeContext) -> None:
         ),
     )
     selected = choices[selected_id]
-    matches = selected.get("stage_matches", ())
+    all_overrides = dict(st.session_state.get("trake_frame_overrides", {}))
+    selected_overrides = {
+        int(stage_index): int(frame_idx)
+        for stage_index, frame_idx in dict(all_overrides.get(selected_id, {})).items()
+    }
+    try:
+        selected_sequence = _trake_sequence_with_overrides(
+            context,
+            selected,
+            selected_overrides,
+        )
+    except (TypeError, ValueError):
+        selected_overrides = {}
+        all_overrides.pop(selected_id, None)
+        st.session_state.trake_frame_overrides = all_overrides
+        selected_sequence = _trake_sequence_with_overrides(context, selected, {})
+    matches = selected_sequence.get("stage_matches", ())
     if isinstance(matches, (list, tuple)) and matches:
         st.markdown("**Dòng thời gian ngang**")
         valid_matches = [match for match in matches if isinstance(match, dict)]
@@ -3158,11 +4367,166 @@ def _render_trake(context: RuntimeContext) -> None:
                         )
                         st.caption(f"{timestamp_ms / 1000:.2f} giây")
 
+        st.markdown("**Điều chỉnh một stage bằng các frame lân cận**")
+        if st.session_state.get("trake_adjust_stage") not in range(
+            1, len(valid_matches) + 1
+        ):
+            st.session_state.trake_adjust_stage = 1
+        stage_choice = st.selectbox(
+            "Stage cần điều chỉnh",
+            tuple(range(1, len(valid_matches) + 1)),
+            key="trake_adjust_stage",
+            format_func=lambda value: f"E{value}",
+        )
+        anchor = valid_matches[int(stage_choice) - 1]
+        repository = getattr(context, "artifact_repository", None)
+        neighbor_values: tuple[Any, ...] = ()
+        neighbor_loader = getattr(repository, "neighbors", None)
+        if callable(neighbor_loader):
+            try:
+                neighbor_values = tuple(
+                    neighbor_loader(
+                        str(selected_sequence.get("batch_id", batch_id)),
+                        str(selected_sequence.get("video_id", "")),
+                        int(anchor.get("timestamp_ms", 0)),
+                        radius_ms=4_000,
+                        limit=5,
+                    )
+                )
+            except Exception:
+                neighbor_values = ()
+        previous = valid_matches[int(stage_choice) - 2] if int(stage_choice) > 1 else None
+        following = (
+            valid_matches[int(stage_choice)]
+            if int(stage_choice) < len(valid_matches)
+            else None
+        )
+        compatible_neighbors = [
+            frame
+            for frame in neighbor_values
+            if (
+                previous is None
+                or (
+                    int(frame.source_frame_idx) > int(previous["source_frame_idx"])
+                    and int(frame.timestamp_ms) > int(previous["timestamp_ms"])
+                )
+            )
+            and (
+                following is None
+                or (
+                    int(frame.source_frame_idx) < int(following["source_frame_idx"])
+                    and int(frame.timestamp_ms) < int(following["timestamp_ms"])
+                )
+            )
+        ]
+        if compatible_neighbors:
+            neighbor_columns = st.columns(len(compatible_neighbors))
+            for column, frame in zip(
+                neighbor_columns,
+                compatible_neighbors,
+                strict=True,
+            ):
+                with column:
+                    image = _trake_frame_image(
+                        context,
+                        str(frame.batch_id),
+                        str(frame.video_id),
+                        int(frame.source_frame_idx),
+                    )
+                    if image is not None:
+                        st.image(image, width="stretch")
+                    if st.button(
+                        f"Chọn {int(frame.source_frame_idx)}",
+                        key=(
+                            f"trake_swap_{hashlib.sha256(selected_id.encode()).hexdigest()[:8]}_"
+                            f"{stage_choice}_{int(frame.source_frame_idx)}"
+                        ),
+                    ):
+                        selected_overrides[int(stage_choice)] = int(frame.source_frame_idx)
+                        all_overrides[selected_id] = selected_overrides
+                        st.session_state.trake_frame_overrides = all_overrides
+                        st.session_state.trake_export_cache = None
+                        st.rerun()
+        else:
+            st.caption("Không có frame lân cận nào giữ được thứ tự thời gian nghiêm ngặt.")
+        if st.button(
+            "Khôi phục chuỗi gốc",
+            key=f"trake_reset_sequence_{hashlib.sha256(selected_id.encode()).hexdigest()[:8]}",
+            disabled=not selected_overrides,
+        ):
+            all_overrides.pop(selected_id, None)
+            st.session_state.trake_frame_overrides = all_overrides
+            st.session_state.trake_export_cache = None
+            st.rerun()
+
+        submission_id = _normalized_codabench_query_id(
+            st.session_state.get("codabench_query_id_trake", "")
+        )
+        staged_rank: int | None = None
+        if submission_id is not None:
+            staged_name = _codabench_filename(submission_id, "trake")
+            staged_entry = st.session_state.get("codabench_staging", {}).get(staged_name)
+            if isinstance(staged_entry, dict):
+                for index, row in enumerate(_staged_row_values(staged_entry), start=1):
+                    if row and row[0] == str(selected_sequence.get("video_id", "")):
+                        staged_rank = index
+                        break
+        pin_label = (
+            f"📌 Cập nhật chuỗi ở Rank #{staged_rank}"
+            if staged_rank is not None
+            else "📌 Ghim chuỗi vào Submission Hub"
+        )
+        if st.button(
+            pin_label,
+            key="trake_pin_selected",
+            disabled=submission_id is None,
+            width="stretch",
+        ):
+            assert submission_id is not None
+            try:
+                single = {**selected_sequence, "rank": 1}
+                _, row_data = _trake_csv_bytes(
+                    context,
+                    query_id=str(st.session_state.trake_query_id or "trake"),
+                    batch_id=str(selected_sequence["batch_id"]),
+                    stage_count=len(valid_matches),
+                    results=[single],
+                )
+                current = {
+                    "task": "trake",
+                    "batch_id": str(selected_sequence["batch_id"]),
+                    "data": row_data,
+                    "source_fingerprint": hashlib.sha256(row_data).hexdigest(),
+                    "stage_count": len(valid_matches),
+                    "row_count": 1,
+                    "source_ranks": None,
+                }
+                staged_filename = _append_or_update_codabench_row(
+                    context,
+                    task="trake",
+                    query_id=submission_id,
+                    current=current,
+                    row_data=row_data,
+                    update_rank=staged_rank,
+                )
+                _pin_trake_sequence(selected_sequence)
+            except (BackendError, TypeError, ValueError) as error:
+                if isinstance(error, BackendError) and error.code == "staging_revision_conflict":
+                    st.warning("Staging đã đổi ở tab khác; hãy bấm ghim lại trên snapshot mới.")
+                else:
+                    st.warning("Chuỗi chưa được ghim vì frame hoặc thứ tự thời gian không hợp lệ.")
+            else:
+                st.success(f"Đã ghi chuỗi vào `{staged_filename}`.")
+
     query_id = str(st.session_state.trake_query_id or "trake")
+    submission_results = list(st.session_state.get("trake_pinned", ()))
+    if not submission_results:
+        st.caption("Ghim ít nhất một chuỗi để chuẩn bị CSV TRAKE cục bộ.")
+        return
     export_fingerprint = _result_fingerprint(
         workflow="trake",
         batch_id=str(batch_id),
-        rows=results,
+        rows=submission_results,
     )
     cached_export = st.session_state.get("trake_export_cache")
     try:
@@ -3175,7 +4539,7 @@ def _render_trake(context: RuntimeContext) -> None:
                 query_id=query_id,
                 batch_id=str(batch_id),
                 stage_count=int(st.session_state.trake_result_stage_count or stage_count),
-                results=results,
+                results=submission_results,
             )
             cached_export = {
                 "fingerprint": export_fingerprint,
@@ -3229,6 +4593,43 @@ def _codabench_row_count(data: bytes) -> int:
         return 0
 
 
+def _codabench_records(data: bytes) -> list[bytes]:
+    """Return exact logical CSV records from trusted staged bytes."""
+
+    text = data.decode("utf-8", errors="strict")
+    reader = csv.reader(io.StringIO(text, newline=""), strict=True)
+    line_numbers: list[int] = []
+    for row in reader:
+        if not row:
+            raise ValueError("empty CSV record")
+        line_numbers.append(reader.line_num)
+    lines = text.splitlines(keepends=True)
+    records: list[bytes] = []
+    start = 0
+    for stop in line_numbers:
+        records.append("".join(lines[start:stop]).encode("utf-8"))
+        start = stop
+    if not records or start != len(lines) or b"".join(records) != data:
+        raise ValueError("invalid staged CSV records")
+    return records
+
+
+def _staged_row_values(entry: dict[str, Any]) -> list[list[str]]:
+    data = entry.get("data")
+    if not isinstance(data, bytes):
+        return []
+    try:
+        return [
+            list(row)
+            for row in csv.reader(
+                io.StringIO(data.decode("utf-8"), newline=""),
+                strict=True,
+            )
+        ]
+    except (UnicodeDecodeError, csv.Error):
+        return []
+
+
 def _codabench_current_entry(
     workflow: str,
 ) -> dict[str, Any] | None:
@@ -3249,7 +4650,7 @@ def _codabench_current_entry(
     source_rows = {
         "kis": list(st.session_state.get("kis_pinned", ())),
         "qa": list(st.session_state.get("qa_pinned", ())),
-        "trake": list(st.session_state.get("trake_results", ())),
+        "trake": list(st.session_state.get("trake_pinned", ())),
     }[workflow]
     batch_ids = {
         str(row.get("batch_id"))
@@ -3287,7 +4688,300 @@ def _codabench_current_entry(
 
 
 def _codabench_filename(query_id: str, task: str) -> str:
-    return f"query-{query_id}-{task}.csv"
+    return codabench_query_filename(query_id, task)  # type: ignore[arg-type]
+
+
+def _normalized_codabench_query_id(value: Any) -> str | None:
+    try:
+        return normalize_codabench_query_id(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _stage_codabench_entry(
+    context: RuntimeContext,
+    *,
+    task: str,
+    query_id: str,
+    current: dict[str, Any],
+) -> str:
+    """Validate and persist one immutable entry through the FastAPI owner."""
+
+    normalized = normalize_codabench_query_id(query_id)
+    filename = _codabench_filename(normalized, task)
+    collision_id = codabench_query_id_collision_key(normalized)
+    staging = dict(st.session_state.get("codabench_staging", {}))
+    for existing_name, item in staging.items():
+        existing_id = item.get("query_id")
+        if not isinstance(existing_id, str):
+            continue
+        same_id = codabench_query_id_collision_key(existing_id) == collision_id
+        same_filename = existing_name.casefold() == filename.casefold()
+        if existing_name == filename:
+            continue
+        if same_id or same_filename:
+            raise ValueError("bundle_query_id_collision")
+    pending = {
+        **current,
+        "filename": filename,
+        "query_id": normalized,
+        "sha256": hashlib.sha256(current["data"]).hexdigest(),
+    }
+    stager = getattr(context, "stage_submission_entry", None)
+    if callable(stager):
+        try:
+            snapshot = stager(
+                {
+                    "expected_revision": int(
+                        st.session_state.get("codabench_staging_revision", 0)
+                    ),
+                    "batch_id": pending["batch_id"],
+                    "entry": {
+                        "task": pending["task"],
+                        "query_id": normalized,
+                        "csv_base64": base64.b64encode(pending["data"]).decode("ascii"),
+                        "source_fingerprint": pending["source_fingerprint"],
+                        "stage_count": pending.get("stage_count"),
+                        "source_ranks": pending.get("source_ranks"),
+                    },
+                }
+            )
+        except BackendError as error:
+            if error.code == "staging_revision_conflict":
+                loader = getattr(context, "load_submission_staging", None)
+                if callable(loader):
+                    _apply_codabench_staging_snapshot(loader())
+            raise
+        _apply_codabench_staging_snapshot(snapshot)
+    else:
+        staging[filename] = pending
+        st.session_state.codabench_staging = staging
+    errors = dict(st.session_state.get("codabench_entry_errors", {}))
+    errors.pop(filename, None)
+    st.session_state.codabench_entry_errors = errors
+    st.session_state.codabench_bundle_cache = None
+    return filename
+
+
+def _mutate_codabench_entry_rows(
+    context: RuntimeContext,
+    *,
+    filename: str,
+    action: str,
+    row_data: bytes | None = None,
+    rank: int | None = None,
+    target_rank: int | None = None,
+) -> None:
+    """Mutate one durable physical rank through the FastAPI trust boundary."""
+
+    staging = dict(st.session_state.get("codabench_staging", {}))
+    entry = staging.get(filename)
+    if not isinstance(entry, dict):
+        raise ValueError("staging_entry_not_found")
+    mutator = getattr(context, "mutate_submission_rows", None)
+    payload: dict[str, Any] = {
+        "action": action,
+        "expected_revision": int(st.session_state.get("codabench_staging_revision", 0)),
+    }
+    if row_data is not None:
+        if len(_codabench_records(row_data)) != 1:
+            raise ValueError("staging_row_invalid")
+        payload["row_csv_base64"] = base64.b64encode(row_data).decode("ascii")
+    if rank is not None:
+        payload["rank"] = rank
+    if target_rank is not None:
+        payload["target_rank"] = target_rank
+    if callable(mutator):
+        try:
+            snapshot = mutator(filename, payload)
+        except BackendError as error:
+            if error.code == "staging_revision_conflict":
+                loader = getattr(context, "load_submission_staging", None)
+                if callable(loader):
+                    _apply_codabench_staging_snapshot(loader())
+            raise
+        _apply_codabench_staging_snapshot(snapshot)
+    else:
+        records = _codabench_records(entry["data"])
+        incoming = None if row_data is None else _codabench_records(row_data)[0]
+        if action == "append" and incoming is not None:
+            if len(records) >= 100:
+                raise ValueError("staging_row_limit_exceeded")
+            records.append(incoming)
+        elif (
+            action == "update"
+            and incoming is not None
+            and isinstance(rank, int)
+            and not isinstance(rank, bool)
+            and 1 <= rank <= len(records)
+        ):
+            records[rank - 1] = incoming
+        elif (
+            action == "delete"
+            and isinstance(rank, int)
+            and not isinstance(rank, bool)
+            and 1 <= rank <= len(records)
+        ):
+            records.pop(rank - 1)
+        elif (
+            action == "move"
+            and isinstance(rank, int)
+            and not isinstance(rank, bool)
+            and isinstance(target_rank, int)
+            and not isinstance(target_rank, bool)
+            and 1 <= rank <= len(records)
+            and 1 <= target_rank <= len(records)
+        ):
+            record = records.pop(rank - 1)
+            records.insert(target_rank - 1, record)
+        else:
+            raise ValueError("staging_row_invalid")
+        if not records:
+            deleter = getattr(context, "delete_submission_entry", None)
+            if callable(deleter):
+                snapshot = deleter(
+                    filename,
+                    expected_revision=int(
+                        st.session_state.get("codabench_staging_revision", 0)
+                    ),
+                )
+                _apply_codabench_staging_snapshot(snapshot)
+            else:
+                staging.pop(filename, None)
+                st.session_state.codabench_staging = staging
+        else:
+            data = b"".join(records)
+            _stage_codabench_entry(
+                context,
+                task=str(entry["task"]),
+                query_id=str(entry["query_id"]),
+                current={
+                    "task": entry["task"],
+                    "batch_id": entry["batch_id"],
+                    "data": data,
+                    "source_fingerprint": hashlib.sha256(data).hexdigest(),
+                    "stage_count": entry.get("stage_count"),
+                    "row_count": len(records),
+                    "source_ranks": None,
+                },
+            )
+    errors = dict(st.session_state.get("codabench_entry_errors", {}))
+    errors.pop(filename, None)
+    st.session_state.codabench_entry_errors = errors
+    st.session_state.codabench_bundle_cache = None
+
+
+def _append_or_update_codabench_row(
+    context: RuntimeContext,
+    *,
+    task: str,
+    query_id: str,
+    current: dict[str, Any],
+    row_data: bytes,
+    update_rank: int | None = None,
+) -> str:
+    """Create a first row or append/replace one rank in an existing entry."""
+
+    normalized = normalize_codabench_query_id(query_id)
+    filename = _codabench_filename(normalized, task)
+    staged = st.session_state.get("codabench_staging", {}).get(filename)
+    if not isinstance(staged, dict):
+        if update_rank is not None:
+            raise ValueError("staging_entry_not_found")
+        first = dict(current)
+        first["data"] = row_data
+        first["row_count"] = 1
+        first["source_fingerprint"] = hashlib.sha256(row_data).hexdigest()
+        return _stage_codabench_entry(
+            context,
+            task=task,
+            query_id=normalized,
+            current=first,
+        )
+    if staged.get("task") != task or staged.get("batch_id") != current.get("batch_id"):
+        raise ValueError("bundle_query_id_collision")
+    if task == "trake" and staged.get("stage_count") != current.get("stage_count"):
+        raise ValueError("submission_stage_count_mismatch")
+    _mutate_codabench_entry_rows(
+        context,
+        filename=filename,
+        action="append" if update_rank is None else "update",
+        row_data=row_data,
+        rank=update_rank,
+    )
+    return filename
+
+
+def _apply_codabench_staging_snapshot(snapshot: dict[str, Any]) -> None:
+    """Hydrate safe session-state projections from an authoritative API snapshot."""
+
+    revision = snapshot.get("revision")
+    raw_entries = snapshot.get("entries")
+    if (
+        isinstance(revision, bool)
+        or not isinstance(revision, int)
+        or revision < 0
+        or not isinstance(raw_entries, dict)
+    ):
+        raise BackendError("backend_response_invalid")
+    hydrated: dict[str, dict[str, Any]] = {}
+    for filename, value in raw_entries.items():
+        if not isinstance(filename, str) or not isinstance(value, dict):
+            raise BackendError("backend_response_invalid")
+        try:
+            query_id, task = parse_codabench_query_filename(filename)
+            encoded = value["csv_base64"]
+            if not isinstance(encoded, str):
+                raise ValueError("invalid bytes")
+            data = base64.b64decode(encoded, validate=True)
+        except (KeyError, TypeError, ValueError):
+            raise BackendError("backend_response_invalid") from None
+        digest = value.get("sha256")
+        if (
+            value.get("query_id") != query_id
+            or value.get("task") != task
+            or not isinstance(digest, str)
+            or hashlib.sha256(data).hexdigest() != digest
+        ):
+            raise BackendError("backend_response_invalid")
+        hydrated[filename] = {
+            "filename": filename,
+            "task": task,
+            "query_id": query_id,
+            "batch_id": value.get("batch_id"),
+            "data": data,
+            "source_fingerprint": value.get("source_fingerprint"),
+            "stage_count": value.get("stage_count"),
+            "row_count": value.get("row_count"),
+            "source_ranks": (
+                tuple(value["source_ranks"])
+                if isinstance(value.get("source_ranks"), list)
+                else None
+            ),
+            "sha256": digest,
+            "updated_at_utc": value.get("updated_at_utc"),
+        }
+    st.session_state.codabench_staging = hydrated
+    st.session_state.codabench_staging_revision = revision
+    st.session_state.codabench_staging_updated_at = snapshot.get("updated_at_utc")
+    st.session_state.codabench_staging_hydrated = True
+    st.session_state.codabench_staging_error = None
+
+
+def _hydrate_submission_staging(context: RuntimeContext) -> None:
+    """Load disk-backed staging once for this browser session."""
+
+    if st.session_state.get("codabench_staging_hydrated"):
+        return
+    loader = getattr(context, "load_submission_staging", None)
+    if not callable(loader):
+        st.session_state.codabench_staging_hydrated = True
+        return
+    try:
+        _apply_codabench_staging_snapshot(loader())
+    except BackendError as error:
+        st.session_state.codabench_staging_hydrated = True
+        st.session_state.codabench_staging_error = error.code
 
 
 def _codabench_entry_status(
@@ -3302,12 +4996,111 @@ def _codabench_entry_status(
     active_query_id = str(st.session_state.get(f"codabench_query_id_{task}", "")).strip()
     if active_query_id != query_id:
         return "READY"
+    if task == "kis":
+        working = st.session_state.get("kis_working_fingerprint")
+        if not isinstance(working, str):
+            working = _kis_working_source_fingerprint()
+            st.session_state.kis_working_fingerprint = working
+        return (
+            "READY"
+            if isinstance(working, str) and working == entry.get("source_fingerprint")
+            else "STALE"
+        )
+
+    if task in {"qa", "trake"}:
+        # These workflows are managed as durable ranked lists. Their validated
+        # disk snapshot remains authoritative across F5 and candidate changes.
+        return "READY"
     current = current_by_task.get(task)
-    if not isinstance(current, dict) or current.get("source_fingerprint") != entry.get(
-        "source_fingerprint"
+    if not isinstance(current, dict):
+        return "READY"
+    current_data = current.get("data")
+    if not isinstance(current_data, bytes) or hashlib.sha256(current_data).hexdigest() != entry.get(
+        "sha256"
     ):
         return "STALE"
     return "READY"
+
+
+def _render_staged_rank_manager(
+    context: RuntimeContext,
+    *,
+    task: str,
+    query_id: str | None,
+) -> None:
+    """Render granular controls for an active QA or TRAKE ranked CSV."""
+
+    if task not in {"qa", "trake"} or query_id is None:
+        return
+    filename = _codabench_filename(query_id, task)
+    entry = st.session_state.get("codabench_staging", {}).get(filename)
+    if not isinstance(entry, dict):
+        return
+    rows = _staged_row_values(entry)
+    if not rows:
+        return
+    st.markdown(f"**Quản lý thứ hạng · `{filename}`**")
+    digest = str(entry.get("sha256", ""))[:10]
+    for rank, values in enumerate(rows, start=1):
+        if task == "qa" and len(values) == 3:
+            identity = f"{values[0]} · frame {values[1]}"
+            detail = f'“{values[2]}”'
+        elif task == "trake" and len(values) >= 3:
+            identity = values[0]
+            detail = " → ".join(values[1:])
+        else:
+            identity = "Dòng không hợp lệ"
+            detail = ""
+        rank_col, identity_col, detail_col, up_col, down_col, delete_col = st.columns(
+            (0.7, 1.7, 3.2, 0.55, 0.55, 0.8)
+        )
+        rank_col.markdown(f"`#{rank}`")
+        identity_col.caption(identity)
+        detail_col.caption(detail)
+        operation: tuple[str, int | None] | None = None
+        with up_col:
+            if st.button(
+                "⬆",
+                key=f"{task}_staged_up_{digest}_{rank}",
+                disabled=rank == 1,
+                help="Đưa lên một rank",
+            ):
+                operation = ("move", rank - 1)
+        with down_col:
+            if st.button(
+                "⬇",
+                key=f"{task}_staged_down_{digest}_{rank}",
+                disabled=rank == len(rows),
+                help="Đưa xuống một rank",
+            ):
+                operation = ("move", rank + 1)
+        with delete_col:
+            if st.button(
+                "🗑️",
+                key=f"{task}_staged_delete_{digest}_{rank}",
+                help="Xóa riêng rank này",
+            ):
+                operation = ("delete", None)
+        if operation is None:
+            continue
+        try:
+            action, destination = operation
+            _mutate_codabench_entry_rows(
+                context,
+                filename=filename,
+                action=action,
+                rank=rank,
+                target_rank=destination,
+            )
+        except BackendError as error:
+            if error.code == "staging_revision_conflict":
+                st.warning("Staging đã đổi ở tab khác; đã tải lại snapshot mới nhất.")
+            else:
+                st.warning("Không thể thay đổi rank; staging hợp lệ cũ được giữ nguyên.")
+        except (TypeError, ValueError):
+            st.warning("Rank được chọn không hợp lệ; staging chưa bị thay đổi.")
+        else:
+            st.rerun()
 
 
 def _render_codabench_submission_hub(context: RuntimeContext, active_workflow: str) -> None:
@@ -3319,6 +5112,10 @@ def _render_codabench_submission_hub(context: RuntimeContext, active_workflow: s
         "Profile `codabench_10187_2025`: ZIP chỉ chứa thư mục `submission/`. "
         "Không tự động tải dữ liệu lên Codabench."
     )
+    if st.session_state.get("codabench_staging_error"):
+        st.warning("Không thể tải staging bền vững; dữ liệu trên đĩa chưa bị thay đổi.")
+    else:
+        st.success("💾 Persistent State: Active · Preserved on F5 / Refresh")
     columns = st.columns(3)
     for column, task, label in zip(
         columns,
@@ -3326,55 +5123,63 @@ def _render_codabench_submission_hub(context: RuntimeContext, active_workflow: s
         ("KIS", "Visual Q&A", "TRAKE"),
     ):
         with column:
-            st.text_input(
-                f"Query ID nộp bài · {label}",
-                key=f"codabench_query_id_{task}",
-                placeholder="Ví dụ: 01",
-            )
+            if task == active_workflow and task in {"qa", "trake"}:
+                active_id = str(
+                    st.session_state.get(f"codabench_query_id_{task}", "")
+                ).strip()
+                st.caption(
+                    f"Query ID nộp bài · {label}: `{active_id or 'chưa nhập'}`"
+                )
+            else:
+                st.text_input(
+                    f"Query ID nộp bài · {label}",
+                    key=f"codabench_query_id_{task}",
+                    placeholder="Ví dụ: p1-1, p1-15, 01, round1_01",
+                )
 
     current_by_task = {
         task: _codabench_current_entry(task) for task in ("kis", "qa", "trake")
     }
-    query_id = str(
+    raw_query_id = str(
         st.session_state.get(f"codabench_query_id_{active_workflow}", "")
     ).strip()
+    query_id = _normalized_codabench_query_id(raw_query_id)
     current = current_by_task[active_workflow]
-    stage_disabled = not query_id.isdigit() or not 1 <= len(query_id) <= 32 or current is None
-    if st.button(
-        f"Thêm/cập nhật truy vấn {active_workflow.upper()} hiện tại",
-        key="codabench_stage_current",
-        disabled=stage_disabled,
-        width="stretch",
-    ):
-        assert current is not None
-        filename = _codabench_filename(query_id, active_workflow)
-        staging = dict(st.session_state.get("codabench_staging", {}))
-        duplicate = next(
-            (
-                item
-                for name, item in staging.items()
-                if name != filename and str(item.get("query_id")) == query_id
-            ),
-            None,
-        )
-        if duplicate is not None:
-            st.error("Query ID này đã được dùng cho một workflow khác trong bundle.")
-        else:
-            staging[filename] = {
-                **current,
-                "filename": filename,
-                "query_id": query_id,
-                "sha256": hashlib.sha256(current["data"]).hexdigest(),
-            }
-            st.session_state.codabench_staging = staging
-            errors = dict(st.session_state.get("codabench_entry_errors", {}))
-            errors.pop(filename, None)
-            st.session_state.codabench_entry_errors = errors
-            st.session_state.codabench_bundle_cache = None
-            st.rerun()
-    if stage_disabled:
+    stage_disabled = query_id is None or current is None
+    if active_workflow == "kis":
+        if st.button(
+            "Thêm/cập nhật truy vấn KIS hiện tại",
+            key="codabench_stage_current",
+            disabled=stage_disabled,
+            width="stretch",
+        ):
+            assert current is not None
+            assert query_id is not None
+            try:
+                _stage_codabench_entry(
+                    context,
+                    task=active_workflow,
+                    query_id=query_id,
+                    current=current,
+                )
+            except BackendError as error:
+                if error.code == "staging_revision_conflict":
+                    st.warning("Staging đã đổi ở tab khác; snapshot mới nhất đã được tải lại.")
+                else:
+                    st.warning("CSV chưa được lưu vì preflight hoặc staging backend từ chối.")
+            except ValueError:
+                st.error("Query ID này đã được dùng cho một workflow khác trong bundle.")
+            else:
+                st.rerun()
+    else:
         st.caption(
-            "Nhập Query ID dạng số và chuẩn bị CSV hợp lệ trong workflow hiện tại trước khi stage."
+            "Dùng nút ghim trong workflow để nối thêm hoặc cập nhật từng rank; "
+            "Hub không ghi đè toàn bộ bảng xếp hạng QA/TRAKE."
+        )
+    if active_workflow == "kis" and stage_disabled:
+        st.caption(
+            "Nhập Query ID gồm 1–32 chữ ASCII, số, dấu gạch dưới hoặc gạch nối; "
+            "đồng thời chuẩn bị CSV hợp lệ trước khi stage."
         )
 
     staging = dict(st.session_state.get("codabench_staging", {}))
@@ -3389,16 +5194,30 @@ def _render_codabench_submission_hub(context: RuntimeContext, active_workflow: s
             "Trạng thái": statuses[name],
             "Số dòng": entry.get("row_count"),
             "Số stage": entry.get("stage_count"),
+            "Preview": (
+                entry["data"].decode("utf-8").splitlines()[0]
+                if entry.get("task") == "qa"
+                and isinstance(entry.get("data"), bytes)
+                and entry["data"]
+                else None
+            ),
         }
         for name, entry in sorted(
-            staging.items(), key=lambda item: (int(str(item[1]["query_id"])), item[0])
+            staging.items(),
+            key=lambda item: (
+                codabench_query_id_sort_key(str(item[1]["query_id"])),
+                item[0].casefold(),
+                item[0],
+            ),
         )
     ]
     for task in ("kis", "qa", "trake"):
-        task_query_id = str(st.session_state.get(f"codabench_query_id_{task}", "")).strip()
+        task_query_id = _normalized_codabench_query_id(
+            st.session_state.get(f"codabench_query_id_{task}", "")
+        )
         expected_name = (
             _codabench_filename(task_query_id, task)
-            if task_query_id.isdigit()
+            if task_query_id is not None
             else f"query-<id>-{task}.csv"
         )
         if expected_name in staging:
@@ -3419,23 +5238,74 @@ def _render_codabench_submission_hub(context: RuntimeContext, active_workflow: s
                     if isinstance(current_task_entry, dict)
                     else None
                 ),
+                "Preview": None,
             }
         )
     st.dataframe(matrix_rows, width="stretch", hide_index=True)
+    _render_staged_rank_manager(
+        context,
+        task=active_workflow,
+        query_id=query_id,
+    )
     if staging:
         remove_name = st.selectbox(
             "Entry cần xóa khỏi staging",
             tuple(sorted(staging)),
             key="codabench_remove_entry",
         )
-        if st.button("Xóa entry đã chọn", key="codabench_remove"):
-            staging.pop(remove_name, None)
-            st.session_state.codabench_staging = staging
-            errors = dict(st.session_state.get("codabench_entry_errors", {}))
-            errors.pop(remove_name, None)
-            st.session_state.codabench_entry_errors = errors
-            st.session_state.codabench_bundle_cache = None
-            st.rerun()
+        remove_column, clear_column = st.columns(2)
+        with remove_column:
+            if st.button("Xóa entry đã chọn", key="codabench_remove", width="stretch"):
+                deleter = getattr(context, "delete_submission_entry", None)
+                try:
+                    if callable(deleter):
+                        snapshot = deleter(
+                            remove_name,
+                            expected_revision=int(
+                                st.session_state.get("codabench_staging_revision", 0)
+                            ),
+                        )
+                        _apply_codabench_staging_snapshot(snapshot)
+                    else:
+                        staging.pop(remove_name, None)
+                        st.session_state.codabench_staging = staging
+                    errors = dict(st.session_state.get("codabench_entry_errors", {}))
+                    errors.pop(remove_name, None)
+                    st.session_state.codabench_entry_errors = errors
+                    st.session_state.codabench_bundle_cache = None
+                    st.rerun()
+                except BackendError as error:
+                    if error.code == "staging_revision_conflict":
+                        loader = getattr(context, "load_submission_staging", None)
+                        if callable(loader):
+                            _apply_codabench_staging_snapshot(loader())
+                    st.warning("Không thể xóa entry; staging mới nhất đã được giữ nguyên.")
+        with clear_column:
+            if st.button(
+                "🗑️ Xóa tất cả & Khôi phục mặc định",
+                key="codabench_clear_all",
+                width="stretch",
+            ):
+                clearer = getattr(context, "clear_submission_staging", None)
+                try:
+                    if callable(clearer):
+                        snapshot = clearer(
+                            expected_revision=int(
+                                st.session_state.get("codabench_staging_revision", 0)
+                            )
+                        )
+                        _apply_codabench_staging_snapshot(snapshot)
+                    else:
+                        st.session_state.codabench_staging = {}
+                    st.session_state.codabench_entry_errors = {}
+                    st.session_state.codabench_bundle_cache = None
+                    st.rerun()
+                except BackendError as error:
+                    if error.code == "staging_revision_conflict":
+                        loader = getattr(context, "load_submission_staging", None)
+                        if callable(loader):
+                            _apply_codabench_staging_snapshot(loader())
+                    st.warning("Không thể xóa staging; dữ liệu hiện có vẫn được giữ nguyên.")
     else:
         st.info("Chưa có CSV nào trong staging.")
 
@@ -3453,7 +5323,7 @@ def _render_codabench_submission_hub(context: RuntimeContext, active_workflow: s
     selected: list[dict[str, Any]] = []
     if mode == "all":
         selected = list(staging.values())
-    elif query_id.isdigit():
+    elif query_id is not None:
         selected_name = _codabench_filename(query_id, active_workflow)
         if selected_name in staging:
             selected = [staging[selected_name]]
@@ -3475,26 +5345,36 @@ def _render_codabench_submission_hub(context: RuntimeContext, active_workflow: s
         if not callable(builder):
             st.error("Backend hiện tại chưa hỗ trợ tạo Codabench bundle.")
         else:
-            payload_entries = [
-                {
-                    "task": entry["task"],
-                    "query_id": entry["query_id"],
-                    "csv_base64": base64.b64encode(entry["data"]).decode("ascii"),
-                    "source_fingerprint": entry["source_fingerprint"],
-                    "stage_count": entry.get("stage_count"),
-                    "source_ranks": entry.get("source_ranks"),
-                }
-                for entry in selected
-            ]
+            persistent_backend = callable(
+                getattr(context, "load_submission_staging", None)
+            )
+            payload_entries = None
+            if not persistent_backend:
+                payload_entries = [
+                    {
+                        "task": entry["task"],
+                        "query_id": entry["query_id"],
+                        "csv_base64": base64.b64encode(entry["data"]).decode("ascii"),
+                        "source_fingerprint": entry["source_fingerprint"],
+                        "stage_count": entry.get("stage_count"),
+                        "source_ranks": entry.get("source_ranks"),
+                    }
+                    for entry in selected
+                ]
             try:
                 with st.spinner("Đang kiểm tra CSV và tạo Codabench archive..."):
-                    result = builder(
-                        {
-                            "mode": mode,
-                            "batch_id": next(iter(batch_ids)),
-                            "entries": payload_entries,
-                        }
-                    )
+                    bundle_payload: dict[str, Any] = {
+                        "mode": mode,
+                        "batch_id": next(iter(batch_ids)),
+                    }
+                    if persistent_backend:
+                        bundle_payload["entry_filenames"] = sorted(selected_names)
+                        bundle_payload["staging_revision"] = int(
+                            st.session_state.get("codabench_staging_revision", 0)
+                        )
+                    else:
+                        bundle_payload["entries"] = payload_entries
+                    result = builder(bundle_payload)
                 st.session_state.codabench_bundle_cache = result
                 st.session_state.codabench_entry_errors = {}
             except BackendError as error:
@@ -3557,6 +5437,13 @@ def render_app(context: RuntimeContext) -> None:
     inject_cyberpunk_theme()
     try:
         _initialize_state()
+        pending_workflow = st.session_state.pop("_pending_active_workflow", None)
+        if pending_workflow in {"kis", "qa", "trake"}:
+            st.session_state.active_workflow = pending_workflow
+        _render_recovery_control()
+        if _render_runtime_contract_block(context):
+            return
+        _hydrate_submission_staging(context)
         st.markdown(
             render_hud_header(
                 "SYSTEM ONLINE // AIC 2026",
@@ -3603,7 +5490,26 @@ def main() -> None:
 
     _install_windows_asyncio_log_filter()
     injected = st.session_state.get("_aic_runtime_override")
-    context = injected if injected is not None else _runtime()
+    if injected is not None:
+        context = injected
+    else:
+        try:
+            context = _runtime()
+        except BackendError:
+            st.set_page_config(
+                page_title="AIC 2026 - Backend chưa sẵn sàng",
+                page_icon="⚠️",
+                layout="wide",
+                initial_sidebar_state="auto",
+            )
+            inject_cyberpunk_theme()
+            _initialize_state()
+            _render_recovery_control()
+            st.error(
+                "Không thể kết nối FastAPI tại thời điểm này. "
+                "Hãy kiểm tra stack rồi tải lại trang; dữ liệu Codabench trong phiên không bị xóa."
+            )
+            return
     if injected is None:
         logging_config = context.config.get("logging", {})
         configure_app_error_logging(

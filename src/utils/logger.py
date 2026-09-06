@@ -125,16 +125,30 @@ def configure_app_error_logging(
             except ValueError:
                 pass
         path.parent.mkdir(parents=True, exist_ok=True)
-        _APP_ERROR_HANDLER_ID = _loguru_logger.add(
-            str(path),
-            level="ERROR",
-            rotation=rotation,
-            retention="30 days",
-            enqueue=True,
-            backtrace=True,
-            diagnose=False,
-            serialize=True,
-        )
+        sink_options = {
+            "level": "ERROR",
+            "rotation": rotation,
+            "retention": "30 days",
+            "backtrace": True,
+            "diagnose": False,
+            "serialize": True,
+        }
+        try:
+            _APP_ERROR_HANDLER_ID = _loguru_logger.add(
+                str(path),
+                enqueue=True,
+                **sink_options,
+            )
+        except PermissionError:
+            # Restricted Windows hosts can deny the named pipe used by
+            # multiprocessing.SimpleQueue.  Error logging must not prevent the
+            # Streamlit application from starting, so retain the same durable
+            # sink without the background queue on those hosts.
+            _APP_ERROR_HANDLER_ID = _loguru_logger.add(
+                str(path),
+                enqueue=False,
+                **sink_options,
+            )
         _APP_ERROR_HANDLER_PATH = path
     return path
 

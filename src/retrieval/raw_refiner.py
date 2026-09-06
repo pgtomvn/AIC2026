@@ -515,6 +515,7 @@ class LocalFrameRefiner:
                             continue
                         item = dict(candidate)
                         item["coarse_source_frame_idx"] = item["source_frame_idx"]
+                        item.pop("_object_assignments", None)
                         item["source_frame_idx"] = stored.source_frame_idx
                         item["timestamp_ms"] = stored.timestamp_ms
                         item["pts"] = stored.pts
