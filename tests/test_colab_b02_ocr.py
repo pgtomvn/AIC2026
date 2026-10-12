@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import zipfile
+from pathlib import Path
 
 import pytest
 from PIL import Image
@@ -13,6 +14,12 @@ from scripts.build_b02_ocr_notebooks import build
 from scripts.colab_b02_ocr import pilot_selection, run_worker, validate_checkpoint
 from src.extraction.vietocr_engine import VIETOCR_REVISION, VietOCREngine
 from src.ingest.cloud_artifacts import _atomic_json, _stable_json_hash
+
+P0_DIR = Path(__file__).resolve().parents[1] / "outputs" / "checkpoints" / "b02-p0"
+P0_MANIFEST = P0_DIR / "b02-p0-manifest-v3.json"
+requires_p0_manifest = pytest.mark.skipif(
+    not P0_MANIFEST.is_file(), reason="needs the local B02 P0 manifest (generated data, not in Git)"
+)
 
 
 class FakeEngine:
@@ -123,6 +130,7 @@ def test_frozen_assets_are_verified_without_loading_models(tmp_path):
         VietOCREngine(tmp_path).identity
 
 
+@requires_p0_manifest
 def test_notebooks_have_three_code_cells_frozen_bundle_and_no_secrets(tmp_path):
     report = build(tmp_path)
     import ast

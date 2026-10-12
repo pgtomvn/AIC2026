@@ -11,6 +11,12 @@ from scripts.build_b02_asr_ms_notebook import build
 from scripts.colab_video_asr import inventory_b02_ms
 from src.ingest.cloud_artifacts import _stable_json_hash
 
+P0_DIR = Path(__file__).resolve().parents[1] / "outputs" / "checkpoints" / "b02-p0"
+P0_MANIFEST = P0_DIR / "b02-p0-manifest-v3.json"
+requires_p0_manifest = pytest.mark.skipif(
+    not P0_MANIFEST.is_file(), reason="needs the local B02 P0 manifest (generated data, not in Git)"
+)
+
 
 def sources(tmp_path):
     videos = {f"M01_V{i:03}": {} for i in range(1, 305)}
@@ -50,6 +56,7 @@ def test_missing_ms_source_and_unexpected_video_fail_closed(tmp_path):
         inventory_b02_ms(tmp_path, manifest, 1)
 
 
+@requires_p0_manifest
 def test_three_cells_cpu_one_video_new_namespace(tmp_path):
     report = build(tmp_path)
     assert hashlib.sha256(Path(report["bundle"]).read_bytes()).hexdigest() == report["source_sha256"]
