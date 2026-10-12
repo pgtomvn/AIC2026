@@ -8,15 +8,6 @@ A multimodal video search system for the **Ho Chi Minh City AI Challenge 2026** 
 Given a natural-language description (Vietnamese or English), it finds the exact video moment,
 answers questions about a frame, and aligns multi-step events across a video timeline.
 
-> Hệ thống truy vấn video đa phương thức cho cuộc thi AI Challenge TP.HCM 2026: tìm khoảnh khắc
-> trong video bằng mô tả văn bản, hỏi đáp trên khung hình, và căn chỉnh chuỗi sự kiện theo thời gian.
-
-> [!NOTE]
-> This is an actively developed competition codebase, not a turnkey product. Scoring adapters
-> follow the historical 2025 rules and are versioned so they can be replaced once the official
-> 2026 schema is published. Models, datasets, and search indexes are **not** included in the
-> repository and must be prepared locally.
-
 ## Features
 
 The system supports three competition workflows over a shared runtime:
