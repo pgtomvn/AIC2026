@@ -400,7 +400,6 @@ class TranslationCache:
 
     def get(self, cache_key: str, model_fingerprint: str) -> str | None:
         self.initialize()
-        now = time.time()
         with self._lock, sqlite3.connect(self.path, timeout=1.0) as connection:
             connection.execute("PRAGMA busy_timeout=1000")
             row = connection.execute(
@@ -412,16 +411,16 @@ class TranslationCache:
                 return None
             connection.execute(
                 "UPDATE query_translations SET last_accessed_at = ? WHERE cache_key = ?",
-                (now, cache_key),
+                (self._access_stamp(connection), cache_key),
             )
             connection.commit()
             return str(row[0])
 
     def put(self, cache_key: str, english_text: str, model_fingerprint: str) -> None:
         self.initialize()
-        now = time.time()
         with self._lock, sqlite3.connect(self.path, timeout=1.0) as connection:
             connection.execute("PRAGMA busy_timeout=1000")
+            now = self._access_stamp(connection)
             connection.execute(
                 """
                 INSERT INTO query_translations(
@@ -444,6 +443,14 @@ class TranslationCache:
                 (self.max_entries,),
             )
             connection.commit()
+
+    @staticmethod
+    def _access_stamp(connection: sqlite3.Connection) -> float:
+        """Return a strictly increasing access time so LRU order survives coarse clocks."""
+        sql = "SELECT MAX(last_accessed_at) FROM query_translations"
+        (latest,) = connection.execute(sql).fetchone()
+        now = time.time()
+        return now if latest is None or now > latest else latest + 1e-6
 
 
 class OfflineVietnameseTranslator:
