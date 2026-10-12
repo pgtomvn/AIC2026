@@ -550,6 +550,12 @@ def main() -> int:
         raise RuntimeError("initial KIS view incorrectly reports an empty completed search")
     if not any("run_app-v2" in value for value in _messages(app.caption)):
         raise RuntimeError("canonical launch identity is not visible")
+    collapsed = {block.label: block.proto.expanded for block in app.get("expander")}
+    for label in ("Tùy chọn tìm kiếm", "Bài nộp · CSV / ZIP"):
+        if collapsed.get(label) is not False:
+            raise RuntimeError(f"secondary controls should start collapsed: {label}")
+    if any("Nhập mô tả và chọn Tìm kiếm" in value for value in _messages(app.caption)):
+        raise RuntimeError("redundant initial KIS tutorial is still visible")
     app.text_area(key="query_text").set_value(
         "CLB FANA tổ chức từ thiện tại tỉnh Khánh Hòa"
     )

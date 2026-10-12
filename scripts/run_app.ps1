@@ -246,7 +246,9 @@ $env:OLLAMA_MODELS = Join-Path $ProjectRoot "models/ollama"
 $env:OLLAMA_NO_CLOUD = "1"
 if (-not $env:OLLAMA_LLM_LIBRARY) {
     $configuredLibrary = Get-LocalEnvValue -Name "OLLAMA_LLM_LIBRARY"
-    $env:OLLAMA_LLM_LIBRARY = if ($configuredLibrary) { $configuredLibrary } else { "vulkan" }
+    # Let Ollama discover CUDA/Vulkan unless the operator explicitly selects one.
+    # Forcing Vulkan can silently disable a usable CUDA device on hybrid laptops.
+    if ($configuredLibrary) { $env:OLLAMA_LLM_LIBRARY = $configuredLibrary }
 }
 
 if ($IsWindowsHost) {

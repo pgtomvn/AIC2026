@@ -69,7 +69,7 @@ class BatchArtifactCounts:
     text_segments_by_kind: dict[str, int] = field(default_factory=dict)
 
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 _BASE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS canonical_frames (
     batch_id TEXT NOT NULL,
@@ -172,7 +172,28 @@ CREATE INDEX IF NOT EXISTS idx_raw_refined_frames_timestamp
 ON raw_refined_frames(batch_id, video_id, timestamp_ms, source_frame_idx);
 """
 
-_SCHEMA = _BASE_SCHEMA + _REFINED_SCHEMA
+_ORDINAL_SCHEMA = """
+CREATE TABLE IF NOT EXISTS canonical_ordinal_frames (
+    batch_id TEXT NOT NULL,
+    video_id TEXT NOT NULL,
+    keyframe_ordinal INTEGER NOT NULL CHECK (keyframe_ordinal >= 1),
+    source_frame_idx INTEGER NOT NULL CHECK (source_frame_idx >= 0),
+    timestamp_ms INTEGER NOT NULL CHECK (timestamp_ms >= 0),
+    record_json TEXT NOT NULL,
+    artifact_fingerprint TEXT NOT NULL,
+    record_fingerprint TEXT NOT NULL,
+    index_ready INTEGER NOT NULL DEFAULT 0 CHECK (index_ready IN (0, 1)),
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (batch_id, video_id, keyframe_ordinal)
+);
+CREATE INDEX IF NOT EXISTS idx_canonical_ordinal_frames_timestamp
+ON canonical_ordinal_frames(batch_id, video_id, timestamp_ms, keyframe_ordinal);
+CREATE INDEX IF NOT EXISTS idx_canonical_ordinal_frames_ready
+ON canonical_ordinal_frames(index_ready, batch_id, video_id, keyframe_ordinal);
+"""
+
+_SCHEMA = _BASE_SCHEMA + _REFINED_SCHEMA + _ORDINAL_SCHEMA
 
 
 def _require_nonempty(value: str, name: str) -> str:
@@ -260,14 +281,18 @@ class ArtifactRepository:
             connection.row_factory = sqlite3.Row
             connection.execute(f"PRAGMA busy_timeout={self.busy_timeout_ms:d}")
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version not in (0, 1, _SCHEMA_VERSION):
+            if version not in (0, 1, 2, _SCHEMA_VERSION):
                 raise ArtifactRepositoryError(
                     "Unsupported artifact schema version "
-                    f"{version}; expected 0, 1, or {_SCHEMA_VERSION}"
+                    f"{version}; expected 0, 1, 2, or {_SCHEMA_VERSION}"
                 )
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA foreign_keys=ON")
-            schema = _SCHEMA if version in (0, _SCHEMA_VERSION) else _REFINED_SCHEMA
+            schema = (
+                _SCHEMA
+                if version in (0, _SCHEMA_VERSION)
+                else (_REFINED_SCHEMA + _ORDINAL_SCHEMA if version == 1 else _ORDINAL_SCHEMA)
+            )
             connection.executescript(
                 f"BEGIN IMMEDIATE;\n{schema}\nPRAGMA user_version = {_SCHEMA_VERSION};\nCOMMIT;"
             )
@@ -340,6 +365,26 @@ class ArtifactRepository:
                 )
             prepared_by_identity[identity] = prepared
             ordinals[ordinal_identity] = identity
+        return tuple(prepared_by_identity.values())
+
+    @staticmethod
+    def _prepare_ordinal_frames(
+        records: Iterable[FrameRecord], fingerprint: str | None
+    ) -> tuple[_PreparedFrame, ...]:
+        prepared_by_identity: dict[tuple[str, str, int], _PreparedFrame] = {}
+        for record in records:
+            if not isinstance(record, FrameRecord):
+                raise TypeError("records must contain only FrameRecord instances")
+            prepared = _PreparedFrame(
+                record=record,
+                artifact_fingerprint=_frame_processing_fingerprint(record, fingerprint),
+                record_fingerprint=_content_fingerprint(record),
+            )
+            identity = (record.batch_id, record.video_id, record.keyframe_ordinal)
+            previous = prepared_by_identity.get(identity)
+            if previous is not None and previous != prepared:
+                raise ArtifactConflictError(f"Conflicting ordinal frame identity {identity!r} in input")
+            prepared_by_identity[identity] = prepared
         return tuple(prepared_by_identity.values())
 
     @staticmethod
@@ -563,6 +608,18 @@ class ArtifactRepository:
         inserted = unchanged = readiness_changed = 0
         timestamp = time.time()
         with self._transaction() as connection:
+            for batch_id, video_id in {
+                (item.record.batch_id, item.record.video_id) for item in prepared_records
+            }:
+                ordinal_mode = connection.execute(
+                    """SELECT 1 FROM canonical_ordinal_frames
+                    WHERE batch_id = ? AND video_id = ? LIMIT 1""",
+                    (batch_id, video_id),
+                ).fetchone()
+                if ordinal_mode is not None:
+                    raise ArtifactConflictError(
+                        f"{batch_id}/{video_id} already uses ordinal frame identity"
+                    )
             for prepared in prepared_records:
                 record = prepared.record
                 existing = connection.execute(
@@ -629,6 +686,86 @@ class ArtifactRepository:
                     record.video_id,
                     record.keyframe_ordinal,
                     record.source_frame_idx,
+                )
+                inserted += 1
+        return UpsertResult(inserted, unchanged, readiness_changed)
+
+    def upsert_ordinal_frames(
+        self,
+        records: Iterable[FrameRecord],
+        *,
+        fingerprint: str | None = None,
+        index_ready: bool = False,
+    ) -> UpsertResult:
+        """Persist every organizer keyframe under its ordinal, including repeated source indices.
+
+        This separate identity path keeps legacy source-frame rows and their
+        foreign keys unchanged. Processing or content conflicts roll back the
+        whole call; matching retries are idempotent.
+        """
+
+        if not isinstance(index_ready, bool):
+            raise TypeError("index_ready must be a boolean")
+        prepared_records = self._prepare_ordinal_frames(records, fingerprint)
+        inserted = unchanged = readiness_changed = 0
+        timestamp = time.time()
+        with self._transaction() as connection:
+            for batch_id, video_id in {
+                (item.record.batch_id, item.record.video_id) for item in prepared_records
+            }:
+                source_mode = connection.execute(
+                    """SELECT 1 FROM canonical_frames
+                    WHERE batch_id = ? AND video_id = ? LIMIT 1""",
+                    (batch_id, video_id),
+                ).fetchone()
+                if source_mode is not None:
+                    raise ArtifactConflictError(
+                        f"{batch_id}/{video_id} already uses source-frame identity"
+                    )
+            for prepared in prepared_records:
+                record = prepared.record
+                identity = (record.batch_id, record.video_id, record.keyframe_ordinal)
+                existing = connection.execute(
+                    """SELECT artifact_fingerprint, record_fingerprint, index_ready
+                    FROM canonical_ordinal_frames
+                    WHERE batch_id = ? AND video_id = ? AND keyframe_ordinal = ?""",
+                    identity,
+                ).fetchone()
+                if existing is not None:
+                    self._check_existing(
+                        existing,
+                        artifact_fingerprint=prepared.artifact_fingerprint,
+                        record_fingerprint=prepared.record_fingerprint,
+                        description=f"Ordinal frame {identity!r}",
+                    )
+                    if bool(existing["index_ready"]) != index_ready:
+                        connection.execute(
+                            """UPDATE canonical_ordinal_frames
+                            SET index_ready = ?, updated_at = ?
+                            WHERE batch_id = ? AND video_id = ? AND keyframe_ordinal = ?""",
+                            (int(index_ready), timestamp, *identity),
+                        )
+                        readiness_changed += 1
+                    else:
+                        unchanged += 1
+                    continue
+                connection.execute(
+                    """INSERT INTO canonical_ordinal_frames(
+                        batch_id, video_id, keyframe_ordinal, source_frame_idx,
+                        timestamp_ms, record_json, artifact_fingerprint,
+                        record_fingerprint, index_ready, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        *identity,
+                        record.source_frame_idx,
+                        record.timestamp_ms,
+                        _canonical_json(record),
+                        prepared.artifact_fingerprint,
+                        prepared.record_fingerprint,
+                        int(index_ready),
+                        timestamp,
+                        timestamp,
+                    ),
                 )
                 inserted += 1
         return UpsertResult(inserted, unchanged, readiness_changed)
@@ -1000,6 +1137,15 @@ class ArtifactRepository:
 
         timestamp = time.time()
         with self._transaction() as connection:
+            if connection.execute(
+                """SELECT 1 FROM canonical_ordinal_frames
+                WHERE batch_id = ? AND video_id = ? LIMIT 1""",
+                (batch_id, video_id),
+            ).fetchone() is not None:
+                raise ArtifactConflictError(
+                    f"{batch_id}/{video_id} uses ordinal frame identity; "
+                    "source-frame replacement is unavailable"
+                )
             existing_frame_count = int(
                 connection.execute(
                     """
@@ -1085,6 +1231,136 @@ class ArtifactRepository:
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise RepositoryCorruptionError("Invalid canonical frame row") from exc
+
+    @staticmethod
+    def _ordinal_frame_from_row(row: sqlite3.Row) -> FrameRecord:
+        try:
+            record = FrameRecord.from_dict(json.loads(row["record_json"]))
+            if (
+                record.batch_id != row["batch_id"]
+                or record.video_id != row["video_id"]
+                or record.keyframe_ordinal != row["keyframe_ordinal"]
+                or record.source_frame_idx != row["source_frame_idx"]
+                or record.timestamp_ms != row["timestamp_ms"]
+                or _content_fingerprint(record) != row["record_fingerprint"]
+            ):
+                raise ValueError("ordinal frame columns and record disagree")
+            return record
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RepositoryCorruptionError("Invalid canonical ordinal frame row") from exc
+
+    def get_ordinal_frame(
+        self, batch_id: str, video_id: str, keyframe_ordinal: int
+    ) -> FrameRecord | None:
+        """Return one exact keyframe; source-frame and PTS collisions are allowed."""
+
+        _require_nonempty(batch_id, "batch_id")
+        _require_nonempty(video_id, "video_id")
+        if (
+            isinstance(keyframe_ordinal, bool)
+            or not isinstance(keyframe_ordinal, int)
+            or keyframe_ordinal < 1
+        ):
+            raise ValueError("keyframe_ordinal must be a positive integer")
+        with closing(self._connection()) as connection:
+            row = connection.execute(
+                """SELECT * FROM canonical_ordinal_frames
+                WHERE batch_id = ? AND video_id = ? AND keyframe_ordinal = ?""",
+                (batch_id, video_id, keyframe_ordinal),
+            ).fetchone()
+        return None if row is None else self._ordinal_frame_from_row(row)
+
+    def get_trake_frame(
+        self, batch_id: str, video_id: str, source_frame_idx: int, *, timestamp_ms: int
+    ) -> FrameRecord | None:
+        """Resolve TRAKE evidence by exact source/PTS; never guess an ordinal."""
+        from src.retrieval.trake_scope import trake_video_allowed
+
+        if not trake_video_allowed(batch_id, video_id):
+            return None
+        if batch_id != "aic26-b2":
+            frame = self.get_source_frame(batch_id, video_id, source_frame_idx)
+            return frame if frame is not None and frame.timestamp_ms == timestamp_ms else None
+        if any(isinstance(x, bool) or not isinstance(x, int) or x < 0
+               for x in (source_frame_idx, timestamp_ms)):
+            raise ValueError("invalid TRAKE coordinates")
+        with closing(self._connection()) as connection:
+            rows = connection.execute(
+                """SELECT * FROM canonical_ordinal_frames
+                WHERE batch_id = ? AND video_id = ? AND source_frame_idx = ?
+                    AND timestamp_ms = ? LIMIT 2""",
+                (batch_id, video_id, source_frame_idx, timestamp_ms),
+            ).fetchall()
+        return self._ordinal_frame_from_row(rows[0]) if len(rows) == 1 else None
+
+    def iter_ordinal_frames(
+        self,
+        *,
+        batch_id: str | None = None,
+        video_id: str | None = None,
+        index_ready_only: bool = False,
+    ) -> Iterator[FrameRecord]:
+        """Iterate all ordinal frames in organizer order, retaining equal PTS rows."""
+
+        if video_id is not None and batch_id is None:
+            raise ValueError("video_id requires batch_id")
+        if batch_id is not None:
+            _require_nonempty(batch_id, "batch_id")
+        if video_id is not None:
+            _require_nonempty(video_id, "video_id")
+        if not isinstance(index_ready_only, bool):
+            raise TypeError("index_ready_only must be a boolean")
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        if batch_id is not None:
+            clauses.append("batch_id = ?")
+            parameters.append(batch_id)
+        if video_id is not None:
+            clauses.append("video_id = ?")
+            parameters.append(video_id)
+        if index_ready_only:
+            clauses.append("index_ready = 1")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        query = f"""SELECT * FROM canonical_ordinal_frames {where}
+            ORDER BY batch_id, video_id, keyframe_ordinal"""
+
+        def generate() -> Iterator[FrameRecord]:
+            with closing(self._connection()) as connection:
+                for row in connection.execute(query, parameters):
+                    yield self._ordinal_frame_from_row(row)
+
+        return generate()
+
+    def count_ordinal_frames(self, batch_id: str, *, video_id: str | None = None) -> int:
+        """Count distinct organizer keyframes without collapsing source indices or PTS."""
+
+        _require_nonempty(batch_id, "batch_id")
+        parameters: list[Any] = [batch_id]
+        query = "SELECT COUNT(*) FROM canonical_ordinal_frames WHERE batch_id = ?"
+        if video_id is not None:
+            _require_nonempty(video_id, "video_id")
+            query += " AND video_id = ?"
+            parameters.append(video_id)
+        with closing(self._connection()) as connection:
+            return int(connection.execute(query, parameters).fetchone()[0])
+
+    def nearest_ordinal_frame(
+        self, batch_id: str, video_id: str, timestamp_ms: int
+    ) -> FrameRecord | None:
+        """Resolve a time to one keyframe, breaking equal-PTS ties by ordinal."""
+
+        _require_nonempty(batch_id, "batch_id")
+        _require_nonempty(video_id, "video_id")
+        _require_nonnegative_int(timestamp_ms, "timestamp_ms")
+        with closing(self._connection()) as connection:
+            row = connection.execute(
+                """SELECT * FROM canonical_ordinal_frames
+                WHERE batch_id = ? AND video_id = ?
+                ORDER BY ABS(timestamp_ms - ?), timestamp_ms, keyframe_ordinal
+                LIMIT 1""",
+                (batch_id, video_id, timestamp_ms),
+            ).fetchone()
+        return None if row is None else self._ordinal_frame_from_row(row)
 
     @staticmethod
     def _refined_frame_from_row(row: sqlite3.Row) -> RefinedFrameRecord:
@@ -1696,6 +1972,14 @@ class ArtifactRepository:
                     (int(ready), timestamp, batch_id, video_id, int(ready)),
                 )
                 changed += cursor.rowcount
+                cursor = connection.execute(
+                    """
+                    UPDATE canonical_ordinal_frames SET index_ready = ?, updated_at = ?
+                    WHERE batch_id = ? AND video_id = ? AND index_ready != ?
+                    """,
+                    (int(ready), timestamp, batch_id, video_id, int(ready)),
+                )
+                changed += cursor.rowcount
             if include_text_segments:
                 cursor = connection.execute(
                     """
@@ -1716,19 +2000,24 @@ class ArtifactRepository:
             summary = connection.execute(
                 """
                 SELECT
-                    (SELECT COUNT(*) FROM canonical_frames WHERE batch_id = ?) AS frames,
+                    ((SELECT COUNT(*) FROM canonical_frames WHERE batch_id = ?)
+                     + (SELECT COUNT(*) FROM canonical_ordinal_frames WHERE batch_id = ?)) AS frames,
                     (SELECT COUNT(*) FROM canonical_text_segments WHERE batch_id = ?) AS texts,
-                    (SELECT COUNT(*) FROM canonical_frames
-                        WHERE batch_id = ? AND index_ready = 1) AS ready_frames,
+                    ((SELECT COUNT(*) FROM canonical_frames
+                        WHERE batch_id = ? AND index_ready = 1)
+                     + (SELECT COUNT(*) FROM canonical_ordinal_frames
+                        WHERE batch_id = ? AND index_ready = 1)) AS ready_frames,
                     (SELECT COUNT(*) FROM canonical_text_segments
                         WHERE batch_id = ? AND index_ready = 1) AS ready_texts,
                     (SELECT COUNT(*) FROM (
                         SELECT video_id FROM canonical_frames WHERE batch_id = ?
                         UNION
+                        SELECT video_id FROM canonical_ordinal_frames WHERE batch_id = ?
+                        UNION
                         SELECT video_id FROM canonical_text_segments WHERE batch_id = ?
                     )) AS videos
                 """,
-                (batch_id, batch_id, batch_id, batch_id, batch_id, batch_id),
+                (batch_id,) * 9,
             ).fetchone()
             kinds = connection.execute(
                 """

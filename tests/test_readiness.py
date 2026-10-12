@@ -82,6 +82,27 @@ class _HTTP:
         raise AssertionError(f"unexpected readiness request: {method} {url}")
 
 
+def test_reasoning_refresh_rechecks_services_without_rescanning_corpus(tmp_path: Path) -> None:
+    http = _HTTP(fail=True)
+    clock = [100.0]
+    service = ReadinessService(_config(tmp_path), project_root=tmp_path,
+                               http_client=http, clock=lambda: clock[0])
+    old = service.check("aic25-b1-reference")
+    assert not next(channel for channel in old.channels if channel.name == "ollama_vlm").usable
+    http.fail = False
+    http.calls.clear()
+    current = service.refresh_reasoning(old, force=True)
+    assert next(channel for channel in current.channels if channel.name == "ollama_vlm").usable
+    assert all(url.endswith(("/api/tags", "/api/show")) for _, url, _ in http.calls)
+    previous_calls = len(http.calls)
+    service.refresh_reasoning(old)
+    assert len(http.calls) == previous_calls
+    http.fail = True
+    clock[0] += 3
+    offline = service.refresh_reasoning(old)
+    assert not next(channel for channel in offline.channels if channel.name == "ollama_vlm").usable
+
+
 def _artifact_database(path: Path) -> None:
     first_image = path.parent / "frame-1.jpg"
     second_image = path.parent / "frame-2.jpg"
@@ -193,6 +214,28 @@ def _config(tmp_path: Path) -> dict[str, Any]:
         },
         "retrieval": {"rrf_k": 60, "candidate_depths": {}, "channel_weights": {}},
     }
+
+
+def test_b02_organizer_readiness_uses_batch_collection_without_touching_b01(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    config["services"]["qdrant"]["collections"]["organizer_compatible_frames"] = (
+        "organizer_{batch}_v1"
+    )
+    http = _HTTP()
+    service = ReadinessService(config, project_root=tmp_path, http_client=http)
+
+    b01 = service._probe_qdrant(
+        "organizer_clip", "aic25-b1-reference", ChannelApplicability.REQUIRED
+    )
+    b02 = service._probe_qdrant(
+        "organizer_clip", "aic26-b2", ChannelApplicability.REQUIRED
+    )
+
+    assert b01.resource_name == "organizer-v1"
+    assert b02.resource_name == "organizer_aic26-b2_v1"
+    assert any("/collections/organizer_aic26-b2_v1" in url for _, url, _ in http.calls)
 
 
 def test_reference_readiness_is_batch_scoped_and_optional_channels_do_not_degrade(

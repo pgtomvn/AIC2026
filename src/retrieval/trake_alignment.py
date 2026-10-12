@@ -23,6 +23,7 @@ from src.contracts import (
 )
 from src.query.entity_extractor import fold_entity_text
 from src.query.translator import QueryProcessing, QueryTextAdapter, QueryVariant
+from src.retrieval.trake_scope import trake_filters, trake_video_allowed
 from src.retrieval.trake_trajectory_cache import TRAKETrajectoryCache
 
 TRAKE_ALIGNMENT_VERSION = "trake-exact-alignment-v5-entity-routing"
@@ -621,7 +622,7 @@ class TRAKEPipeline:
                 # Exact Stage-B reads full trajectories from cache; one hit is
                 # sufficient to retain each group's maximum Stage-A score.
                 "group_size": 1 if use_exact_cache else self.seed_frames_per_prompt,
-                "filters": {"batch_id": batch_id},
+                "filters": trake_filters(batch_id),
             }
             if supports_vectors:
                 # The production adapter retains private Qdrant point IDs, so
@@ -674,6 +675,9 @@ class TRAKEPipeline:
                     ):
                         point_refs.append((str(group_id), point_id))
         videos = set().union(*(scores.keys() for scores in per_prompt))
+        videos = {video for video in videos if trake_video_allowed(batch_id, video)}
+        lexical_video_order = tuple(video for video in lexical_video_order
+                                    if trake_video_allowed(batch_id, video))
         stage_count = len(per_prompt) - 1
         stage_a: dict[str, float] = {}
         for video_id in videos:
@@ -741,7 +745,7 @@ class TRAKEPipeline:
                     retrieve_kwargs_supported = True
                     retrieve_parameter_names = set()
                 if retrieve_kwargs_supported or "filters" in retrieve_parameter_names:
-                    retrieve_kwargs["filters"] = {"batch_id": batch_id}
+                    retrieve_kwargs["filters"] = trake_filters(batch_id)
                 if retrieve_kwargs_supported or "batch_size" in retrieve_parameter_names:
                     retrieve_kwargs["batch_size"] = self.vector_scroll_batch_size
                 try:
@@ -1141,7 +1145,7 @@ class TRAKEPipeline:
         if not candidate_videos:
             return {}
         points = store.iter_points_with_vectors(
-            {"batch_id": batch_id, "video_id": list(candidate_videos)},
+            trake_filters(batch_id, video_id=list(candidate_videos)),
             batch_size=self.vector_scroll_batch_size,
         )
         return self._canonical_frames(batch_id, candidate_videos, dimension, points)

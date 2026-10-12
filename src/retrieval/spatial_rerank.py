@@ -286,15 +286,23 @@ _POSITIVE_LABEL_ALIAS_GROUPS: dict[str, frozenset[str]] = {
 }
 
 
+@lru_cache(maxsize=1)
+def _folded_alias_groups() -> tuple[tuple[str, frozenset[str]], ...]:
+    """Normalize the fixed vocabulary once, not for each cold detector label."""
+    return tuple(
+        (canonical, frozenset(fold_entity_text(alias) for alias in aliases))
+        for canonical, aliases in _LABEL_ALIAS_GROUPS
+    )
+
+
 @lru_cache(maxsize=4096)
 def _canonical_label_tokens(value: str) -> frozenset[str]:
     folded = fold_entity_text(value)
     tokens = {token for token in folded.split() if len(token) > 2}
-    for canonical, aliases in _LABEL_ALIAS_GROUPS:
+    for canonical, aliases in _folded_alias_groups():
         padded = f" {folded} "
         matched = False
-        for alias in aliases:
-            alias_folded = fold_entity_text(alias)
+        for alias_folded in aliases:
             if alias_folded == folded or f" {alias_folded} " in padded:
                 matched = True
                 break

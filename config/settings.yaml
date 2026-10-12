@@ -43,6 +43,32 @@ readiness:
         ocr: optional
         asr: optional
         accelerated_visual: optional
+    aic26-b2:
+      kind: reference
+      retrieval_enabled: true
+      expected_mapping_rows: 220270
+      # B02 uses ordinal identity; relative N frame_idx and nine M08 pairs
+      # must never be silently collapsed by source-frame identity.
+      expected_canonical_frames: 220270
+      expected_videos: 614
+      canonical_image_min_coverage: 0.99
+      # Eligible M/S only; N and M08_V001 are excluded by the TRAKE scope.
+      trake_enabled: true
+      workflows:
+        kis: [organizer_clip]
+        qa: [organizer_clip, canonical_images]
+        trake: [organizer_clip]
+      channels:
+        organizer_clip: required
+        canonical_images: required
+        ollama_vlm: required
+        gemini_vlm: optional
+        visual: optional
+        semantic_text: optional
+        metadata: optional
+        ocr: optional
+        asr: optional
+        accelerated_visual: optional
   native_defaults:
     workflows:
       kis: [visual]
@@ -159,6 +185,14 @@ models:
     verification_record: data/state/organizer-clip-verification.json
     verification_sample_size: 16
     verification_median_cosine: 0.999
+    batch_verifications:
+      aic26-b2:
+        record: outputs/checkpoints/b02-p1/b02-clip-encoder-verification.json
+        manifest_sha256: e9bc8ec6daa64380228851b7e5dab854b122539a63ec1ba1e91aef5ee798079c
+        feature_archive_sha256: ce1c487d0d83d976628716822b869819d8e0f77ae4be176207db9341b5e53b14
+        sample_count: 6
+        minimum_median_cosine: 0.999
+        minimum_sample_cosine: 0.999
     cache_dir: models/open_clip
     local_files_only: true
   organizer_compatible_visual:
@@ -201,6 +235,7 @@ models:
     weights_sha256: 03075d2d2d2bbd3e180b9ba0afae4aa8563226e2d32911656966e05b2f2ee060
     device: cpu
     max_new_tokens: 256
+    timeout_seconds: 90
     local_files_only: true
   ocr:
     engine: paddleocr
@@ -277,6 +312,8 @@ services:
     url: http://127.0.0.1:11434
     url_env: OLLAMA_URL
     model: qwen2.5vl:3b-q4_K_M
+    execution_mode: auto
+    execution_mode_env: AIC_QA_DEVICE
     expected_digest_prefix: fb90415cde1e
     connect_timeout_seconds: 2
     timeout_seconds: 60
@@ -312,6 +349,19 @@ services:
       metadata: aic_metadata_multilingual_v2
 
 retrieval:
+  all_batches:
+    # Rollback changes only this flag; neither corpus nor index is modified.
+    enabled: true
+  interactive:
+    # Production tools are explicit user actions; no unvalidated automatic rank changes.
+    schema_version: 1
+    feedback_enabled: true
+    conversation_enabled: true
+    temporal_enabled: true
+    evidence_enabled: true
+    automatic_activation: false
+    temporal_release_record: outputs/evaluation/temporal-english-local-release.json
+    event_inspection_enabled: false  # local inference smoke failed; keep isolated until verified
   # Canonical metadata only; scalar restores the per-hit lookup implementation.
   metadata_resolution: asr_only_batched
   top_k: 100
@@ -419,6 +469,9 @@ retrieval:
     object_cache_bytes: 16777216
     # Largest measured head with transactional warm p95 <= 20 ms (2026-08-24).
     spatial_candidate_depth: 64
+    # Cooperative verification budget after separately timed evidence prefetch.
+    # Engineering limit for the laptop; not selected using test-set accuracy.
+    verification_budget_ms: 20
     spatial_beta: 0.35
     color_candidate_depth: 8
     color_absent_multiplier: 0.65

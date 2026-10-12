@@ -864,7 +864,9 @@ def test_runtime_capabilities_expose_safe_local_and_cloud_states(tmp_path: Path)
     assert response["qa"]["default_policy"] == "gemini_then_local"
     assert response["qa"]["local"]["status"]["state"] == "ready"
     assert response["qa"]["cloud"]["status"]["state"] == "blocked_asset"
-    assert response["runtime_contract"]["version"] == 6
+    assert response["runtime_contract"]["version"] == 8
+    assert "kis.interactive_feedback" in response["runtime_contract"]["features"]
+    assert "kis.manual_temporal_sequence" in response["runtime_contract"]["features"]
     assert "kis.adaptive_rrf" in response["runtime_contract"]["features"]
     assert "kis.full_spatial_ontology" in response["runtime_contract"]["features"]
     assert (
@@ -892,6 +894,48 @@ def test_runtime_capabilities_do_not_block_on_readiness_while_warming(tmp_path: 
     response = endpoint()
 
     assert response["qa"]["local"]["status"]["state"] == "warming"
+
+
+def test_qa_provider_gate_refreshes_a_stale_warmup_report(tmp_path: Path) -> None:
+    from src.api import _require_qa_policy_usable
+
+    context = _context(tmp_path, _QAPipeline())
+    old = context.readiness_service.check("b1")
+    old.batch_id = "b1"
+    old.channels[1].usable = False
+    context.warmup = SimpleNamespace(readiness_report=lambda: old)
+    live = {"available": True}
+    calls = []
+
+    def refresh(report, *, force=False):
+        assert report is old
+        calls.append(force)
+        report = _Readiness().check("b1")
+        report.channels[1].usable = live["available"]
+        return report
+
+    context.readiness_service.refresh_reasoning = refresh
+    request = QAQueryRequest("q", "event", "question", batch_filters=("b1",),
+                             reasoning_policy="local_only")
+    _require_qa_policy_usable(context, request, require_retrieval=False)
+    live["available"] = False
+    with pytest.raises(HTTPException) as raised:
+        _require_qa_policy_usable(context, request, require_retrieval=False)
+    assert raised.value.detail == {"code": "ollama_unavailable"}
+    assert calls == [True, True]
+
+
+def test_capabilities_preserve_translation_warmup_failure(tmp_path: Path) -> None:
+    context = _context(tmp_path, _QAPipeline())
+    context.warmup = SimpleNamespace(
+        readiness_report=lambda: None,
+        snapshot=lambda: {"channels": [{"name": "query_translation", "state": "failed",
+                                        "reason_code": "warmup_runtime_failure"}]},
+    )
+    result = _route(create_app(context), "/v1/runtime/capabilities", "GET").endpoint()
+    assert result["query_translation"]["state"] == "failed"
+    assert result["query_translation"]["reason_code"] == "warmup_runtime_failure"
+    assert result["qa"]["local"]["inference_verified"] is False
 
 
 def test_image_diagnostic_is_ephemeral_structured_and_consent_gated(tmp_path: Path) -> None:

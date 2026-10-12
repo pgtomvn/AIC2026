@@ -815,7 +815,10 @@ class VectorStore:
                 scroll_filter=self._build_filter(filters),
                 limit=batch_size,
                 offset=offset,
-                with_payload=list(_TRAJECTORY_PAYLOAD_FIELDS),
+                with_payload=list(_TRAJECTORY_PAYLOAD_FIELDS) + (
+                    ["trake_eligible", "keyframe_ordinal", "shot_id"]
+                    if isinstance(filters, dict) and filters.get("batch_id") == "aic26-b2" else []
+                ),
                 with_vectors=True,
             )
             if isinstance(response, tuple):
@@ -901,6 +904,7 @@ class VectorStore:
         frame_keys: list[tuple[str, int]] | tuple[tuple[str, int], ...],
         *,
         batch_id: str | None = None,
+        coordinate: str = "source_frame_idx",
     ) -> np.ndarray:
         """Fetch vectors by canonical payload identity for Rocchio feedback.
 
@@ -908,12 +912,16 @@ class VectorStore:
         callers may pass ``batch_id`` to disambiguate a multi-batch collection.
         """
 
+        if coordinate not in {"source_frame_idx", "keyframe_ordinal"}:
+            raise ValueError("unsupported feedback coordinate")
+        if (batch_id == "aic26-b2") != (coordinate == "keyframe_ordinal"):
+            raise ValueError("B02 feedback requires explicit ordinal identity")
         client = self._get_client()
         rows: list[np.ndarray] = []
         for video_id, source_frame_idx in frame_keys:
             filters: dict[str, Any] = {
                 "video_id": video_id,
-                "source_frame_idx": int(source_frame_idx),
+                coordinate: int(source_frame_idx),
             }
             if batch_id is not None:
                 filters["batch_id"] = batch_id
@@ -959,6 +967,8 @@ class BatchVectorStore:
         *,
         url: str,
         collection_template: str,
+        collection_overrides: Mapping[str, str] | None = None,
+        readable_batches: set[str] | frozenset[str] | None = None,
         vector_size: int,
         distance: str = "Cosine",
         api_key: Optional[str] = None,
@@ -971,6 +981,19 @@ class BatchVectorStore:
         self.url = url
         self.collection_template = collection_template
         self.collection_name = collection_template
+        self.collection_overrides = dict(collection_overrides or {})
+        self.readable_batches = (
+            None if readable_batches is None else frozenset(readable_batches)
+        )
+        if self.readable_batches is not None:
+            for batch_id in self.readable_batches:
+                collection_batch_token(batch_id)
+        if len(set(self.collection_overrides.values())) != len(self.collection_overrides):
+            raise ValueError("collection overrides must bind distinct physical collections")
+        for batch_id, name in self.collection_overrides.items():
+            collection_batch_token(batch_id)
+            if not name or len(name) > 255 or not _SAFE_COLLECTION_COMPONENT.fullmatch(name):
+                raise ValueError(f"invalid Qdrant collection override: {name!r}")
         self.vector_size = vector_size
         self.distance = distance
         self.api_key = api_key
@@ -996,7 +1019,12 @@ class BatchVectorStore:
     def for_batch(self, batch_id: str) -> VectorStore:
         """Return a normal store bound to one physical batch collection."""
 
-        return self._store(batch_collection_name(self.collection_template, batch_id))
+        return self._store(self._collection_for_batch(batch_id))
+
+    def _collection_for_batch(self, batch_id: str) -> str:
+        return self.collection_overrides.get(
+            batch_id, batch_collection_name(self.collection_template, batch_id)
+        )
 
     def _get_client(self) -> Any:
         if self._client is None:
@@ -1019,6 +1047,10 @@ class BatchVectorStore:
             name = item.get("name") if isinstance(item, Mapping) else getattr(item, "name", None)
             if isinstance(name, str) and name.startswith(prefix) and name.endswith(suffix):
                 names.append(name)
+        names.extend(name for name in self.collection_overrides.values() if name not in names)
+        if self.readable_batches is not None:
+            selected = {self._collection_for_batch(batch) for batch in self.readable_batches}
+            names = [name for name in names if name in selected]
         return sorted(names)
 
     @staticmethod
@@ -1034,7 +1066,9 @@ class BatchVectorStore:
         batches = self._requested_batches(filters)
         if batches is None:
             return self._discover_collection_names()
-        return [batch_collection_name(self.collection_template, batch) for batch in batches]
+        if self.readable_batches is not None:
+            batches = tuple(batch for batch in batches if batch in self.readable_batches)
+        return list(dict.fromkeys(self._collection_for_batch(batch) for batch in batches))
 
     def search(
         self,
@@ -1147,20 +1181,25 @@ class BatchVectorStore:
         frame_keys: list[tuple[str, int]] | tuple[tuple[str, int], ...],
         *,
         batch_id: str | None = None,
+        coordinate: str = "source_frame_idx",
     ) -> np.ndarray:
         """Fetch feedback vectors, rejecting missing or cross-batch ambiguity."""
 
         names = (
-            [batch_collection_name(self.collection_template, batch_id)]
+            [self._collection_for_batch(batch_id)]
             if batch_id is not None
             else self._discover_collection_names()
         )
+        if batch_id is not None and self.readable_batches is not None:
+            if batch_id not in self.readable_batches:
+                raise ValueError(f"batch {batch_id!r} is not verified for this vector store")
         matches: list[np.ndarray] = []
         for name in names:
             if not self._get_client().collection_exists(collection_name=name):
                 continue
             try:
-                matches.append(self._store(name).vectors_for_frames(frame_keys, batch_id=batch_id))
+                kwargs = {"coordinate": coordinate} if coordinate != "source_frame_idx" else {}
+                matches.append(self._store(name).vectors_for_frames(frame_keys, batch_id=batch_id, **kwargs))
             except ValueError as error:
                 if " is missing" not in str(error):
                     raise

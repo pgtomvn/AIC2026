@@ -9,7 +9,7 @@ import re
 import threading
 import zipfile
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Iterable, Protocol
 
@@ -362,11 +362,40 @@ class CanonicalImageResolver:
             if active_archive is not None:
                 active_archive.close()
 
+    def _ordinal_image_record(self, frame: FrameRecord | RefinedFrameRecord) -> FrameRecord | RefinedFrameRecord:
+        """Resolve the verified B02 S-series four-digit ZIP naming convention.
+
+        Only leading-zero width may differ; batch, archive, directory, ordinal
+        and extension must agree. No on-disk record or archive is changed.
+        """
+        if (not isinstance(frame, FrameRecord) or frame.batch_id != "aic26-b2"
+                or not re.fullmatch(r"S\d{2}-V\d{3}", frame.video_id)
+                or not frame.image_uri.startswith("zip://")):
+            return frame
+        ordinal = frame.keyframe_ordinal
+        if type(ordinal) is not int or ordinal < 1:
+            raise CanonicalImageError("missing canonical ordinal")
+        path, member = self._zip_parts(frame.image_uri)
+        expected = f"keyframes/{frame.video_id}/{ordinal:03d}.jpg"
+        padded = f"keyframes/{frame.video_id}/{ordinal:04d}.jpg"
+        if path.name != f"Keyframes_{frame.video_id[:3]}.zip" or member not in {expected, padded}:
+            raise CanonicalImageError("B02 ordinal image URI disagrees with identity")
+        with self._archive_guard:
+            archive, duplicates, lock = self._archive_entry(path)
+            with lock:
+                present = {name for name in {expected, padded} if name in archive.NameToInfo}
+                if len(present) != 1:
+                    raise CanonicalImageError("B02 ordinal image is missing or ambiguous")
+                selected = present.pop()
+                self._validated_zip_info(archive, selected, duplicates)
+        return replace(frame, image_uri=f"zip://{path}!/{selected}")
+
     def probe(self, frame: FrameRecord | RefinedFrameRecord) -> CanonicalImageProbe:
         """Validate provenance and compute a cheap source revision without decoding."""
 
         if not isinstance(frame, (FrameRecord, RefinedFrameRecord)):
             raise TypeError("frame must be a persisted source-frame record")
+        frame = self._ordinal_image_record(frame)
         if "://" in frame.image_uri and not frame.image_uri.startswith("zip://"):
             raise CanonicalImageError("unsupported canonical image URI")
         if frame.image_uri.startswith("zip://"):
@@ -459,6 +488,7 @@ class CanonicalImageResolver:
     ) -> ResolvedCanonicalImage:
         """Validate, orient, resize, and encode one canonical image as JPEG."""
 
+        frame = self._ordinal_image_record(frame)
         probe_value = self.probe(frame)
         cached = self._cached_image(probe_value.cache_key)
         if cached is not None:

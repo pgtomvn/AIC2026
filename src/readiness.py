@@ -26,7 +26,10 @@ from src import PROJECT_ROOT
 from src.assets import verify_asset_manifest
 from src.embedding.clip_encoder import CLIPEncoder
 from src.indexing.vector_store import batch_collection_name
-from src.organizer_verification import organizer_verification_passed
+from src.organizer_verification import (
+    organizer_batch_verification_passed,
+    organizer_verification_passed,
+)
 from src.retrieval.qa_media import CanonicalImageResolver
 from src.tooling.ffmpeg import verify_ffmpeg_manifest
 from src.utils.io_helpers import (
@@ -549,6 +552,10 @@ class ReadinessService:
         readiness = config.get("readiness", {})
         self.cache_seconds = max(0.0, float(readiness.get("cache_seconds", 10)))
         self._cache: dict[tuple[str, str, str], tuple[float, ReadinessReport]] = {}
+        self._reasoning_cache: dict[str, tuple[float, tuple[ChannelReadiness, ...]]] = {}
+        self.reasoning_cache_seconds = max(
+            0.0, float(readiness.get("reasoning_cache_seconds", 2.0))
+        )
         self._lock = threading.RLock()
 
     def invalidate(self) -> None:
@@ -556,6 +563,43 @@ class ReadinessService:
 
         with self._lock:
             self._cache.clear()
+            self._reasoning_cache.clear()
+
+    def refresh_reasoning(
+        self, report: ReadinessReport, *, force: bool = False
+    ) -> ReadinessReport:
+        """Refresh provider health without rescanning images or vector indexes.
+
+        Warm-up reports describe long-lived retrieval assets. Ollama may be
+        stopped or started independently, so its liveness has a separate TTL.
+        These probes inspect configuration/model identity, never run inference.
+        """
+
+        with self._lock:
+            now = self.clock()
+            cached = self._reasoning_cache.get(report.batch_id)
+            if not force and cached and now - cached[0] <= self.reasoning_cache_seconds:
+                providers = cached[1]
+            else:
+                specification = self._batch_specification(report.batch_id)
+                applicability = specification.get("channels", {})
+                providers = tuple(
+                    self._probe_channel(
+                        name, report.batch_id,
+                        ChannelApplicability(applicability.get(name, "not_applicable")),
+                        specification,
+                    )
+                    for name in ("ollama_vlm", "gemini_vlm")
+                )
+                self._reasoning_cache[report.batch_id] = (now, providers)
+        updated = {channel.name: channel for channel in providers}
+        channels = tuple(updated.get(channel.name, channel) for channel in report.channels)
+        by_name = {channel.name: channel for channel in channels}
+        return replace(
+            report,
+            channels=channels,
+            qa=self._workflow(report.qa.required_channels, by_name, qa=True),
+        )
 
     def retrieval_fingerprint(self, batch_filters: tuple[str, ...]) -> str:
         """Return a stable, secret-free identity for candidate-cache invalidation.
@@ -729,6 +773,10 @@ class ReadinessService:
         required = tuple(configured.get(workflow, ()))
         by_name = {channel.name: channel for channel in report.channels}
         if workflow == "trake":
+            if specification.get("trake_enabled", True) is False:
+                return WorkflowReadiness(
+                    WorkflowState.BLOCKED, required, ("batch_temporal_contract_unavailable",)
+                )
             unavailable = tuple(
                 name for name in required if name not in by_name or not by_name[name].usable
             )
@@ -946,6 +994,11 @@ class ReadinessService:
         applicability: ChannelApplicability,
         specification: Mapping[str, Any],
     ) -> ChannelReadiness:
+        if name in _QDRANT_CHANNELS and specification.get("retrieval_enabled", True) is False:
+            return ChannelReadiness(
+                name, applicability, ChannelState.NOT_PROVISIONED,
+                "batch_import_not_activated", "complete_batch_activation",
+            )
         if applicability is ChannelApplicability.NOT_APPLICABLE:
             return ChannelReadiness(
                 name,
@@ -994,7 +1047,12 @@ class ReadinessService:
                 "profile_does_not_enable_channel",
                 "select_accelerated_profile",
             )
-        template = qdrant.get("collections", {}).get(collection_key)
+        collections = qdrant.get("collections", {})
+        template = collections.get(collection_key)
+        if name == "organizer_clip" and batch_id != "aic25-b1-reference":
+            # B01 keeps its historical fixed collection. Later reference
+            # batches use a batch-qualified collection in the same model space.
+            template = collections.get("organizer_compatible_frames", template)
         expected_dimension = model.get("embedding_dim")
         if not isinstance(template, str) or not template:
             return ChannelReadiness(
@@ -1084,7 +1142,7 @@ class ReadinessService:
                 resource_name=collection,
                 expected_dimension=int(expected_dimension) if expected_dimension else None,
             )
-        dependency = self._model_dependency(name)
+        dependency = self._model_dependency(name, batch_id)
         if dependency is not None:
             return replace(
                 dependency,
@@ -1102,7 +1160,7 @@ class ReadinessService:
             expected_dimension=int(expected_dimension) if expected_dimension else None,
         )
 
-    def _model_dependency(self, name: str) -> ChannelReadiness | None:
+    def _model_dependency(self, name: str, batch_id: str) -> ChannelReadiness | None:
         module_sets = {
             "visual": ("torch", "transformers"),
             "semantic_text": ("torch", "transformers"),
@@ -1136,11 +1194,18 @@ class ReadinessService:
                 cache_dir=_path(model.get("cache_dir", "models/open_clip"), self.project_root),
                 local_files_only=True,
             )
-            if not organizer_verification_passed(
-                model,
-                expected_fingerprint=encoder.fingerprint,
-                project_root=self.project_root,
-            ):
+            verified = (
+                organizer_verification_passed(
+                    model, expected_fingerprint=encoder.fingerprint,
+                    project_root=self.project_root,
+                )
+                if batch_id == "aic25-b1-reference"
+                else organizer_batch_verification_passed(
+                    model, batch_id=batch_id, expected_fingerprint=encoder.fingerprint,
+                    project_root=self.project_root,
+                )
+            )
+            if not verified:
                 return ChannelReadiness(
                     name,
                     ChannelApplicability.OPTIONAL,
@@ -1280,6 +1345,13 @@ class ReadinessService:
                     """,
                     (batch_id,),
                 ).fetchone()
+                if batch_id == "aic26-b2":
+                    row = connection.execute(
+                        """SELECT COUNT(*), COUNT(DISTINCT video_id)
+                        FROM canonical_ordinal_frames WHERE batch_id = ?
+                        AND json_extract(record_json, '$.image_uri') <> ''""",
+                        (batch_id,),
+                    ).fetchone()
             count, video_count = int(row[0]), int(row[1])
         except (OSError, sqlite3.Error, TypeError, ValueError):
             return ChannelReadiness(

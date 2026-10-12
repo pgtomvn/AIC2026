@@ -10,6 +10,7 @@ import re
 import shutil
 import tempfile
 import threading
+from collections import Counter
 from collections.abc import Mapping
 from fractions import Fraction
 from pathlib import Path
@@ -31,6 +32,10 @@ class RefinedFramePersistenceError(RuntimeError):
     """Raised when an exact frame cannot be made durable within safe bounds."""
 
 
+class _RefinementEmbeddingError(ValueError):
+    """An invalid embedding must not be mistaken for unavailable raw media."""
+
+
 class RefinedFrameSink(Protocol):
     """Persistence boundary used before a temporary decoded frame is released."""
 
@@ -44,6 +49,8 @@ class RefinedFrameSink(Protocol):
 
 
 def _source_from_uri(video_id: str, uri: str) -> VideoSource:
+    if uri.startswith("reference://"):
+        raise FileNotFoundError("reference-only identity has no local raw video")
     if uri.startswith("zip://"):
         value = uri[len("zip://") :]
         archive_value, separator, member = value.partition("!/")
@@ -53,7 +60,10 @@ def _source_from_uri(video_id: str, uri: str) -> VideoSource:
         import zipfile
 
         with zipfile.ZipFile(archive) as handle:
-            size = handle.getinfo(member).file_size
+            try:
+                size = handle.getinfo(member).file_size
+            except KeyError as error:
+                raise FileNotFoundError("raw video member is unavailable") from error
         return VideoSource(video_id, archive, member, size)
     return VideoSource(video_id, Path(uri))
 
@@ -320,6 +330,12 @@ class LocalFrameRefiner:
         self.sample_fps = sample_fps
         self.top_windows = top_windows
         self.frame_sink = frame_sink
+        self._state = threading.local()
+
+    @property
+    def last_diagnostics(self) -> dict[str, Any]:
+        """Per-request outcome, including coarse-only resource fallbacks."""
+        return dict(getattr(self._state, "diagnostics", {}))
 
     @property
     def fingerprint(self) -> str:
@@ -430,9 +446,10 @@ class LocalFrameRefiner:
     def is_eligible(candidate: dict[str, Any]) -> bool:
         """Return whether a canonical hit can be decoded around its exact anchor."""
 
-        sampling_reasons = candidate.get("sampling_reasons", ())
+        sampling_reasons = candidate.get("sampling_reasons") or ()
         return (
             isinstance(candidate.get("video_uri"), str)
+            and not candidate["video_uri"].startswith("reference://")
             and candidate.get("timestamp_ms") is not None
             and candidate.get("pts") is not None
             and candidate.get("time_base") is not None
@@ -447,17 +464,23 @@ class LocalFrameRefiner:
         query_texts: tuple[str, ...] = (),
     ) -> list[dict[str, Any]]:
         active = candidates[: self.top_windows]
+        self._state.diagnostics = {
+            "state": "not_applicable",
+            "reason_code": (
+                "reference_only_source" if active and all(
+                    str(candidate.get("video_uri", "")).startswith("reference://")
+                    for candidate in active
+                ) else "no_exact_raw_anchor"
+            ),
+            "refined_count": 0,
+        }
         if self.frame_sink is None or not any(self.is_eligible(candidate) for candidate in active):
             return [dict(candidate) for candidate in candidates]
         texts = query_texts or (plan.original_text,)
-        vectors = np.stack([encode_query_mean(self.encoder, text) for text in texts])
-        query_vector = vectors.mean(axis=0)
-        norm = float(np.linalg.norm(query_vector))
-        if not np.isfinite(norm) or norm <= 0:
-            raise ValueError("refinement query embedding must have a finite non-zero norm")
-        query_vector = (query_vector / norm).astype(np.float32, copy=False)
+        query_vector: np.ndarray | None = None
+        reasons: Counter[str] = Counter()
+        refined_count = 0
         refined: list[dict[str, Any]] = []
-        self.scratch.root.mkdir(parents=True, exist_ok=True)
         for candidate in candidates[: self.top_windows]:
             video_uri = candidate.get("video_uri")
             center_ms = candidate.get("timestamp_ms")
@@ -467,6 +490,7 @@ class LocalFrameRefiner:
             try:
                 source = _source_from_uri(str(candidate["video_id"]), video_uri)
                 with self.scratch.materialize(source) as media_path:
+                    self.scratch.root.mkdir(parents=True, exist_ok=True)
                     with tempfile.TemporaryDirectory(
                         prefix="refine-", dir=self.scratch.root
                     ) as temporary_dir:
@@ -495,8 +519,25 @@ class LocalFrameRefiner:
                             ),
                         )
                         if not frames:
+                            reasons["raw_window_empty"] += 1
                             refined.append(dict(candidate))
                             continue
+                        # Do not run the GPU encoder when every raw source is
+                        # absent. Still encode exactly once for usable windows.
+                        if query_vector is None:
+                            try:
+                                query_vectors = np.stack([
+                                    encode_query_mean(self.encoder, text) for text in texts
+                                ])
+                            except ValueError as error:
+                                raise _RefinementEmbeddingError(str(error)) from error
+                            query_vector = query_vectors.mean(axis=0)
+                            norm = float(np.linalg.norm(query_vector))
+                            if not np.isfinite(norm) or norm <= 0:
+                                raise _RefinementEmbeddingError(
+                                    "refinement query embedding must have a finite non-zero norm"
+                                )
+                            query_vector = (query_vector / norm).astype(np.float32, copy=False)
                         vectors = np.asarray(
                             self.encoder.encode_images([frame["path"] for frame in frames]),
                             dtype=np.float32,
@@ -511,6 +552,7 @@ class LocalFrameRefiner:
                                 refiner_fingerprint=self.fingerprint,
                             )
                         except RefinedFramePersistenceError:
+                            reasons["raw_persistence_unavailable"] += 1
                             refined.append(dict(candidate))
                             continue
                         item = dict(candidate)
@@ -533,9 +575,27 @@ class LocalFrameRefiner:
                             }
                         )
                         refined.append(item)
-            except (FileNotFoundError, OSError, ValueError):
+                        refined_count += 1
+            except (FileNotFoundError, OSError, ValueError) as error:
+                if isinstance(error, _RefinementEmbeddingError):
+                    raise
                 # Reference-only videos and unavailable raw archives retain the
                 # coarse result instead of causing the whole query to fail.
                 refined.append(dict(candidate))
+                reason = (
+                    "raw_source_unavailable" if isinstance(error, FileNotFoundError)
+                    else "raw_storage_unavailable" if isinstance(error, OSError)
+                    else "raw_window_invalid"
+                )
+                reasons[reason] += 1
         refined.extend(dict(candidate) for candidate in candidates[self.top_windows :])
+        self._state.diagnostics = {
+            "state": "degraded" if reasons else "ready",
+            "reason_code": (
+                "raw_partial_refinement" if reasons and refined_count
+                else next(iter(reasons)) if reasons else "query_completed"
+            ),
+            "refined_count": refined_count,
+            "fallback_counts": dict(reasons),
+        }
         return refined

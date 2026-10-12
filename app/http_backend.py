@@ -11,6 +11,8 @@ from urllib.parse import quote
 
 import requests
 
+from src.ingest.b02_presentation import ordinal_thumbnail_url
+
 _SAFE_ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
 
 
@@ -158,8 +160,8 @@ class _Pipeline:
         self,
         request: Any,
         *,
-        positive_ids: tuple[tuple[str, int], ...],
-        negative_ids: tuple[tuple[str, int], ...],
+        positive_ids: tuple[tuple[str, int], ...] = (),
+        negative_ids: tuple[tuple[str, int], ...] = (),
         limit: int,
     ) -> list[dict[str, Any]]:
         payload = request.to_dict()
@@ -254,7 +256,7 @@ class _QAPipeline:
                 "POST",
                 f"/v1/qa/search/{actual}/answer",
                 payload=request.to_dict(),
-                timeout_seconds=75,
+                timeout_seconds=150,
             )
         except BackendError as error:
             if error.recoverable:
@@ -314,6 +316,7 @@ class _Frame:
     source_frame_idx: int
     timestamp_ms: int = 0
     shot_id: str | None = None
+    keyframe_ordinal: int | None = None
 
 
 class _Repository:
@@ -323,6 +326,28 @@ class _Repository:
 
     def initialize(self) -> None:
         return None
+
+    def submission_export(self, rows: list[dict[str, Any]], *, task: str = "kis",
+                          answer_spec_id: str | None = None) -> bytes:
+        import base64
+
+        result = self.client.json("POST", "/v1/submissions/preview", payload={
+            "rows": rows, "task": task, "answer_spec_id": answer_spec_id})
+        data = base64.b64decode(result["csv_base64"], validate=True)
+        if hashlib.sha256(data).hexdigest() != result["sha256"]:
+            raise BackendError("backend_response_invalid")
+        return data
+
+    def b02_export(self, rows: list[dict[str, Any]], *, task: str = "kis",
+                   answer_spec_id: str | None = None) -> bytes:
+        import base64
+
+        result = self.client.json("POST", "/v1/b02/submissions/preview", payload={
+            "rows": rows, "task": task, "answer_spec_id": answer_spec_id})
+        data = base64.b64decode(result["csv_base64"], validate=True)
+        if hashlib.sha256(data).hexdigest() != result["sha256"]:
+            raise BackendError("backend_response_invalid")
+        return data
 
     def _validate(self, batch_id: str, identities: Any) -> dict[str, Any]:
         values = [
@@ -364,6 +389,61 @@ class _Repository:
         return _Frame(batch_id, video_id, source_frame_idx, timestamp)
 
     get_frame = get_source_frame
+
+    def ordinal_neighbors(
+        self, batch_id: str, video_id: str, keyframe_ordinal: int, *, radius: int = 5
+    ) -> tuple[_Frame, ...]:
+        """Load a bounded ordinal neighborhood without source-index conversion."""
+        path = ordinal_thumbnail_url(batch_id, video_id, keyframe_ordinal)
+        if isinstance(radius, bool) or not isinstance(radius, int) or not 0 <= radius <= 5:
+            raise ValueError("ordinal radius must be between zero and five")
+        value = self.client.json(
+            "GET", path.removesuffix("/image") + "/neighbors", params={"radius": radius}
+        )
+        frames = []
+        seen = set()
+        for item in value.get("neighbors", ()):
+            ordinal = item.get("keyframe_ordinal")
+            ordinal_thumbnail_url(batch_id, video_id, ordinal)
+            if (item.get("batch_id") != batch_id or item.get("video_id") != video_id
+                    or abs(ordinal - keyframe_ordinal) > radius or ordinal in seen):
+                raise ValueError("invalid ordinal neighborhood identity")
+            source, timestamp = item.get("source_frame_idx"), item.get("timestamp_ms")
+            if any(isinstance(x, bool) or not isinstance(x, int) or x < 0
+                   for x in (source, timestamp)):
+                raise ValueError("invalid canonical coordinates")
+            seen.add(ordinal)
+            frames.append(_Frame(batch_id, video_id, source, timestamp,
+                                 item.get("shot_id"), ordinal))
+        if keyframe_ordinal not in seen:
+            raise ValueError("ordinal neighborhood is missing its anchor")
+        return tuple(sorted(frames, key=lambda frame: frame.keyframe_ordinal))
+
+    def get_ordinal_frame(
+        self, batch_id: str, video_id: str, keyframe_ordinal: int
+    ) -> _Frame | None:
+        """Resolve an exact canonical ordinal, retaining its source coordinate."""
+        try:
+            return self.ordinal_neighbors(batch_id, video_id, keyframe_ordinal, radius=0)[0]
+        except BackendError as exc:
+            if exc.status_code == 404:
+                return None
+            raise
+
+    def frame_evidence(self, batch_id: str, video_id: str, source_frame_idx: int) -> dict[str, Any]:
+        return self.client.json("GET", f"/v1/frames/{batch_id}/{video_id}/{source_frame_idx}/evidence")
+
+    def ordinal_evidence(self, batch_id: str, video_id: str, ordinal: int) -> dict[str, Any]:
+        path = ordinal_thumbnail_url(batch_id, video_id, ordinal).removesuffix("/image") + "/evidence"
+        return self.client.json("GET", path)
+
+    def inspect_event(self, frames: list[dict[str, Any]], question: str) -> dict[str, Any]:
+        return self.client.json("POST", "/v1/kis/inspect-event", payload={"frames": frames, "question": question},
+                                timeout_seconds=65)
+
+    def confirm_answer(self, request: Any, frame: dict[str, Any], elapsed_ms: float) -> dict[str, Any]:
+        return self.client.json("POST", "/v1/kis/confirm-answer", payload={
+            "request": request.to_dict(), "frame": frame, "elapsed_ms": elapsed_ms, "confirmed": True})
 
     def neighbors(
         self,
@@ -424,9 +504,11 @@ class _ImageResolver:
         self.client = client
 
     def resolve(self, frame: _Frame) -> Any:
-        data = self.client.bytes(
-            f"/v1/frames/{frame.batch_id}/{frame.video_id}/{frame.source_frame_idx}/image"
-        )
+        if frame.batch_id == "aic26-b2":
+            path = ordinal_thumbnail_url(frame.batch_id, frame.video_id, frame.keyframe_ordinal)
+        else:
+            path = f"/v1/frames/{frame.batch_id}/{frame.video_id}/{frame.source_frame_idx}/image"
+        data = self.client.bytes(path)
         return SimpleNamespace(data=data, mime_type="image/webp")
 
 
@@ -513,11 +595,12 @@ class HttpRuntimeContext:
         self.client = client
         self.capabilities = capabilities
         self.selected_batch_id = str(capabilities["default_batch_id"])
+        self.default_search_batches = tuple(capabilities.get("default_search_batches", (self.selected_batch_id,)))
         self.config = {
             "profile": str(capabilities.get("profile", "laptop")),
             "runtime": {"default_batch_id": self.selected_batch_id},
             "readiness": {"batches": {self.selected_batch_id: {}}},
-            "retrieval": {"visual_qa": {}},
+            "retrieval": {"visual_qa": {}, "all_batches": {"enabled": len(self.default_search_batches) > 1}},
             "competition": {"output_dir": "outputs/submissions"},
             "logging": {
                 "app_error_file": "outputs/logs/app_error.log",
@@ -552,7 +635,7 @@ class HttpRuntimeContext:
 
     def validate_batch_filters(self, values: Any = None) -> tuple[str, ...]:
         selected = tuple(str(value).strip() for value in (values or ()) if str(value).strip())
-        return selected or (self.selected_batch_id,)
+        return selected or self.default_search_batches
 
     def diagnostic_image(self, payload: dict[str, Any]) -> dict[str, Any]:
         return dict(
@@ -560,7 +643,7 @@ class HttpRuntimeContext:
                 "POST",
                 "/v1/qa/diagnostics/image",
                 payload=payload,
-                timeout_seconds=75,
+                timeout_seconds=150,
             )
         )
 

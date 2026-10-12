@@ -8,7 +8,7 @@ from typing import Final
 
 from src import PROJECT_ROOT
 
-RUNTIME_CONTRACT_VERSION: Final[int] = 6
+RUNTIME_CONTRACT_VERSION: Final[int] = 8
 RUNTIME_CONTRACT_FEATURES: Final[tuple[str, ...]] = (
     "entity_constraints.kis",
     "entity_constraints.qa",
@@ -24,10 +24,20 @@ RUNTIME_CONTRACT_FEATURES: Final[tuple[str, ...]] = (
     "kis.experimental_cross_modal_calibration",
     "dataset.multimodal_coverage",
     "kis.full_spatial_ontology",
+    "kis.interactive_feedback",
+    "kis.session_conversation",
+    "kis.manual_temporal_sequence",
+    "kis.frame_evidence",
+    "kis.edit_preview",
+    "kis.gated_english_temporal",
+    "kis.manual_event_inspection",
 )
 RUNTIME_CONTRACT_SURFACE: Final[tuple[str, ...]] = (
     "app/http_backend.py",
     "app/streamlit_app.py",
+    "app/components/interactive_search.py",
+    "app/components/event_inspection.py",
+    "app/components/result_gallery.py",
     "src/api.py",
     "src/contracts.py",
     "src/query/query_decomposer.py",
@@ -36,10 +46,30 @@ RUNTIME_CONTRACT_SURFACE: Final[tuple[str, ...]] = (
     "src/ingest/reference_provisioner.py",
     "src/readiness.py",
     "src/retrieval/color_filter.py",
+    "src/retrieval/raw_refiner.py",
+    "src/retrieval/spatial_rerank.py",
     "src/retrieval/cross_modal_rescore.py",
     "src/retrieval/spatial_graph.py",
     "src/retrieval/textual_kis.py",
+    "src/retrieval/interactive.py",
+    "src/retrieval/temporal_sequence.py",
+    "src/retrieval/temporal_router.py",
+    "src/retrieval/refinement_preview.py",
+    "src/retrieval/event_inspection.py",
+    "src/vlm/local_qwen.py",
+    "src/retrieval/frame_evidence.py",
+    "src/ingest/frame_identity.py",
+    "src/ingest/b02_presentation.py",
+    "src/submission/b02.py",
+    "src/retrieval/qa_retrieval.py",
+    "app/components/b02_export.py",
+    "app/components/ordinal_images.py",
     "src/runtime_contract.py",
+    "src/retrieval/batch_scope.py",
+    "src/retrieval/trake_router.py",
+    "src/runtime.py",
+    "src/batch_warmup.py",
+    "src/submission/combined.py",
 )
 
 

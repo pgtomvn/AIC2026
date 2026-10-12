@@ -21,13 +21,14 @@ from typing import Any
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from PIL import Image, UnidentifiedImageError
 
 from src import PROJECT_ROOT
 from src.codabench_query_id import normalize_codabench_query_id
 from src.contracts import (
     CompetitionSpec,
+    FrameReference,
     QACandidateFrame,
     QACandidateRequest,
     QACompetitionSpec,
@@ -135,8 +136,10 @@ def _with_runtime_batches(
     if batches == request.batch_filters:
         return request
     if isinstance(request, TRAKEQueryRequest):
-        if len(batches) != 1:
-            raise ValueError("TRAKE requires exactly one resolved batch")
+        if len(batches) > 1:
+            from src.retrieval.batch_scope import validate_scope
+
+            validate_scope(batches)
         return request.model_copy(update={"batch_filters": batches})
     return replace(request, batch_filters=batches)
 
@@ -155,6 +158,9 @@ _QA_PROVIDER_ERROR_CATEGORIES = frozenset(
         "network_unreachable",
         "not_configured",
         "ollama_context_exceeded",
+        "inference_timeout",
+        "gpu_runtime_incompatible",
+        "worker_terminated",
         "ollama_timeout",
         "ollama_response_invalid",
         "provider_chain_exhausted",
@@ -172,6 +178,8 @@ _QA_SEARCH_STATUSES = frozenset(
 _QA_CHANNEL_STATES = frozenset(
     {
         "ready",
+        "degraded",
+        "not_applicable",
         "configured_unverified",
         "not_provisioned",
         "disabled_by_profile",
@@ -292,20 +300,23 @@ def _warmup_workflow(snapshot: Mapping[str, Any], workflow: str) -> dict[str, An
     }
 
 
-def _require_search_usable(context: RuntimeContext, workflow: str = "kis") -> None:
+def _require_search_usable(context: RuntimeContext, workflow: str = "kis", *,
+                           batches: tuple[str, ...] = ()) -> None:
     if workflow not in {"kis", "qa", "trake"}:
         raise ValueError("workflow must be one of: kis, qa, trake")
     warmup = getattr(context, "warmup", None)
     if warmup is None:
         return
-    snapshot = _warmup_snapshot(context) or {}
+    from src.batch_warmup import scoped_snapshot
+
+    snapshot = scoped_snapshot(_warmup_snapshot(context) or {}, batches)
     selected = _warmup_workflow(snapshot, workflow)
     state = str(selected.get("state", snapshot.get("state", "idle")))
     if state in {"idle", "evicted"}:
         start = getattr(warmup, "start", None)
         if callable(start):
             start()
-        snapshot = _warmup_snapshot(context) or snapshot
+        snapshot = scoped_snapshot(_warmup_snapshot(context) or snapshot, batches)
         selected = _warmup_workflow(snapshot, workflow)
         state = str(selected.get("state", "warming"))
     if bool(selected.get("usable", False)):
@@ -372,7 +383,7 @@ def _require_qa_policy_usable(
     """Gate the request-scoped provider and, when needed, QA retrieval media."""
 
     if require_retrieval:
-        _require_search_usable(context, "kis")
+        _require_search_usable(context, "kis", batches=request.batch_filters)
     service = getattr(context, "readiness_service", None)
     if service is None:
         raise HTTPException(status_code=503, detail={"code": "runtime_not_ready"})
@@ -386,6 +397,9 @@ def _require_qa_policy_usable(
                 report = warmed
         if report is None:
             report = service.check(request.batch_filters[0], mode="app")
+        refresh = getattr(service, "refresh_reasoning", None)
+        if callable(refresh):
+            report = refresh(report, force=True)
     except Exception:
         raise HTTPException(status_code=503, detail={"code": "runtime_not_ready"}) from None
     channels = {value.name: value for value in report.channels}
@@ -531,6 +545,15 @@ def _safe_hit_evidence(value: Any) -> dict[str, Any]:
                 if math.isfinite(number):
                     item[name] = number
         text_value = raw.get("text_raw")
+        steps = raw.get("temporal_steps")
+        if isinstance(steps, (tuple, list)):
+            item["temporal_steps"] = [
+                {k: v[k] for k in ("step", "source_frame_idx", "timestamp_ms")}
+                for v in steps[:6] if isinstance(v, dict) and all(
+                    isinstance(v.get(k), int) and not isinstance(v[k], bool) and v[k] >= 0
+                    for k in ("step", "source_frame_idx", "timestamp_ms")
+                )
+            ]
         if isinstance(text_value, str):
             item["text_raw"] = text_value[:2_048]
         polygons = _safe_polygon_values(raw.get("polygons"))
@@ -641,6 +664,10 @@ def _safe_frame_neighbor(frame: Any, *, offset: int | None = None) -> dict[str, 
             f"/v1/frames/{batch_id}/{video_id}/{source_frame_idx}/image"
         ),
     }
+    if batch_id == "aic26-b2":
+        from src.ingest.b02_presentation import present_ordinal_frame
+
+        result.update(present_ordinal_frame(frame))
     if offset is not None:
         if isinstance(offset, bool) or not isinstance(offset, int) or not -5 <= offset <= 5:
             raise ValueError("frame offset is invalid")
@@ -681,6 +708,13 @@ def _public_hits(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
             if batch_id is not None
             else f"canonical://frame/{video_id}/{source_frame_idx}"
         )
+        if batch_id == "aic26-b2":
+            from src.ingest.b02_presentation import ordinal_thumbnail_url
+
+            try:
+                thumbnail_uri = ordinal_thumbnail_url(batch_id, video_id, item.get("keyframe_ordinal"))
+            except (TypeError, ValueError):
+                continue
         raw_channel_ranks = item.get("channel_ranks", {})
         raw_channel_ranks = raw_channel_ranks if isinstance(raw_channel_ranks, dict) else {}
         channel_ranks = {
@@ -733,6 +767,13 @@ def _public_hits(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         public = hit.to_dict()
         public["frame_semantics"] = "source_frame_idx"
+        if batch_id == "aic26-b2":
+            public["frame_semantics"] = "keyframe_ordinal"
+            from src.ingest.b02_keyframe_mapping import is_vfr_traffic_video
+
+            traffic = is_vfr_traffic_video(video_id)
+            public["submission_unit"] = "timestamp_ms" if traffic else "source_frame_idx"
+            public["submission_value"] = timestamp_ms if traffic else source_frame_idx
         if batch_id is not None:
             public["batch_id"] = batch_id
         for field in ("keyframe_ordinal", "coarse_source_frame_idx"):
@@ -1210,6 +1251,11 @@ def _safe_qa_prediction(value: Any) -> dict[str, Any] | None:
         "window_id": window_id.strip(),
         "evidence": evidence,
     }
+    if batch_id == "aic26-b2":
+        ordinal = value.get("keyframe_ordinal")
+        if isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 1:
+            return None
+        result["keyframe_ordinal"] = ordinal
     raw_answer = value.get("raw_answer")
     if isinstance(raw_answer, str):
         result["raw_answer"] = raw_answer[:4_096]
@@ -1489,6 +1535,7 @@ def _safe_channel_statuses(value: Any) -> dict[str, dict[str, Any]]:
             "dropped_tokens",
             "query_variant_count",
             "result_count",
+            "refined_count",
             "expected_count",
             "candidate_video_count",
             "scored_video_count",
@@ -1523,6 +1570,16 @@ def _safe_query_processing(value: Any) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         return {}
     result: dict[str, Any] = {}
+    batch_search = value.get("batch_search")
+    if isinstance(batch_search, Mapping):
+        from src.retrieval.batch_scope import BATCHES
+
+        result["batch_search"] = {
+            "policy": "equal_batch_rrf_v1",
+            "batches": [batch for batch in BATCHES if batch in batch_search.get("batches", ())],
+            "result_counts": {batch: count for batch, count in batch_search.get("result_counts", {}).items()
+                              if batch in BATCHES and type(count) is int and 0 <= count <= 100},
+        }
     for field in (
         "detected_language",
         "translation_source",
@@ -1553,7 +1610,7 @@ def _safe_query_processing(value: Any) -> dict[str, Any]:
     applied = value.get("translation_applied")
     if isinstance(applied, bool):
         result["translation_applied"] = applied
-    for field in ("candidate_rescue", "video_local"):
+    for field in ("candidate_rescue", "video_local", "temporal_sequence"):
         raw_stage = value.get(field)
         if not isinstance(raw_stage, Mapping):
             continue
@@ -1622,6 +1679,17 @@ def _safe_query_processing(value: Any) -> dict[str, Any]:
                 stage["trigger_reasons"] = safe_reasons
         if stage:
             result[field] = stage
+    feedback = value.get("interactive_feedback")
+    if isinstance(feedback, Mapping):
+        result["interactive_feedback"] = {
+            "updated_channels": [str(v) for v in feedback.get("updated_channels", ()) if _safe_identifier(v)],
+            "unavailable_channels": {
+                str(k): str(v) for k, v in feedback.get("unavailable_channels", {}).items()
+                if _safe_identifier(k) and _safe_identifier(v)
+            },
+            "image_only": bool(feedback.get("image_only")),
+            "reference_used": bool(feedback.get("reference_used")),
+        }
     raw_ocr_quality = value.get("ocr_quality")
     if isinstance(raw_ocr_quality, Mapping):
         ocr_quality: dict[str, Any] = {}
@@ -2008,6 +2076,15 @@ def _safe_query_processing(value: Any) -> dict[str, Any]:
                     cache["archive_open_ms"] = round(float(open_ms), 3)
             if cache:
                 safe_advanced[cache_name] = cache
+        timings = advanced.get("stage_timings_ms")
+        if isinstance(timings, Mapping):
+            safe_advanced["stage_timings_ms"] = {
+                name: round(float(timings[name]), 3)
+                for name in ("metadata", "object_prefetch", "geometry", "color", "fusion")
+                if isinstance(timings.get(name), (int, float))
+                and not isinstance(timings[name], bool)
+                and 0 <= timings[name] <= 600_000
+            }
         if safe_advanced:
             result["advanced_rerank"] = safe_advanced
 
@@ -2112,6 +2189,10 @@ def _safe_qa_snapshot(context: RuntimeContext, search_id: str) -> dict[str, Any]
                     f"/v1/frames/{candidate.batch_id}/{candidate.video_id}/"
                     f"{candidate.source_frame_idx}/image"
                 )
+                if candidate.batch_id == "aic26-b2":
+                    from src.ingest.b02_presentation import present_ordinal_frame
+
+                    public.update(present_ordinal_frame(candidate))
                 # Dense/lexical evidence can contain backend-specific payloads.
                 # Public QA retrieval exposes only stable channel ranks.
                 public_evidence: dict[str, Any] = {
@@ -2504,6 +2585,71 @@ def create_app(context: RuntimeContext) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.runtime = context
+    from src.retrieval.event_inspection import EventInspector
+
+    inspector = EventInspector(getattr(context, "artifact_repository", None),
+                               getattr(context, "qa_image_resolver", None),
+                               getattr(getattr(context, "qa_reasoner", None), "local", None))
+
+    @app.middleware("http")
+    async def protect_manual_inference(request, call_next):
+        # No queue: manual inference declines while retrieval/QA is already using models.
+        guarded = request.method == "POST" and (
+            request.url.path in {"/v1/kis/search", "/v1/kis/refine", "/v1/runtime/warmup/start"}
+            or request.url.path.startswith(("/v1/qa/", "/v1/trake/")))
+        if guarded and not inspector.enter_retrieval():
+            return JSONResponse(status_code=409, content={"detail": "manual_local_inference_busy"})
+        try:
+            return await call_next(request)
+        finally:
+            if guarded:
+                inspector.leave_retrieval()
+
+    @app.post("/v1/kis/inspect-event")
+    def inspect_event(payload: dict[str, Any]) -> dict[str, Any]:
+        if not context.config.get("retrieval", {}).get("interactive", {}).get("event_inspection_enabled", False):
+            return {"state": "unavailable", "reason_code": "feature_disabled", "ranking_applied": False}
+        warmup = _warmup_snapshot(context)
+        if warmup and warmup.get("state") not in {"ready", "evicted"}:
+            return {"state": "unavailable", "reason_code": "warmup_busy", "ranking_applied": False}
+        try:
+            raw = payload.get("frames")
+            if not isinstance(raw, list) or not 1 <= len(raw) <= 3:
+                raise ValueError("one_to_three_frames_required")
+            refs = [FrameReference(**value) for value in raw]
+            for ref in refs:
+                _runtime_batch_filters(context, (ref.batch_id,))
+            return inspector.inspect(refs, payload.get("question"))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422, detail="invalid_event_inspection_request") from None
+
+    @app.post("/v1/kis/confirm-answer")
+    def confirm_answer(payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            if payload.get("confirmed") is not True:
+                raise ValueError("explicit_confirmation_required")
+            request = QueryRequest.from_dict(payload["request"])
+            frame = FrameReference(**payload["frame"])
+            elapsed = payload["elapsed_ms"]
+            if (not request.interaction_session_id or not request.interaction_turn
+                    or request.event_source not in {"user", "agent", "benchmark"}
+                    or isinstance(elapsed, bool) or not isinstance(elapsed, (int, float))
+                    or not math.isfinite(elapsed) or not 0 <= elapsed <= 604800000):
+                raise ValueError("invalid_confirmation")
+            _runtime_batch_filters(context, (frame.batch_id,))
+            if not context.artifact_repository.get_frame(frame.batch_id, frame.video_id, frame.source_frame_idx):
+                raise ValueError("canonical_frame_missing")
+            logger = getattr(context, "interaction_logger", None)
+            if logger is None or getattr(logger, "mode", "off") == "off":
+                raise HTTPException(status_code=503, detail="interaction_log_unavailable")
+            logger.record_confirmation(session_id=request.interaction_session_id,
+                                       turn=request.interaction_turn, query_id=request.query_id,
+                                       frame=payload["frame"], elapsed_ms=elapsed, event_source=request.event_source)
+            return {"recorded": True, "human_label": request.event_source == "user"}
+        except (KeyError, TypeError, ValueError):
+            raise HTTPException(status_code=422, detail="invalid_explicit_confirmation") from None
+        except OSError:
+            raise HTTPException(status_code=503, detail="interaction_log_unavailable") from None
     launch_identity = sanitize_launch_identity(getattr(context, "launch_identity", {}))
     source_contract_sha256 = str(
         launch_identity.get("source_contract_sha256") or source_contract_fingerprint()
@@ -2525,7 +2671,7 @@ def create_app(context: RuntimeContext) -> FastAPI:
         started = time.monotonic()
         try:
             _release_local_vlm(context)
-            _require_search_usable(context, "kis")
+            _require_search_usable(context, "kis", batches=request.batch_filters)
             response = _search_payload(context, request)
             logger = getattr(context, "interaction_logger", None)
             if logger is not None:
@@ -2539,6 +2685,11 @@ def create_app(context: RuntimeContext) -> FastAPI:
                         latency_ms=(time.monotonic() - started) * 1_000,
                         diagnostics=response.get("query_processing"),
                     )
+                    if hasattr(logger, "record_turn"):
+                        logger.record_turn(request, results=response.get("hits", ()),
+                                           latency_ms=(time.monotonic()-started)*1000,
+                                           retrieval_fingerprint=context.pipeline.fingerprint,
+                                           kind="search_turn")
                 except (OSError, TypeError, ValueError):
                     pass
             return response
@@ -2580,12 +2731,27 @@ def create_app(context: RuntimeContext) -> FastAPI:
                 detail={"code": "kis_internal_error", "correlation_id": event_id},
             ) from None
 
+    @app.post("/v1/kis/preview-edit")
+    def preview_kis_edit(payload: dict[str, Any]) -> dict[str, Any]:
+        from src.retrieval.refinement_preview import preview_edit
+        try:
+            return preview_edit(payload.get("query"), payload.get("instruction"))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422, detail="invalid_edit_preview") from None
+
     @app.post("/v1/kis/refine")
     def refine(payload: dict[str, Any]) -> dict[str, Any]:
+        started = time.monotonic()
         try:
             request = _with_runtime_batches(context, QueryRequest.from_dict(payload))
+            from src.ingest.frame_identity import resolve_image_frame
+
+            for ref in (*request.positive_frames, *request.negative_frames, request.reference_frame):
+                if ref is not None and ref.batch_id == "aic26-b2":
+                    if resolve_image_frame(context.artifact_repository, ref) is None:
+                        raise ValueError("missing canonical feedback image")
             _release_local_vlm(context)
-            _require_search_usable(context, "kis")
+            _require_search_usable(context, "kis", batches=request.batch_filters)
             hits = context.pipeline.refine(
                 request,
                 positive_ids=tuple(_feedback_key(value) for value in request.positive_feedback_ids),
@@ -2600,6 +2766,10 @@ def create_app(context: RuntimeContext) -> FastAPI:
                         positive_ids=request.positive_feedback_ids,
                         negative_ids=request.negative_feedback_ids,
                     )
+                    if hasattr(logger, "record_turn"):
+                        logger.record_turn(request, results=hits, latency_ms=(time.monotonic()-started)*1000,
+                                           retrieval_fingerprint=getattr(context.pipeline, "fingerprint", ""),
+                                           kind="refinement_turn")
                 except (OSError, TypeError, ValueError):
                     pass
             return {
@@ -2634,7 +2804,7 @@ def create_app(context: RuntimeContext) -> FastAPI:
                 raise TypeError("invalid TRAKE request type")
             request = resolved
             _release_local_vlm(context)
-            _require_search_usable(context, "trake")
+            _require_search_usable(context, "trake", batches=request.batch_filters)
             pipeline = _trake_pipeline(context)
             response = pipeline.search(
                 request,
@@ -2703,7 +2873,7 @@ def create_app(context: RuntimeContext) -> FastAPI:
                 if not isinstance(request, QACandidateRequest):
                     raise TypeError("invalid QA candidate request")
             _release_local_vlm_for_qa_retrieval(context, request.batch_filters[0])
-            _require_search_usable(context, "kis")
+            _require_search_usable(context, "kis", batches=request.batch_filters)
             pipeline = _qa_pipeline(context)
             search_id = uuid4().hex
             pipeline.start_candidate_search(
@@ -2758,7 +2928,7 @@ def create_app(context: RuntimeContext) -> FastAPI:
         try:
             request = QAFrameInjectionRequest.from_dict(payload)
             selected_batch_id = str(getattr(context, "selected_batch_id", "") or "")
-            if request.batch_id != selected_batch_id:
+            if request.batch_id not in getattr(context, "default_search_batches", (selected_batch_id,)):
                 raise ValueError("injected frame must belong to the selected batch")
             batches = _runtime_batch_filters(context, (request.batch_id,))
             if batches != (request.batch_id,):
@@ -3194,6 +3364,90 @@ def create_app(context: RuntimeContext) -> FastAPI:
             ) from None
 
 
+    @app.get("/v1/frames/{batch_id}/{video_id}/{source_frame_idx}/evidence")
+    def evidence_panel(batch_id: str, video_id: str, source_frame_idx: int, limit: int = 200) -> dict[str, Any]:
+        from src.retrieval.frame_evidence import frame_evidence
+
+        if not context.config.get("retrieval", {}).get("interactive", {}).get("evidence_enabled", True):
+            raise HTTPException(status_code=409, detail="evidence_disabled")
+        if context.artifact_repository is None:
+            raise HTTPException(status_code=503, detail="frame_repository_unavailable")
+        try:
+            batch = _runtime_batch_filters(context, (batch_id,))[0]
+            text_stores = {
+                channel.name: channel.store
+                for channel in getattr(context.pipeline, "lexical_channels", ())
+                if channel.name in {"ocr", "asr"}
+            }
+            return frame_evidence(
+                context.artifact_repository, batch, video_id, source_frame_idx,
+                limit=limit, text_stores=text_stores,
+            )
+        except LookupError:
+            raise HTTPException(status_code=404, detail="canonical_frame_not_found") from None
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=422, detail="invalid_evidence_request") from None
+
+    @app.get("/v1/keyframes/{batch_id}/{video_id}/{keyframe_ordinal}/neighbors")
+    def ordinal_neighbors(batch_id: str, video_id: str, keyframe_ordinal: int,
+                          radius: int = 5) -> dict[str, Any]:
+        from src.ingest.b02_presentation import ordinal_neighborhood
+
+        repository = context.artifact_repository
+        if repository is None or not callable(getattr(repository, "get_ordinal_frame", None)):
+            raise HTTPException(status_code=503, detail="ordinal repository unavailable")
+        try:
+            return ordinal_neighborhood(repository, batch_id, video_id, keyframe_ordinal, radius)
+        except LookupError:
+            raise HTTPException(status_code=404, detail="canonical keyframe not found") from None
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422, detail="invalid ordinal neighborhood") from None
+
+    @app.get("/v1/keyframes/{batch_id}/{video_id}/{keyframe_ordinal}/evidence")
+    def ordinal_evidence(batch_id: str, video_id: str, keyframe_ordinal: int, limit: int = 200) -> dict[str, Any]:
+        from src.ingest.b02_presentation import ordinal_thumbnail_url
+        from src.retrieval.frame_evidence import frame_evidence
+
+        if context.artifact_repository is None:
+            raise HTTPException(status_code=503, detail="ordinal_repository_unavailable")
+        try:
+            ordinal_thumbnail_url(batch_id, video_id, keyframe_ordinal)
+            frame = context.artifact_repository.get_ordinal_frame(batch_id, video_id, keyframe_ordinal)
+            if frame is None:
+                raise LookupError("missing ordinal")
+            stores = {c.name: c.store for c in getattr(context.pipeline, "lexical_channels", ()) if c.name in {"ocr", "asr"}}
+            response = frame_evidence(context.artifact_repository, batch_id, video_id, frame.source_frame_idx,
+                                      limit=limit, text_stores=stores, keyframe_ordinal=keyframe_ordinal)
+            response["coverage_note"] = "B02 OCR/ASR not yet provisioned; object labels are not OCR."
+            return response
+        except LookupError:
+            raise HTTPException(status_code=404, detail="canonical_keyframe_missing") from None
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422, detail="invalid_ordinal_evidence") from None
+
+    @app.get("/v1/keyframes/{batch_id}/{video_id}/{keyframe_ordinal}/image")
+    def ordinal_image(batch_id: str, video_id: str, keyframe_ordinal: int) -> Response:
+        from src.ingest.b02_presentation import ordinal_thumbnail_url
+
+        repository = context.artifact_repository
+        resolver = getattr(context, "qa_image_resolver", None)
+        if repository is None or resolver is None:
+            raise HTTPException(status_code=503, detail="canonical image service is unavailable")
+        try:
+            ordinal_thumbnail_url(batch_id, video_id, keyframe_ordinal)
+            frame = repository.get_ordinal_frame(batch_id, video_id, keyframe_ordinal)
+            if frame is None:
+                raise HTTPException(status_code=404, detail="canonical keyframe not found")
+            image = resolver.resolve(frame)
+            return Response(content=image.data, media_type=image.mime_type, headers={
+                "Cache-Control": "private, max-age=3600",
+                "ETag": f'"{image.content_sha256}"', "X-Content-Type-Options": "nosniff",
+            })
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(status_code=422, detail="canonical keyframe image unavailable") from None
+
     @app.get("/v1/frames/{batch_id}/{video_id}/{source_frame_idx}/image")
     def frame_image(batch_id: str, video_id: str, source_frame_idx: int) -> Response:
         repository = context.artifact_repository
@@ -3305,6 +3559,53 @@ def create_app(context: RuntimeContext) -> FastAPI:
             raise HTTPException(
                 status_code=422, detail="frame validation request is invalid"
             ) from None
+
+    @app.post("/v1/submissions/preview")
+    def combined_export_preview(payload: dict[str, Any]) -> dict[str, Any]:
+        from src.retrieval.batch_scope import BATCHES
+        from src.submission.combined import serialize_combined_submission
+
+        if tuple(getattr(context, "default_search_batches", ())) != BATCHES:
+            raise HTTPException(status_code=409, detail="combined_search_not_released")
+        try:
+            rows = payload.get("rows")
+            if not isinstance(rows, list) or not rows or len(rows) > 100:
+                raise ValueError("invalid rows")
+            for row in rows:
+                batch = row.get("batch_id")
+                if batch not in BATCHES or not context.ledger.is_batch_active(batch):
+                    raise ValueError("inactive batch")
+                specification = context.config.get("readiness", {}).get("batches", {}).get(batch, {})
+                flag = "trake_enabled" if payload.get("task") == "trake" else "retrieval_enabled"
+                if specification.get(flag, True) is False:
+                    raise ValueError("unreleased batch")
+            data = serialize_combined_submission(context.artifact_repository, rows,
+                task=payload.get("task", "kis"), answer_spec_id=payload.get("answer_spec_id"))
+        except (ValueError, TypeError, KeyError, AttributeError):
+            raise HTTPException(status_code=422, detail="combined_submission_invalid") from None
+        return {"csv_base64": base64.b64encode(data).decode("ascii"),
+                "sha256": hashlib.sha256(data).hexdigest(), "row_count": len(rows)}
+
+    @app.post("/v1/b02/submissions/preview")
+    def b02_export_preview(payload: dict[str, Any]) -> dict[str, Any]:
+        from src.submission.b02 import serialize_b02_submission
+
+        if (payload.get("task") == "trake" and not context.config.get("readiness", {}).get(
+                "batches", {}).get("aic26-b2", {}).get("trake_enabled", False)):
+            raise HTTPException(status_code=409, detail="b02_trake_not_released")
+        if not context.config.get("readiness", {}).get("batches", {}).get("aic26-b2", {}).get("retrieval_enabled", False):
+            raise HTTPException(status_code=409, detail="b02_not_released")
+        if context.artifact_repository is None or not context.ledger.is_batch_active("aic26-b2"):
+            raise HTTPException(status_code=409, detail="b02_not_active")
+        try:
+            data = serialize_b02_submission(context.artifact_repository, payload.get("rows"),
+                                            task=payload.get("task", "kis"),
+                                            answer_spec_id=payload.get("answer_spec_id"))
+        except (ValueError, TypeError, KeyError):
+            raise HTTPException(status_code=422, detail="b02_submission_invalid") from None
+        return {"csv_base64": base64.b64encode(data).decode("ascii"),
+                "sha256": hashlib.sha256(data).hexdigest(), "batch_id": "aic26-b2",
+                "coordinate_policy": "N=PTS milliseconds; M/S=source frame", "row_count": len(payload["rows"])}
 
     @app.post("/v1/submissions/export")
     def export(payload: dict[str, Any]) -> FileResponse:
@@ -3895,7 +4196,7 @@ def create_app(context: RuntimeContext) -> FastAPI:
 
     @app.get("/v1/readiness")
     def readiness(batch_id: str | None = None, mode: str = "app") -> dict[str, Any]:
-        """Return a sanitized, network-free readiness report for one batch."""
+        """Return sanitized readiness, refreshing local provider health."""
 
         service = getattr(context, "readiness_service", None)
         if service is None:
@@ -3914,6 +4215,9 @@ def create_app(context: RuntimeContext) -> FastAPI:
                     report = warmed
             if report is None:
                 report = service.check(selected_batch, mode=mode)
+            refresh = getattr(service, "refresh_reasoning", None)
+            if mode == "app" and callable(refresh):
+                report = refresh(report)
             payload = report.to_dict()
             payload["selected_batch_id"] = getattr(context, "selected_batch_id", None)
             payload["launch_identity"] = sanitize_launch_identity(
@@ -4083,6 +4387,9 @@ def create_app(context: RuntimeContext) -> FastAPI:
             except Exception:
                 report = None
         if report is not None:
+            refresh = getattr(service, "refresh_reasoning", None)
+            if callable(refresh):
+                report = refresh(report)
             for item in report.channels:
                 if item.name in {"ollama_vlm", "gemini_vlm"}:
                     channels[item.name] = item.to_dict()
@@ -4121,6 +4428,23 @@ def create_app(context: RuntimeContext) -> FastAPI:
         translation_ready = (
             translation_enabled and translation_files_ready and translation_dependency_ready
         )
+        translation_state = (
+            "configured_unverified" if translation_ready
+            else "not_provisioned" if translation_enabled else "disabled_by_profile"
+        )
+        translation_reason = (
+            "translator_not_warmed" if translation_ready
+            else "translator_asset_missing" if translation_enabled and not translation_files_ready
+            else "translator_dependency_missing" if translation_enabled else "translator_disabled"
+        )
+        snapshot = _warmup_snapshot(context) or {}
+        for channel in snapshot.get("channels", ()):
+            if isinstance(channel, Mapping) and channel.get("name") == "query_translation":
+                translation_state = str(channel.get("state", translation_state))
+                translation_reason = channel.get("reason_code")
+                break
+        local_reasoner = getattr(getattr(context, "qa_reasoner", None), "local", None)
+        local_inference_verified = bool(getattr(local_reasoner, "inference_verified", False))
         return {
             "runtime_contract": {
                 "version": RUNTIME_CONTRACT_VERSION,
@@ -4129,20 +4453,11 @@ def create_app(context: RuntimeContext) -> FastAPI:
             },
             "profile": str(context.config.get("profile", "laptop")),
             "default_batch_id": context.selected_batch_id,
+            "default_search_batches": list(getattr(context, "default_search_batches", (context.selected_batch_id,))),
             "workflows": ["kis", "qa", "trake"],
             "query_translation": {
-                "state": "ready"
-                if translation_ready
-                else ("not_provisioned" if translation_enabled else "disabled_by_profile"),
-                "reason_code": None
-                if translation_ready
-                else (
-                    "translator_asset_missing"
-                    if translation_enabled and not translation_files_ready
-                    else "translator_dependency_missing"
-                    if translation_enabled
-                    else "translator_disabled"
-                ),
+                "state": translation_state,
+                "reason_code": translation_reason,
                 "model": str(translation.get("model_name", "")),
                 "revision": str(translation.get("revision", "")),
                 "languages": ["vi", "en"],
@@ -4159,11 +4474,16 @@ def create_app(context: RuntimeContext) -> FastAPI:
                     "provider": "ollama-qwen",
                     "model": str(ollama.get("model", "qwen2.5vl:3b-q4_K_M")),
                     "status": channels.get("ollama_vlm", {}),
+                    "verification_scope": "service_and_model_identity",
+                    "inference_verified": local_inference_verified,
+                    "execution_mode": str(ollama.get("execution_mode", "auto")),
                 },
                 "cloud": {
                     "provider": "gemini",
                     "model": str(gemini.get("model", "gemini-3.6-flash")),
                     "status": channels.get("gemini_vlm", {}),
+                    "verification_scope": "configuration_only",
+                    "inference_verified": False,
                     "requires_external_frame_transfer_consent": True,
                 },
                 "experimental": {
@@ -4226,6 +4546,9 @@ def create_app(context: RuntimeContext) -> FastAPI:
                         report = warmed
                 if report is None:
                     report = service.check(context.selected_batch_id, mode="app")
+                refresh = getattr(service, "refresh_reasoning", None)
+                if callable(refresh):
+                    report = refresh(report)
                 channels = {item.name: item for item in report.channels}
                 canonical = bool(
                     channels.get("canonical_images") and channels["canonical_images"].usable

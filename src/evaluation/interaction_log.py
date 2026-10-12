@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import threading
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -120,6 +121,36 @@ class InteractionLogger:
                 ),
             }
         )
+
+    def record_turn(self, request: Any, *, results: Sequence[Mapping[str, Any]],
+                    latency_ms: float, retrieval_fingerprint: str, kind: str) -> None:
+        """Versioned event for real UI or declared benchmark turns, never qrels."""
+        identities = [{"batch_id": row.get("batch_id"), "video_id": row.get("video_id"),
+                       "source_frame_idx": row.get("source_frame_idx"), "rank": rank}
+                      for rank, row in enumerate(results[:self.max_results], 1)]
+        self._append({
+            "schema_version": 2, "event": kind, "recorded_at": datetime.now(timezone.utc).isoformat(),
+            "session_id": request.interaction_session_id, "turn": request.interaction_turn,
+            "query_id": request.query_id, "event_source": request.event_source,
+            "query": request.feedback_text or request.original_text,
+            "reference_frame": asdict(request.reference_frame) if request.reference_frame else None,
+            "positive_frames": [asdict(v) for v in request.positive_frames],
+            "negative_frames": [asdict(v) for v in request.negative_frames],
+            "legacy_positive_ids": list(request.positive_feedback_ids),
+            "legacy_negative_ids": list(request.negative_feedback_ids),
+            "results": identities, "latency_ms": round(latency_ms, 3),
+            "retrieval_fingerprint": retrieval_fingerprint, "human_label": False,
+        })
+
+    def record_confirmation(self, *, session_id: str, turn: int, query_id: str,
+                            frame: Mapping[str, Any], elapsed_ms: float,
+                            event_source: str) -> None:
+        """Explicit operator attestation only; pin/export never calls this method."""
+        self._append({"schema_version": 2, "event": "answer_confirmed",
+                      "recorded_at": datetime.now(timezone.utc).isoformat(),
+                      "session_id": session_id, "turn": turn, "query_id": query_id,
+                      "frame": dict(frame), "time_to_correct_ms": elapsed_ms,
+                      "event_source": event_source, "human_label": event_source == "user"})
 
 
 __all__ = ["InteractionLogger"]

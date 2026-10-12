@@ -7,6 +7,10 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
+FrameIdentity = tuple[str, int] | tuple[str, str, int]
+VideoIdentity = str | tuple[str, str]
+_B02_BATCH_ID = "aic26-b2"
+
 
 @dataclass(frozen=True)
 class ChannelRanking:
@@ -18,7 +22,7 @@ class ChannelRanking:
 
 
 def canonical_key(result: Mapping[str, Any]) -> tuple[str, int]:
-    """Extract the non-ambiguous frame key from a channel result."""
+    """Extract video ID and source-frame index for legacy callers/output."""
 
     payload = result.get("payload")
     source = payload if isinstance(payload, Mapping) else result
@@ -41,6 +45,44 @@ def canonical_key(result: Mapping[str, Any]) -> tuple[str, int]:
     return video_id, frame_int
 
 
+def frame_identity_key(result: Mapping[str, Any]) -> FrameIdentity:
+    """Use B02 ordinal identity without changing the legacy frame key contract.
+
+    Organizer ``source_frame_idx`` is advisory for B02 traffic video and can
+    repeat. B01 keeps its original ``(video_id, source_frame_idx)`` key.
+    """
+
+    video_id, source_frame_idx = canonical_key(result)
+    payload = result.get("payload")
+    source = payload if isinstance(payload, Mapping) else result
+    batch_id = source.get("batch_id", result.get("batch_id"))
+    if batch_id != _B02_BATCH_ID:
+        return video_id, source_frame_idx
+    ordinal = source.get("keyframe_ordinal", result.get("keyframe_ordinal"))
+    if isinstance(ordinal, bool) or not (
+        isinstance(ordinal, int)
+        or (isinstance(ordinal, str) and ordinal.isdecimal())
+    ):
+        raise ValueError("B02 retrieval result requires a positive keyframe_ordinal")
+    ordinal_int = int(ordinal)
+    if ordinal_int < 1:
+        raise ValueError("B02 retrieval result requires a positive keyframe_ordinal")
+    return _B02_BATCH_ID, video_id, ordinal_int
+
+
+def _video_identity(result: Mapping[str, Any]) -> VideoIdentity:
+    frame_identity = frame_identity_key(result)
+    if len(frame_identity) == 3:
+        return frame_identity[0], frame_identity[1]
+    return frame_identity[0]
+
+
+def _tie_breaker(item: Mapping[str, Any]) -> tuple[str, int, int]:
+    video_id, source_frame_idx = canonical_key(item)
+    identity = frame_identity_key(item)
+    return video_id, source_frame_idx, identity[2] if len(identity) == 3 else -1
+
+
 def _flatten(result: Mapping[str, Any]) -> dict[str, Any]:
     payload = result.get("payload")
     flattened = dict(payload) if isinstance(payload, Mapping) else {}
@@ -48,6 +90,10 @@ def _flatten(result: Mapping[str, Any]) -> dict[str, Any]:
     video_id, source_frame_idx = canonical_key(result)
     flattened["video_id"] = video_id
     flattened["source_frame_idx"] = source_frame_idx
+    identity = frame_identity_key(result)
+    if len(identity) == 3:
+        flattened["batch_id"] = identity[0]
+        flattened["keyframe_ordinal"] = identity[2]
     flattened.pop("frame_id", None)
     return flattened
 
@@ -59,23 +105,23 @@ def weighted_rrf(
 ) -> list[dict[str, Any]]:
     """Fuse heterogeneous rankings using weighted Reciprocal Rank Fusion.
 
-    Duplicate frame keys within one channel contribute only their best rank.
+    Duplicate frame identities within one channel contribute only their best rank.
     Raw cosine/lexical scores are retained as evidence but never combined.
     """
 
     if k < 0:
         raise ValueError("RRF k must be non-negative")
-    scores: dict[tuple[str, int], float] = defaultdict(float)
-    records: dict[tuple[str, int], dict[str, Any]] = {}
-    channel_ranks: dict[tuple[str, int], dict[str, int]] = defaultdict(dict)
-    evidence: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
+    scores: dict[FrameIdentity, float] = defaultdict(float)
+    records: dict[FrameIdentity, dict[str, Any]] = {}
+    channel_ranks: dict[FrameIdentity, dict[str, int]] = defaultdict(dict)
+    evidence: dict[FrameIdentity, list[dict[str, Any]]] = defaultdict(list)
 
     for ranking in rankings:
         if ranking.weight < 0:
             raise ValueError("channel weights must be non-negative")
-        seen: set[tuple[str, int]] = set()
+        seen: set[FrameIdentity] = set()
         for rank, result in enumerate(ranking.results, start=1):
-            key = canonical_key(result)
+            key = frame_identity_key(result)
             if key in seen:
                 continue
             seen.add(key)
@@ -107,6 +153,7 @@ def weighted_rrf(
                 "confidence",
                 "model_version",
                 "polygons",
+                "temporal_steps",
             ):
                 if field in source:
                     evidence_item[field] = source[field]
@@ -132,13 +179,7 @@ def weighted_rrf(
         if entity_matches:
             item["entity_matches"] = list(entity_matches.values())
         fused.append(item)
-    fused.sort(
-        key=lambda item: (
-            -float(item["score"]),
-            str(item["video_id"]),
-            int(item["source_frame_idx"]),
-        )
-    )
+    fused.sort(key=lambda item: (-float(item["score"]), *_tie_breaker(item)))
     return fused
 
 
@@ -151,14 +192,14 @@ def aggregate_temporal_windows(
 
     if window_ms <= 0:
         raise ValueError("window_ms must be positive")
-    groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    groups: dict[tuple[VideoIdentity, str], list[dict[str, Any]]] = defaultdict(list)
     timeless: list[dict[str, Any]] = []
     for item in candidates:
         timestamp = item.get("timestamp_ms")
         if timestamp is None:
             timeless.append(dict(item))
             continue
-        groups[(str(item["video_id"]), str(item.get("shot_id") or ""))].append(
+        groups[(_video_identity(item), str(item.get("shot_id") or ""))].append(
             dict(item)
         )
 
@@ -174,7 +215,18 @@ def aggregate_temporal_windows(
             ]
             ranked = sorted(nearby, key=lambda item: float(item["score"]), reverse=True)
             top_scores = [float(item["score"]) for item in ranked[:3]]
-            representative = dict(ranked[0])
+            # Distinct B02 images may share both advisory frame_idx and PTS.
+            # Keep each equal-time anchor as a distinct candidate rather than
+            # repeatedly selecting only the highest-scoring image.
+            same_time_collision = (
+                len(frame_identity_key(anchor)) == 3
+                and any(
+                    int(item["timestamp_ms"]) == int(anchor["timestamp_ms"])
+                    and frame_identity_key(item) != frame_identity_key(anchor)
+                    for item in nearby
+                )
+            )
+            representative = dict(anchor if same_time_collision else ranked[0])
             representative["score"] = max(top_scores) + sum(top_scores) / len(top_scores)
             representative["window_start_ms"] = max(0, int(anchor["timestamp_ms"] - half))
             representative["window_end_ms"] = int(anchor["timestamp_ms"] + half)
@@ -202,18 +254,14 @@ def aggregate_temporal_windows(
 
     # Multiple anchors can select the same representative; keep its strongest
     # window score before diversity filtering.
-    unique: dict[tuple[str, int], dict[str, Any]] = {}
+    unique: dict[FrameIdentity, dict[str, Any]] = {}
     for item in aggregated:
-        key = canonical_key(item)
+        key = frame_identity_key(item)
         if key not in unique or float(item["score"]) > float(unique[key]["score"]):
             unique[key] = item
     return sorted(
         unique.values(),
-        key=lambda item: (
-            -float(item["score"]),
-            str(item["video_id"]),
-            int(item["source_frame_idx"]),
-        ),
+        key=lambda item: (-float(item["score"]), *_tie_breaker(item)),
     )
 
 
@@ -229,13 +277,13 @@ def diversify(
     """Apply temporal NMS, uniqueness, and rank-band per-video quotas."""
 
     selected: list[dict[str, Any]] = []
-    seen: set[tuple[str, int]] = set()
-    per_video: dict[str, int] = defaultdict(int)
+    seen: set[FrameIdentity] = set()
+    per_video: dict[VideoIdentity, int] = defaultdict(int)
     for candidate in candidates:
-        key = canonical_key(candidate)
+        key = frame_identity_key(candidate)
         if key in seen:
             continue
-        video_id = key[0]
+        video_id = _video_identity(candidate)
         quota = early_per_video if len(selected) < early_cutoff else late_per_video
         if per_video[video_id] >= quota:
             continue
@@ -244,7 +292,17 @@ def diversify(
         too_close = False
         if timestamp is not None:
             for previous in selected:
-                if previous["video_id"] != video_id or previous.get("timestamp_ms") is None:
+                if (
+                    _video_identity(previous) != video_id
+                    or previous.get("timestamp_ms") is None
+                ):
+                    continue
+                if (
+                    len(key) == 3
+                    and int(previous["timestamp_ms"]) == int(timestamp)
+                    and frame_identity_key(previous) != key
+                ):
+                    # Equal PTS does not prove these B02 JPEGs are duplicates.
                     continue
                 same_shot = (
                     shot is None

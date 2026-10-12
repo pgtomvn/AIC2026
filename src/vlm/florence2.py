@@ -18,6 +18,7 @@ from src.vlm.qa_reasoner import (
     PROMPT_VERSION,
     QAImage,
     QAProviderRequestError,
+    QAProviderResponseError,
     QAProviderUnavailableError,
     _fingerprint,
     _validate_images,
@@ -163,7 +164,10 @@ class Florence2TaskReasoner:
                 return " ".join(str(item).strip() for item in value if str(item).strip())
             return ""
         if not isinstance(value, Mapping) or not isinstance(value.get("labels"), list):
-            return "0"
+            raise QAProviderResponseError(
+                "Florence-2 returned an invalid object detection payload",
+                provider="florence2-experimental", category="response_invalid",
+            )
         normalized_target = " ".join(str(target_label or "").casefold().split())
         return str(
             sum(

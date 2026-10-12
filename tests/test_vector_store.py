@@ -685,6 +685,58 @@ class TestBatchVectorStore:
         assert isinstance(bound, VectorStore)
         assert bound.collection_name == ("aic_native_aic26-b2_siglip2_b16_224_r75de2d55_768d_v1")
 
+    def test_legacy_collection_override_is_batch_scoped(self) -> None:
+        legacy = "aic25_b1_openclip_b32_quickgelu_openai_512d_v1"
+        routed = BatchVectorStore(
+            url="http://localhost:6333",
+            collection_template="aic_native_{batch}_openclip_b32_quickgelu_openai_512d_v1",
+            collection_overrides={"aic25-b1-reference": legacy},
+            vector_size=512,
+        )
+
+        assert routed.for_batch("aic25-b1-reference").collection_name == legacy
+        assert routed.for_batch("aic26-b2").collection_name == (
+            "aic_native_aic26-b2_openclip_b32_quickgelu_openai_512d_v1"
+        )
+        assert routed._selected_collection_names({"batch_id": ["aic25-b1-reference"]}) == [
+            legacy
+        ]
+
+    def test_collection_override_rejects_aliases_and_invalid_names(self) -> None:
+        kwargs = {
+            "url": "http://localhost:6333",
+            "collection_template": self.template,
+            "vector_size": 4,
+        }
+        with pytest.raises(ValueError, match="distinct"):
+            BatchVectorStore(
+                **kwargs,
+                collection_overrides={"batch-a": "shared", "batch-b": "shared"},
+            )
+        with pytest.raises(ValueError, match="invalid"):
+            BatchVectorStore(**kwargs, collection_overrides={"batch-a": "../unsafe"})
+
+    def test_unverified_batch_is_not_readable_even_when_collection_exists(self) -> None:
+        client = RoutedQdrantClient()
+        routed = BatchVectorStore(
+            url="http://localhost:6333",
+            collection_template=self.template,
+            vector_size=4,
+            readable_batches={"aic25-b1"},
+        )
+        routed._client = client
+
+        assert routed._selected_collection_names({"batch_id": "aic26-b2"}) == []
+        assert routed.search(
+            np.ones(4, dtype=np.float32), filters={"batch_id": "aic26-b2"}
+        ) == []
+        assert client.queries == []
+        assert routed._discover_collection_names() == [
+            "aic_native_aic25-b1_siglip2_b16_224_r75de2d55_768d_v1"
+        ]
+        with pytest.raises(ValueError, match="not verified"):
+            routed.vectors_for_frames([("L21_V001", 1)], batch_id="aic26-b2")
+
     def test_for_batch_propagates_grpc_transport(self) -> None:
         routed = BatchVectorStore(
             url="http://localhost:6333",

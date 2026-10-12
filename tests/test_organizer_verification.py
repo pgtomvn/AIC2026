@@ -9,6 +9,7 @@ import pytest
 
 import src.runtime as runtime_module
 from src.organizer_verification import (
+    organizer_batch_verification_passed,
     organizer_verification_passed,
     persist_organizer_verification,
 )
@@ -71,12 +72,62 @@ def test_failed_verification_cannot_be_persisted(tmp_path: Path) -> None:
         )
 
 
+def test_b02_verification_requires_matching_batch_and_artifact_hashes(tmp_path: Path) -> None:
+    record = tmp_path / "b02-verification.json"
+    payload = {
+        "schema_version": "b02-clip-encoder-verification-v1",
+        "verified": True,
+        "batch_id": "aic26-b2",
+        "model_name": "ViT-B-32-quickgelu",
+        "pretrained": "openai",
+        "encoder_fingerprint": "fp-1",
+        "manifest_sha256": "manifest-digest",
+        "feature_archive_sha256": "feature-digest",
+        "dimension": 512,
+        "sample_count": 6,
+        "median_cosine": 0.9999,
+        "minimum_sample_cosine": 0.9998,
+    }
+    record.write_text(json.dumps(payload), encoding="utf-8")
+    model = {
+        **_model(tmp_path),
+        "embedding_dim": 512,
+        "batch_verifications": {
+            "aic26-b2": {
+                "record": str(record),
+                "manifest_sha256": "manifest-digest",
+                "feature_archive_sha256": "feature-digest",
+                "sample_count": 6,
+                "minimum_median_cosine": 0.999,
+                "minimum_sample_cosine": 0.999,
+            }
+        },
+    }
+
+    assert organizer_batch_verification_passed(
+        model, batch_id="aic26-b2", expected_fingerprint="fp-1", project_root=tmp_path
+    )
+    assert not organizer_batch_verification_passed(
+        model, batch_id="other", expected_fingerprint="fp-1", project_root=tmp_path
+    )
+    assert not organizer_batch_verification_passed(
+        model, batch_id="aic26-b2", expected_fingerprint="fp-2", project_root=tmp_path
+    )
+    payload["feature_archive_sha256"] = "wrong-digest"
+    record.write_text(json.dumps(payload), encoding="utf-8")
+    assert not organizer_batch_verification_passed(
+        model, batch_id="aic26-b2", expected_fingerprint="fp-1", project_root=tmp_path
+    )
+
+
 def test_runtime_uses_cpu_for_verified_organizer_query_channel(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = load_config()
     config["models"]["organizer_clip"]["query_device"] = "cpu"
-    monkeypatch.setattr(runtime_module, "organizer_verification_passed", lambda *a, **k: True)
+    monkeypatch.setattr(
+        runtime_module, "organizer_batch_verification_passed", lambda *a, **k: True
+    )
 
     pipeline = runtime_module.build_pipeline(config)
     organizer = next(channel for channel in pipeline.dense_channels if channel.name == "organizer_clip")

@@ -176,8 +176,9 @@ def load_config(config_name: str = "settings.yaml") -> dict[str, Any]:
 
     Values in the process environment take precedence over values read from the
     project ``.env`` file. Neither source is mutated. Service settings declare
-    their variable names through ``url_env`` and ``api_key_env`` metadata; an
-    unset or empty variable leaves the corresponding YAML default unchanged.
+    their variable names through ``url_env``, ``api_key_env``, and
+    ``execution_mode_env`` metadata; an unset or empty variable leaves the
+    corresponding YAML default unchanged.
 
     Args:
         config_name: Filename of the config in config/.
@@ -223,7 +224,7 @@ def load_config(config_name: str = "settings.yaml") -> dict[str, Any]:
         if not isinstance(service, dict):
             continue
 
-        for setting_name in ("url", "api_key"):
+        for setting_name in ("url", "api_key", "execution_mode"):
             env_name = service.get(f"{setting_name}_env")
             if not isinstance(env_name, str) or not env_name:
                 continue

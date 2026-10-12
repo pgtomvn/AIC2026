@@ -6,16 +6,18 @@ import csv
 import hashlib
 import io
 import json
+import re
 import tempfile
 import zipfile
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, Literal
 
 import numpy as np
 
 from src.contracts import FrameRecord
+from src.ingest.b02_keyframe_mapping import is_vfr_traffic_video, parse_b02_keyframe_row
 from src.ingest.ledger import ArtifactSpec, JobLedger, StageState
 from src.retrieval.query_plan import accent_fold, normalize_nfc
 
@@ -79,17 +81,38 @@ class OrganizerReferenceImporter:
         feature_archive: str | Path,
         keyframe_archives: Iterable[str | Path] = (),
         object_archive: str | Path | None = None,
+        object_archives: Iterable[str | Path] = (),
         metadata_archive: str | Path | None = None,
         batch_id: str = "aic25-b1-reference",
         object_confidence: float = 0.50,
+        identity_mode: Literal["source_frame_idx", "ordinal"] = "source_frame_idx",
+        metadata_policy: Literal["exact", "partial"] = "exact",
+        reference_manifest_sha256: str | None = None,
     ) -> None:
+        if identity_mode not in ("source_frame_idx", "ordinal"):
+            raise ValueError("identity_mode must be 'source_frame_idx' or 'ordinal'")
+        if metadata_policy not in ("exact", "partial"):
+            raise ValueError("metadata_policy must be 'exact' or 'partial'")
+        supplied_object_archives = tuple(Path(path) for path in object_archives)
+        if object_archive is not None and supplied_object_archives:
+            raise ValueError("pass object_archive or object_archives, not both")
         self.map_archive = Path(map_archive)
         self.feature_archive = Path(feature_archive)
         self.keyframe_archives = tuple(Path(path) for path in keyframe_archives)
         self.object_archive = Path(object_archive) if object_archive else None
+        self.object_archives = (
+            (self.object_archive,) if self.object_archive else supplied_object_archives
+        )
         self.metadata_archive = Path(metadata_archive) if metadata_archive else None
         self.batch_id = batch_id
         self.object_confidence = object_confidence
+        self.identity_mode = identity_mode
+        self.metadata_policy = metadata_policy
+        if reference_manifest_sha256 is not None and not re.fullmatch(
+            r"[0-9a-f]{64}", reference_manifest_sha256
+        ):
+            raise ValueError("reference_manifest_sha256 must be a SHA-256 digest")
+        self.reference_manifest_sha256 = reference_manifest_sha256
 
     def _indexes(self) -> tuple[dict[str, zipfile.ZipInfo], dict[str, zipfile.ZipInfo]]:
         with zipfile.ZipFile(self.map_archive) as maps:
@@ -111,12 +134,26 @@ class OrganizerReferenceImporter:
         return map_index, feature_index
 
     @staticmethod
-    def _payload(video_id: str, row: dict[str, str], image_uri: str) -> dict[str, Any]:
+    def _select_videos(
+        map_index: dict[str, zipfile.ZipInfo], video_ids: Iterable[str] | None
+    ) -> dict[str, zipfile.ZipInfo]:
+        if video_ids is None:
+            return map_index
+        selected = set(video_ids)
+        if not selected or selected - set(map_index):
+            raise ValueError("selected videos must be a nonempty subset of the frame map")
+        return {video_id: map_index[video_id] for video_id in sorted(selected)}
+
+    def _payload(self, video_id: str, row: dict[str, str], image_uri: str) -> dict[str, Any]:
         ordinal = int(row["n"])
         source_frame_idx = int(row["frame_idx"])
-        timestamp_ms = round(float(row["pts_time"]) * 1000)
+        timestamp_ms = (
+            parse_b02_keyframe_row(self.batch_id, video_id, row).timestamp_ms
+            if self.identity_mode == "ordinal"
+            else round(float(row["pts_time"]) * 1000)
+        )
         fps = Fraction(str(row["fps"])).limit_denominator(100_000)
-        return {
+        payload = {
             "video_id": video_id,
             "keyframe_ordinal": ordinal,
             "source_frame_idx": source_frame_idx,
@@ -126,6 +163,21 @@ class OrganizerReferenceImporter:
             "shot_id": f"reference:{ordinal}",
             "image_uri": image_uri,
         }
+        if self.identity_mode == "ordinal":
+            payload["pts_time"] = row["pts_time"]
+            if self.reference_manifest_sha256 is not None:
+                payload["reference_manifest_sha256"] = self.reference_manifest_sha256
+            payload["trake_eligible"] = (
+                not is_vfr_traffic_video(video_id) and video_id != "M08_V001"
+            )
+        return payload
+
+    def _metadata_video_id(self, raw_video_id: str) -> str:
+        if self.identity_mode == "ordinal":
+            match = re.fullmatch(r"S(\d{2})_V(\d{3})", raw_video_id)
+            if match is not None:
+                return f"S{match.group(1)}-V{match.group(2)}"
+        return raw_video_id
 
     def _keyframe_archives_by_video(self) -> dict[str, Path]:
         result: dict[str, Path] = {}
@@ -172,6 +224,13 @@ class OrganizerReferenceImporter:
                 ordinals = [int(row["n"]) for row in rows]
                 if ordinals != list(range(1, len(rows) + 1)):
                     raise ValueError(f"non-contiguous keyframe ordinals for {video_id}")
+                if self.identity_mode == "ordinal":
+                    times = [
+                        parse_b02_keyframe_row(self.batch_id, video_id, row).timestamp_ms
+                        for row in rows
+                    ]
+                    if times != sorted(times):
+                        raise ValueError(f"decreasing keyframe PTS for {video_id}")
                 frame_count += len(rows)
                 feature_count += int(array.shape[0])
         keyframe_count = 0
@@ -194,13 +253,20 @@ class OrganizerReferenceImporter:
                     keyframe_count += len(expected_ordinals)
 
         object_count = 0
-        if self.object_archive is not None:
+        if self.object_archives:
             objects: dict[str, set[int]] = {}
-            with zipfile.ZipFile(self.object_archive) as archive:
-                for info in _safe_members(archive, ".json"):
-                    path = PurePosixPath(info.filename)
-                    if len(path.parts) >= 3 and path.stem.isdigit():
-                        objects.setdefault(path.parts[-2], set()).add(int(path.stem))
+            for archive_path in self.object_archives:
+                with zipfile.ZipFile(archive_path) as archive:
+                    for info in _safe_members(archive, ".json"):
+                        path = PurePosixPath(info.filename)
+                        if len(path.parts) < 2 or not path.stem.isdigit():
+                            continue
+                        video_id = path.parts[-2]
+                        ordinal = int(path.stem)
+                        ordinals = objects.setdefault(video_id, set())
+                        if ordinal in ordinals:
+                            raise ValueError(f"duplicate object ordinal {video_id}/{ordinal}")
+                        ordinals.add(ordinal)
             if set(objects) != set(map_index):
                 raise ValueError("object videos do not exactly match frame-map videos")
             with zipfile.ZipFile(self.map_archive) as maps:
@@ -213,9 +279,20 @@ class OrganizerReferenceImporter:
         metadata_count = 0
         if self.metadata_archive is not None:
             with zipfile.ZipFile(self.metadata_archive) as archive:
-                metadata_videos = {_video_id(info) for info in _safe_members(archive, ".json")}
-            if metadata_videos != set(map_index):
-                raise ValueError("metadata videos do not exactly match frame-map videos")
+                members = _safe_members(archive, ".json")
+                metadata_videos = {self._metadata_video_id(_video_id(info)) for info in members}
+            if len(metadata_videos) != len(members):
+                raise ValueError("duplicate metadata videos after ID normalization")
+            if self.metadata_policy == "exact":
+                if metadata_videos != set(map_index):
+                    raise ValueError("metadata videos do not exactly match frame-map videos")
+            elif metadata_videos - set(map_index):
+                raise ValueError("metadata videos have no frame map")
+            elif self.identity_mode == "ordinal" and any(
+                video_id not in metadata_videos and not is_vfr_traffic_video(video_id)
+                for video_id in map_index
+            ):
+                raise ValueError("nontraffic videos are missing metadata")
             metadata_count = len(metadata_videos)
 
         if self.keyframe_archives and keyframe_count != frame_count:
@@ -235,10 +312,13 @@ class OrganizerReferenceImporter:
         recreate: bool = False,
         expected_videos: int | None = None,
         expected_frames: int | None = None,
+        video_ids: Iterable[str] | None = None,
+        before_video: Callable[[str], None] | None = None,
     ) -> ReferenceStats:
         """Stream one video's feature matrix at a time into a vector store."""
 
         map_index, feature_index = self._indexes()
+        map_index = self._select_videos(map_index, video_ids)
         keyframe_locations = self._keyframe_archives_by_video()
         store.create_collection(recreate=recreate)
         frame_count = 0
@@ -247,6 +327,8 @@ class OrganizerReferenceImporter:
             zipfile.ZipFile(self.feature_archive) as features,
         ):
             for video_id in sorted(map_index):
+                if before_video is not None:
+                    before_video(video_id)
                 rows = _frame_rows(maps, map_index[video_id])
                 vectors = np.load(
                     io.BytesIO(features.read(feature_index[video_id])), allow_pickle=False
@@ -280,8 +362,10 @@ class OrganizerReferenceImporter:
             raise ValueError(f"expected {expected_videos} videos, found {stats.videos}")
         if expected_frames is not None and stats.frames != expected_frames:
             raise ValueError(f"expected {expected_frames} frames, found {stats.frames}")
-        if store.count() != frame_count:
-            raise ValueError(f"vector index count {store.count()} does not match {frame_count}")
+        filters = {"batch_id": self.batch_id, "video_id": list(map_index)} if video_ids is not None else None
+        count = store.count(filters) if filters else store.count()
+        if count != frame_count:
+            raise ValueError(f"vector index count {count} does not match {frame_count}")
         return stats
 
     def verify_vector_store(
@@ -290,10 +374,12 @@ class OrganizerReferenceImporter:
         *,
         expected_videos: int | None = None,
         expected_frames: int | None = None,
+        video_ids: Iterable[str] | None = None,
     ) -> ReferenceStats:
         """Verify existing vector payload identities against every organizer map row."""
 
         map_index, _ = self._indexes()
+        map_index = self._select_videos(map_index, video_ids)
         store.create_collection(recreate=False)
         total = 0
         with zipfile.ZipFile(self.map_archive) as maps:
@@ -324,13 +410,29 @@ class OrganizerReferenceImporter:
                     raise ValueError(
                         f"vector payload identities do not match frame map for {video_id}"
                     )
+                if self.identity_mode == "ordinal":
+                    expected_payloads = {
+                        int(row["n"]): self._payload(video_id, row, "") for row in rows
+                    }
+                    for payload in payloads:
+                        ordinal = int(payload["keyframe_ordinal"])
+                        expected_payload = expected_payloads[ordinal]
+                        fields = ["timestamp_ms", "pts_time", "trake_eligible", "fps_num", "fps_den"]
+                        if self.reference_manifest_sha256 is not None:
+                            fields.append("reference_manifest_sha256")
+                        for field in fields:
+                            if payload.get(field) != expected_payload[field]:
+                                raise ValueError(f"B02 vector {field} mismatch: {video_id}/{ordinal}")
                 total += len(actual)
         stats = ReferenceStats(len(map_index), total, total, 0, 0)
         if expected_videos is not None and stats.videos != expected_videos:
             raise ValueError(f"expected {expected_videos} videos, found {stats.videos}")
         if expected_frames is not None and stats.frames != expected_frames:
             raise ValueError(f"expected {expected_frames} frames, found {stats.frames}")
-        if store.count(filters={"batch_id": self.batch_id}) != total:
+        filters = {"batch_id": self.batch_id}
+        if video_ids is not None:
+            filters["video_id"] = list(map_index)
+        if store.count(filters=filters) != total:
             raise ValueError(
                 "organizer collection contains an unexpected number of points for the batch"
             )
@@ -343,19 +445,26 @@ class OrganizerReferenceImporter:
         ledger: JobLedger | None = None,
         vectors_ready: bool = False,
         competition: str = "aic25",
+        video_ids: Iterable[str] | None = None,
+        before_video: Callable[[str], None] | None = None,
     ) -> CanonicalReferenceStats:
         """Persist organizer maps as canonical frames without expanding JPEG ZIPs.
 
-        Adjacent organizer JPEG ordinals can map to the same source frame.  The
-        canonical frame table stores that source identity once, while the
-        repository's mapping table retains every supplied ordinal for export
-        validation.
+        The default Batch 1 path retains one row per source frame plus ordinal
+        aliases. Explicit ordinal mode retains every Batch 2 keyframe, including
+        rows with the same source frame or presentation timestamp.
         """
 
         map_index, _ = self._indexes()
+        map_index = self._select_videos(map_index, video_ids)
         keyframe_locations = self._keyframe_archives_by_video()
         source_digest = _sha256(self.map_archive)
-        frame_fingerprint = f"organizer-reference-map-v1:{source_digest[:24]}"
+        frame_version = (
+            "organizer-reference-ordinal-map-v1"
+            if self.identity_mode == "ordinal"
+            else "organizer-reference-map-v1"
+        )
+        frame_fingerprint = f"{frame_version}:{source_digest[:24]}"
         vector_fingerprint = f"organizer-reference-vectors-v1:{source_digest[:24]}"
         if ledger is not None:
             ledger.register_batch(
@@ -369,30 +478,41 @@ class OrganizerReferenceImporter:
         canonical_count = 0
         with zipfile.ZipFile(self.map_archive) as maps:
             for video_id in sorted(map_index):
+                if before_video is not None:
+                    before_video(video_id)
                 rows = _frame_rows(maps, map_index[video_id])
                 archive_path = keyframe_locations.get(video_id)
                 canonical: dict[int, FrameRecord] = {}
                 ordinal_to_source: dict[int, int] = {}
+                previous_timestamp_ms = -1
                 for row in rows:
                     ordinal = int(row["n"])
                     source_frame_idx = int(row["frame_idx"])
                     ordinal_to_source[ordinal] = source_frame_idx
-                    if source_frame_idx in canonical:
+                    if self.identity_mode == "source_frame_idx" and source_frame_idx in canonical:
                         continue
-                    timestamp_ms = round(float(row["pts_time"]) * 1000)
+                    timestamp_ms = self._payload(video_id, row, "")["timestamp_ms"]
+                    if self.identity_mode == "ordinal":
+                        if ordinal != len(canonical) + 1:
+                            raise ValueError(f"non-contiguous keyframe ordinals for {video_id}")
+                        if timestamp_ms < previous_timestamp_ms:
+                            raise ValueError(f"decreasing keyframe PTS for {video_id}")
+                        previous_timestamp_ms = timestamp_ms
                     fps = Fraction(str(row["fps"])).limit_denominator(100_000)
                     image_uri = (
                         f"zip://{archive_path.resolve()}!/keyframes/{video_id}/{ordinal:03d}.jpg"
                         if archive_path is not None
                         else f"reference://{self.batch_id}/{video_id}/ordinal/{ordinal}"
                     )
-                    canonical[source_frame_idx] = FrameRecord(
+                    identity = ordinal if self.identity_mode == "ordinal" else source_frame_idx
+                    exact_pts = Fraction(str(row["pts_time"]))
+                    canonical[identity] = FrameRecord(
                         batch_id=self.batch_id,
                         video_id=video_id,
                         keyframe_ordinal=ordinal,
                         source_frame_idx=source_frame_idx,
-                        pts=timestamp_ms,
-                        time_base="1/1000",
+                        pts=(exact_pts.numerator if self.identity_mode == "ordinal" else timestamp_ms),
+                        time_base=(f"1/{exact_pts.denominator}" if self.identity_mode == "ordinal" else "1/1000"),
                         timestamp_ms=timestamp_ms,
                         fps_num=fps.numerator,
                         fps_den=fps.denominator,
@@ -401,12 +521,17 @@ class OrganizerReferenceImporter:
                         image_uri=image_uri,
                         video_uri=f"reference://{self.batch_id}/{video_id}",
                         source_sha256=source_digest,
-                        extractor_version="organizer-reference-map-v1",
+                        extractor_version=frame_version,
                     )
 
                 records = tuple(canonical.values())
-                repository.upsert_frames(records, fingerprint=frame_fingerprint)
-                repository.upsert_frame_mappings(self.batch_id, video_id, ordinal_to_source)
+                if self.identity_mode == "ordinal":
+                    repository.upsert_ordinal_frames(
+                        records, fingerprint=frame_fingerprint, index_ready=vectors_ready
+                    )
+                else:
+                    repository.upsert_frames(records, fingerprint=frame_fingerprint)
+                    repository.upsert_frame_mappings(self.batch_id, video_id, ordinal_to_source)
                 mapping_rows += len(rows)
                 canonical_count += len(records)
 
@@ -487,63 +612,71 @@ class OrganizerReferenceImporter:
                     lookup[(video_id, int(row["n"]))] = self._payload(video_id, row, "")
         return lookup
 
-    def import_objects(self, store: Any, *, create_index: bool = True) -> int:
+    def import_objects(
+        self, store: Any, *, create_index: bool = True,
+        before_batch: Callable[[], None] | None = None,
+    ) -> int:
         """Stream high-confidence organizer object labels into a lexical index."""
 
-        if self.object_archive is None:
+        if not self.object_archives:
             return 0
         mapping = self._map_lookup()
         if create_index:
             store.create_index()
         count = 0
         pending: list[dict[str, Any]] = []
-        with zipfile.ZipFile(self.object_archive) as archive:
-            for info in _safe_members(archive, ".json"):
-                path = PurePosixPath(info.filename)
-                if len(path.parts) < 3 or not path.stem.isdigit():
-                    continue
-                video_id = path.parts[-2]
-                ordinal = int(path.stem)
-                frame = mapping.get((video_id, ordinal))
-                if frame is None:
-                    raise ValueError(f"object file has no frame map: {info.filename}")
-                payload = json.loads(archive.read(info))
-                scores = payload.get("detection_scores", [])
-                names = payload.get("detection_class_names", [])
-                entities = payload.get("detection_class_entities", [])
-                if len(names) < len(scores) and len(entities) < len(scores):
-                    raise ValueError(f"misaligned object detections: {info.filename}")
-                labels: list[str] = []
-                for index, score in enumerate(scores):
-                    if float(score) < self.object_confidence:
+        for archive_path in self.object_archives:
+            with zipfile.ZipFile(archive_path) as archive:
+                for info in _safe_members(archive, ".json"):
+                    path = PurePosixPath(info.filename)
+                    if len(path.parts) < 2 or not path.stem.isdigit():
                         continue
-                    entity = str(entities[index]).strip() if index < len(entities) else ""
-                    name = str(names[index]).strip() if index < len(names) else ""
-                    # Organizer names are often OpenImages MIDs.  Keep readable
-                    # class names only; never pollute lexical search with /m/*.
-                    if name and not name.startswith("/m/"):
-                        labels.append(name)
-                    if entity:
-                        labels.append(entity)
-                text = normalize_nfc(" ".join(dict.fromkeys(labels)))
-                if not text:
-                    continue
-                pending.append(
-                    {
-                        "id": f"object:{self.batch_id}:{video_id}:ordinal:{ordinal}",
-                        "batch_id": self.batch_id,
-                        **frame,
-                        "kind": "objects",
-                        "text_raw": text,
-                        "text_nfc": text,
-                        "text_accent_folded": accent_fold(text),
-                    }
-                )
-                if len(pending) >= 1_000:
-                    store.add_documents(pending)
-                    count += len(pending)
-                    pending.clear()
+                    video_id = path.parts[-2]
+                    ordinal = int(path.stem)
+                    frame = mapping.get((video_id, ordinal))
+                    if frame is None:
+                        raise ValueError(f"object file has no frame map: {info.filename}")
+                    payload = json.loads(archive.read(info))
+                    scores = payload.get("detection_scores", [])
+                    names = payload.get("detection_class_names", [])
+                    entities = payload.get("detection_class_entities", [])
+                    if len(names) < len(scores) and len(entities) < len(scores):
+                        raise ValueError(f"misaligned object detections: {info.filename}")
+                    labels: list[str] = []
+                    for index, score in enumerate(scores):
+                        if float(score) < self.object_confidence:
+                            continue
+                        entity = str(entities[index]).strip() if index < len(entities) else ""
+                        name = str(names[index]).strip() if index < len(names) else ""
+                        # Organizer names are often OpenImages MIDs. Keep readable
+                        # class names only; never pollute lexical search with /m/*.
+                        if name and not name.startswith("/m/"):
+                            labels.append(name)
+                        if entity:
+                            labels.append(entity)
+                    text = normalize_nfc(" ".join(dict.fromkeys(labels)))
+                    if not text:
+                        continue
+                    pending.append(
+                        {
+                            "id": f"object:{self.batch_id}:{video_id}:ordinal:{ordinal}",
+                            "batch_id": self.batch_id,
+                            **frame,
+                            "kind": "objects",
+                            "text_raw": text,
+                            "text_nfc": text,
+                            "text_accent_folded": accent_fold(text),
+                        }
+                    )
+                    if len(pending) >= 1_000:
+                        if before_batch is not None:
+                            before_batch()
+                        store.add_documents(pending)
+                        count += len(pending)
+                        pending.clear()
         if pending:
+            if before_batch is not None:
+                before_batch()
             store.add_documents(pending)
             count += len(pending)
         return count
@@ -563,7 +696,7 @@ class OrganizerReferenceImporter:
         documents: list[dict[str, Any]] = []
         with zipfile.ZipFile(self.metadata_archive) as archive:
             for info in _safe_members(archive, ".json"):
-                video_id = _video_id(info)
+                video_id = self._metadata_video_id(_video_id(info))
                 if video_id not in first_frames:
                     raise ValueError(f"metadata has no frame map: {video_id}")
                 value = json.loads(archive.read(info))
@@ -572,6 +705,8 @@ class OrganizerReferenceImporter:
                     keywords = [keywords]
                 parts = [value.get("title", ""), value.get("description", ""), *keywords]
                 text = normalize_nfc(" ".join(str(part) for part in parts if part))
+                if not text:
+                    continue
                 frame = self._payload(video_id, first_frames[video_id], "")
                 documents.append(
                     {

@@ -24,17 +24,22 @@ from src.retrieval.candidate_rescue import (
 )
 from src.retrieval.fusion import (
     ChannelRanking,
+    FrameIdentity,
     aggregate_temporal_windows,
     canonical_key,
     diversify,
+    frame_identity_key,
     weighted_rrf,
 )
+from src.retrieval.interactive import rocchio, unit_vector
 from src.retrieval.ocr_quality import (
     OCRQualityConfig,
     OCRQualityStore,
     calibrate_ocr_results,
 )
 from src.retrieval.query_plan import QueryPlan, build_query_plan
+from src.retrieval.temporal_router import parse_english_steps, release_allowed
+from src.retrieval.temporal_sequence import score_sequence
 from src.retrieval.video_local import VideoLocalConfig, score_video_local
 
 
@@ -126,6 +131,7 @@ class TextualKISPipeline:
         video_local_trajectories: Any = None,
         ocr_quality: Mapping[str, Any] | OCRQualityConfig | None = None,
         ocr_quality_store: OCRQualityStore | None = None,
+        interactive: Mapping[str, Any] | None = None,
     ) -> None:
         if not 1 <= top_k <= 100:
             raise ValueError("top_k must be between 1 and 100")
@@ -161,6 +167,10 @@ class TextualKISPipeline:
         self.bm25_weight = bm25_weight
         self.top_k = top_k
         self.rrf_k = rrf_k
+        self.interactive = dict(interactive or {})
+        self.temporal_trajectories: Any = None
+        self.temporal_release_record: Any = None
+        self.temporal_source_fingerprint = ""
         self.frame_resolver = frame_resolver
         self.raw_refiner = raw_refiner
         self.feedback_provider = feedback_provider
@@ -1184,10 +1194,10 @@ class TextualKISPipeline:
         # Max reciprocal-rank preserves a rare-detail match even when the
         # candidate is absent from generic/global views. Evidence from all
         # views is still retained for diagnostics and later calibration.
-        by_key: dict[tuple[str, int], dict[str, Any]] = {}
+        by_key: dict[FrameIdentity, dict[str, Any]] = {}
         for ranking in rankings:
             for item in weighted_rrf((ranking,), k=k):
-                key = canonical_key(item)
+                key = frame_identity_key(item)
                 previous = by_key.get(key)
                 if previous is None:
                     by_key[key] = dict(item)
@@ -1230,6 +1240,10 @@ class TextualKISPipeline:
                     "rank": rank,
                     "video_id": video_id,
                     "source_frame_idx": source_frame_idx,
+                    **({
+                        "batch_id": "aic26-b2",
+                        "keyframe_ordinal": self._result_source(item).get("keyframe_ordinal"),
+                    } if self._result_source(item).get("batch_id") == "aic26-b2" else {}),
                     "score": round(float(item.get("score", 0.0)), 12),
                     "channel_ranks": dict(item.get("channel_ranks", {})),
                     "semantic_view_ranks": {
@@ -1299,6 +1313,15 @@ class TextualKISPipeline:
         self.last_query_processing = processing_value
         for channel in self.dense_channels:
             channel_started = time.monotonic()
+            if tuple(self._request_value(request, "batch_filters", ())) == ("aic26-b2",) and channel.name != "organizer_clip":
+                self.last_channel_statuses[channel.name] = {
+                    "state": "not_provisioned", "reason_code": "b02_reference_scope",
+                }
+                continue
+            if self._request_value(request, "image_only", False) and channel.name not in (
+                query_vectors or {}
+            ):
+                continue
             if request_mode == "asr_only":
                 self.last_channel_statuses[channel.name] = {
                     "state": "skipped",
@@ -1514,6 +1537,15 @@ class TextualKISPipeline:
                 self.last_channel_statuses[channel.name] = self._failure_status(error)
 
         for channel in self.lexical_channels:
+            if self._request_value(request, "image_only", False):
+                continue
+            batches = tuple(self._request_value(request, "batch_filters", ()))
+            if ((batches == ("aic26-b2",) and channel.name != "objects")
+                    or (channel.name == "objects" and "aic26-b2" not in batches)):
+                self.last_channel_statuses[channel.name] = {
+                    "state": "not_provisioned", "reason_code": "batch_channel_scope",
+                }
+                continue
             channel_started = time.monotonic()
             asr_channel = "asr" in channel.name.casefold()
             if request_mode == "visual_only":
@@ -1919,10 +1951,10 @@ class TextualKISPipeline:
         return fused
 
     @staticmethod
-    def _request_value(request: str | Mapping[str, Any] | Any, name: str) -> Any:
+    def _request_value(request: str | Mapping[str, Any] | Any, name: str, default: Any = None) -> Any:
         if isinstance(request, str):
-            return None
-        return request.get(name) if isinstance(request, Mapping) else getattr(request, name, None)
+            return default
+        return request.get(name, default) if isinstance(request, Mapping) else getattr(request, name, default)
 
     def _prepare_query(
         self,
@@ -2177,11 +2209,39 @@ class TextualKISPipeline:
     ) -> list[dict[str, Any]]:
         """Execute hybrid retrieval and return canonical ranked frame hits."""
 
+        batches = tuple(self._request_value(query, "batch_filters", ()))
+        if len(batches) > 1 and "aic25-b1-reference" in batches:
+            from src.retrieval.batch_scope import merge_rankings, validate_scope
+
+            rankings, diagnostics = {}, {}
+            statuses, errors = {}, {}
+            for batch in validate_scope(batches):
+                scoped = ({**query, "batch_filters": (batch,)} if isinstance(query, Mapping)
+                          else replace(query, batch_filters=(batch,)))
+                rankings[batch] = self.search(scoped, limit=limit, query_vectors=query_vectors,
+                                             refine_raw=refine_raw, advanced_rerank=advanced_rerank)
+                diagnostics[batch] = dict(self.last_query_processing)
+                statuses.update({f"{batch}:{name}": dict(value)
+                                 for name, value in self.last_channel_statuses.items()})
+                errors.update({f"{batch}:{name}": value for name, value in self.last_channel_errors.items()})
+            self.last_channel_statuses, self.last_channel_errors = statuses, errors
+            self.last_query_processing = {"batch_search": {
+                "policy": "equal_batch_rrf_v1", "batches": list(validate_scope(batches)),
+                "result_counts": {batch: len(items) for batch, items in rankings.items()},
+                "processing": diagnostics,
+            }}
+            return merge_rankings(rankings, limit=self.top_k if limit is None else limit)
+
+        if self._request_value(query, "image_only", False) and not query_vectors:
+            raise ValueError("image-only retrieval requires reference vectors through refine")
         self.last_channel_errors = {}
         self.last_channel_statuses = {}
         self.last_query_processing = {}
         self._execution_state.rank_trace = {}
         request_mode = str(self._request_value(query, "mode") or "automatic")
+        b02_request = "aic26-b2" in self._request_value(query, "batch_filters", ())
+        if b02_request:
+            refine_raw = False
         set_request_mode = getattr(self.frame_resolver, "set_request_mode", None)
         if callable(set_request_mode):
             set_request_mode(request_mode)
@@ -2205,6 +2265,14 @@ class TextualKISPipeline:
         processing = self._prepare_query(query, plan)
         effective_k, _dense_share, _text_share = self._intent_rrf_policy(processing)
         verification_requested = self._verification_requested(processing)
+        if b02_request:
+            verification_requested = False
+            self.last_query_processing["b02_scope"] = {
+                "mode": "reference_visual_objects", "coordinate": "keyframe_ordinal",
+                "unavailable": ["ocr", "asr", "spatial_color_verification", "raw_refinement"],
+            }
+        if self._request_value(query, "image_only", False):
+            verification_requested = False
         rankings = self._collect_rankings(
             plan,
             query,
@@ -2227,36 +2295,33 @@ class TextualKISPipeline:
         }
         self.last_query_processing = processing_value
         fused = weighted_rrf(rankings, k=effective_k)
-        fused, rankings = self._run_candidate_rescue(
-            fused,
-            rankings,
-            query,
-            effective_k=effective_k,
-        )
-        fused = self._run_video_local(
-            fused,
-            rankings,
-            query,
-            effective_k=effective_k,
-        )
+        if not b02_request:
+            fused, rankings = self._run_candidate_rescue(
+                fused, rankings, query, effective_k=effective_k,
+            )
+            fused = self._run_video_local(
+                fused, rankings, query, effective_k=effective_k,
+            )
+        sequence_hits = [] if b02_request else self._sequence_branch(query, plan, fused)
         self._trace_stage("tier1_fusion", fused)
         fused = self._apply_metadata_video_boost(fused)
         self._trace_stage("metadata", fused)
         if self.reranker is not None and fused:
             fused = self.reranker.rerank(plan.original_text, fused, top_k=len(fused))
 
-        if self.temporal_windows_ms and fused:
-            by_key: dict[tuple[str, int], dict[str, Any]] = {}
+        if self.temporal_windows_ms and fused and not sequence_hits and not b02_request:
+            by_key: dict[FrameIdentity, dict[str, Any]] = {}
             for window_ms in self.temporal_windows_ms:
                 for item in aggregate_temporal_windows(fused, window_ms=window_ms):
                     item = dict(item)
                     item["window_size_ms"] = window_ms
-                    key = canonical_key(item)
+                    key = frame_identity_key(item)
                     if key not in by_key or float(item["score"]) > float(by_key[key]["score"]):
                         by_key[key] = item
             fused = sorted(by_key.values(), key=lambda item: -float(item["score"]))
 
-        fused = self._rerank_temporal_evidence(fused, plan)
+        if not sequence_hits and not b02_request:
+            fused = self._rerank_temporal_evidence(fused, plan)
         fused = self._apply_asr_temporal_bonus(
             fused,
             enabled=(
@@ -2299,8 +2364,8 @@ class TextualKISPipeline:
             )
         self._trace_stage("tier2", fused)
 
-        if refine_raw and self.raw_refiner is not None and fused:
-            coarse_keys = {canonical_key(item) for item in fused[:20]}
+        if refine_raw and self.raw_refiner is not None and fused and not sequence_hits:
+            coarse_keys = {frame_identity_key(item) for item in fused[:20]}
             try:
                 raw_parameters = signature(self.raw_refiner).parameters.values()
                 raw_kwargs = any(value.kind is Parameter.VAR_KEYWORD for value in raw_parameters)
@@ -2316,16 +2381,19 @@ class TextualKISPipeline:
                     refined = self.raw_refiner(plan, fused[:20], query_texts=visual_texts)
                 else:
                     refined = self.raw_refiner(plan, fused[:20])
-                refined_keys = {canonical_key(item) for item in refined}
+                refined_keys = {frame_identity_key(item) for item in refined}
                 replaced_keys = coarse_keys | refined_keys
                 fused = list(refined) + [
-                    item for item in fused if canonical_key(item) not in replaced_keys
+                    item for item in fused if frame_identity_key(item) not in replaced_keys
                 ]
                 fused.sort(key=lambda item: -float(item["score"]))
+                raw_diagnostics = getattr(self.raw_refiner, "last_diagnostics", {})
                 self.last_channel_statuses["raw_refinement"] = {
-                    "state": "ready",
-                    "reason_code": "query_completed",
+                    "state": raw_diagnostics.get("state", "ready"),
+                    "reason_code": raw_diagnostics.get("reason_code", "query_completed"),
                     "result_count": len(refined),
+                    **({"refined_count": raw_diagnostics["refined_count"]}
+                       if "refined_count" in raw_diagnostics else {}),
                     "latency_ms": round((time.monotonic() - refinement_started) * 1_000, 3),
                 }
             except Exception as error:
@@ -2339,6 +2407,20 @@ class TextualKISPipeline:
                 }
 
         self._trace_stage("raw_refinement", fused)
+        if sequence_hits:
+            # Temporal score is local to its branch. No direct cosine/score addition.
+            original_by_key = {frame_identity_key(hit): hit for hit in fused}
+            fused = weighted_rrf((
+                ChannelRanking("baseline", tuple(fused), 1.0),
+                ChannelRanking("temporal_sequence", tuple(sequence_hits), .6),
+            ), k=effective_k)
+            for hit in fused:
+                original = original_by_key.get(frame_identity_key(hit))
+                if original is not None:
+                    hit["evidence"] = [
+                        value for value in hit["evidence"] if value.get("channel") == "temporal_sequence"
+                    ] + list(original.get("evidence", ()))
+                    hit["channel_ranks"] = {**original.get("channel_ranks", {}), **hit["channel_ranks"]}
         diversified = diversify(
             fused,
             limit=requested_limit,
@@ -2350,12 +2432,12 @@ class TextualKISPipeline:
         self._trace_stage("diversity", diversified)
         rank_trace = self.last_rank_trace
         tier1_ranks = {
-            (str(item["video_id"]), int(item["source_frame_idx"])): int(item["rank"])
+            frame_identity_key(item): int(item["rank"])
             for item in rank_trace.get("tier1_fusion", ())
         }
         stage_rank_delta: list[dict[str, Any]] = []
         for item in diversified[:20]:
-            key = canonical_key(item)
+            key = frame_identity_key(item)
             initial_rank = tier1_ranks.get(key)
             if initial_rank is None:
                 continue
@@ -2366,7 +2448,7 @@ class TextualKISPipeline:
                     (
                         int(row["rank"])
                         for row in rows
-                        if (row["video_id"], int(row["source_frame_idx"])) == key
+                        if frame_identity_key(row) == key
                     ),
                     None,
                 )
@@ -2375,8 +2457,12 @@ class TextualKISPipeline:
                     deltas[stage] = initial_rank - stage_rank
             stage_rank_delta.append(
                 {
-                    "video_id": key[0],
-                    "source_frame_idx": key[1],
+                    "video_id": item["video_id"],
+                    "source_frame_idx": item["source_frame_idx"],
+                    **({
+                        "batch_id": "aic26-b2",
+                        "keyframe_ordinal": item.get("keyframe_ordinal"),
+                    } if item.get("batch_id") == "aic26-b2" else {}),
                     "initial_rank": initial_rank,
                     "stage_ranks": ranks,
                     "stage_rank_delta": deltas,
@@ -2387,6 +2473,112 @@ class TextualKISPipeline:
         processing_value["stage_rank_delta"] = stage_rank_delta
         self.last_query_processing = processing_value
         return diversified
+
+    def _sequence_branch(
+        self, query: Any, plan: QueryPlan, candidates: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        mode = self._request_value(query, "temporal_mode", "auto")
+        explicit = self._request_value(query, "use_temporal_sequence", False)
+        if mode == "off" or self._request_value(query, "image_only", False):
+            return []
+        routed = mode == "auto" and not explicit
+        parsed = None
+        if routed:
+            if not self.interactive.get("automatic_activation", False):
+                return []
+            batches = tuple(self._request_value(query, "batch_filters", ()))
+            batch = self.temporal_trajectories.batch(batches[0]) if self.temporal_trajectories and len(batches) == 1 else None
+            reason = "release_gate_not_passed"
+            if self.last_query_processing.get("detected_language") == "en" and release_allowed(
+                self.temporal_release_record, retrieval_fingerprint=self.fingerprint,
+                cache_fingerprint=str(getattr(batch, "fingerprint", "")),
+                source_fingerprint=self.temporal_source_fingerprint,
+            ):
+                parsed = parse_english_steps(plan.original_text)
+                reason = parsed["reason_code"]
+            if not parsed or not parsed["steps"]:
+                self.last_query_processing = {**self.last_query_processing, "temporal_sequence": {
+                    "mode": "auto", "applied": False, "reason_code": reason}}
+                return []
+        elif not explicit and mode != "manual":
+            return []
+        started = time.monotonic()
+        diagnostics: dict[str, Any] = {"mode": "manual", "applied": False,
+                                       "source_channel": "organizer_clip"}
+        hits: list[dict[str, Any]] = []
+        try:
+            if not self.interactive.get("temporal_enabled", True):
+                raise ValueError("feature_disabled")
+            batches = tuple(self._request_value(query, "batch_filters", ()))
+            if len(batches) != 1 or self._request_value(query, "mode") == "asr_only":
+                raise ValueError("single_visual_batch_required")
+            if self.temporal_trajectories is None or self.temporal_trajectories.batch(batches[0]) is None:
+                raise ValueError("trajectory_cache_not_ready")
+            steps = tuple(self._request_value(query, "temporal_steps", ()))
+            target = self._request_value(query, "temporal_target", None)
+            if parsed is not None:
+                steps, target = tuple(parsed["steps"]), parsed["target"]
+            elif not steps and self.last_query_processing.get("detected_language") == "en":
+                english = parse_english_steps(plan.original_text)
+                steps, target = tuple(english["steps"]), english["target"]
+            if not steps:
+                if self.last_query_processing.get("detected_language") == "en":
+                    raise ValueError("explicit_ordered_steps_required")
+                steps = tuple(v for v in (plan.before, plan.current, plan.after) if v)
+                target = steps.index(plan.current) if plan.current in steps else None
+            if not 2 <= len(steps) <= 6:
+                raise ValueError("explicit_ordered_steps_required")
+            target = len(steps) - 1 if target is None else target
+            channel = next(c for c in self.dense_channels if c.name == "organizer_clip")
+            def encode(text: str) -> np.ndarray:
+                processing = self.query_adapter.prepare(text, language_hint=self._request_value(query, "query_language", "auto"))
+                variants = self.query_adapter.dense_variants(channel.name, processing)
+                if not variants:
+                    raise ValueError("translation_unavailable")
+                return unit_vector(encode_query_mean(channel.encoder, variants[0].text))
+            hits, diagnostics = score_sequence(
+                candidates, cache=self.temporal_trajectories, batch_id=batches[0],
+                step_vectors=[encode(step) for step in steps],
+                global_vector=encode(plan.original_text), target=target,
+            )
+            if self.frame_resolver is None:
+                raise ValueError("canonical_mapping_unavailable")
+            canonical: list[dict[str, Any]] = []
+            for hit in hits:
+                verified = True
+                for step in hit["temporal_steps"]:
+                    proof = self.frame_resolver({"payload": {**hit, **step}})
+                    data = proof.get("payload", proof) if proof is not None else {}
+                    if any(data.get(k) != v for k, v in {
+                        "batch_id": hit["batch_id"], "video_id": hit["video_id"],
+                        "source_frame_idx": step["source_frame_idx"], "timestamp_ms": step["timestamp_ms"],
+                    }.items()):
+                        verified = False
+                        break
+                if not verified:
+                    continue
+                resolved = self.frame_resolver({"payload": hit, "score": hit["score"]})
+                if resolved is None:
+                    continue
+                payload = dict(resolved.get("payload", resolved))
+                if payload.get("source_frame_idx") != hit["source_frame_idx"] or payload.get("timestamp_ms") != hit["timestamp_ms"]:
+                    continue
+                payload.update(score=hit["score"], temporal_steps=hit["temporal_steps"])
+                canonical.append(payload)
+            hits = canonical
+            diagnostics.update(applied=bool(hits), result_count=len(hits))
+            if not hits:
+                diagnostics["reason_code"] = "canonical_mapping_unavailable"
+        except (ValueError, TypeError, RuntimeError, StopIteration, AttributeError, OSError) as error:
+            hits = []
+            reason = str(error)
+            safe_reasons = {"feature_disabled", "single_visual_batch_required", "trajectory_cache_not_ready",
+                            "explicit_ordered_steps_required", "translation_unavailable", "canonical_mapping_unavailable"}
+            diagnostics.update(applied=False, reason_code=reason if reason in safe_reasons else "sequence_unavailable")
+        diagnostics["latency_ms"] = (time.monotonic() - started) * 1000
+        diagnostics["mode"] = "auto" if routed else "manual"
+        self.last_query_processing = {**self.last_query_processing, "temporal_sequence": diagnostics}
+        return hits
 
     def refine(
         self,
@@ -2399,27 +2591,90 @@ class TextualKISPipeline:
         gamma: float = 0.25,
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
-        """Apply normalized Rocchio feedback and perform a fresh search."""
+        """Update all compatible visual spaces, then search/fuse exactly once."""
 
+        if not self.interactive.get("feedback_enabled", True):
+            raise RuntimeError("interactive feedback is disabled")
         if self.feedback_provider is None:
             raise RuntimeError("relevance feedback requires a feedback_provider")
         if not self.dense_channels:
             raise RuntimeError("relevance feedback requires a dense channel")
+        image_only = self._request_value(query, "image_only", False)
+        feedback_text = self._request_value(query, "feedback_text", None)
+        if feedback_text or image_only:
+            changes = dict(original_text="reference image" if image_only else feedback_text,
+                           english_text_override="reference image" if image_only else None,
+                           before_clause=None, current_clause=None, after_clause=None,
+                           quoted_text=None, named_entities=None, objects=None,
+                           actions=None, attributes=None, entity_constraints=(), feedback_text=None)
+            query = ({**query, **changes} if isinstance(query, Mapping)
+                     else replace(query, **changes))
+        reference = self._request_value(query, "reference_frame", None)
+        def identity(value: Any) -> tuple[str, str, int]:
+            from src.ingest.frame_identity import image_identity
+
+            if (value.get("batch_id") if isinstance(value, Mapping) else value.batch_id) == "aic26-b2":
+                return image_identity(value)
+            if isinstance(value, Mapping):
+                return value["batch_id"], value["video_id"], value["source_frame_idx"]
+            return value.batch_id, value.video_id, value.source_frame_idx
+        positives = [identity(v) for v in self._request_value(query, "positive_frames", ())]
+        negatives = [identity(v) for v in self._request_value(query, "negative_frames", ())]
+        reference_id = identity(reference) if reference is not None else None
+        filters = tuple(self._request_value(query, "batch_filters", ()))
+        selected = {v[0] for v in positives + negatives}
+        if reference_id is not None:
+            selected.add(reference_id[0])
+        if len(selected) > 1 or (selected and filters and not selected.issubset(filters)):
+            raise ValueError("feedback requires one explicitly selected batch")
+        if len(filters) > 1 and (positive_ids or negative_ids or not selected):
+            raise ValueError("combined feedback requires batch-qualified frame references")
+        batch = next(iter(selected), filters[0] if filters else None)
+        if batch == "aic26-b2" and (positive_ids or negative_ids):
+            raise ValueError("B02 feedback requires explicit ordinal FrameReferences")
+        if selected and not filters:
+            query = ({**query, "batch_filters": (batch,)} if isinstance(query, Mapping)
+                     else replace(query, batch_filters=(batch,)))
+        positive_ids = tuple(dict.fromkeys([*positive_ids, *((v[1], v[2]) for v in positives)]))
+        negative_ids = tuple(dict.fromkeys([*negative_ids, *((v[1], v[2]) for v in negatives)]))
+        if set(positive_ids) & set(negative_ids):
+            raise ValueError("positive and negative feedback overlap")
+        reference_key = reference_id[1:] if reference_id else None
+        if reference_key in negative_ids:
+            raise ValueError("reference cannot also be negative")
+        if image_only and reference_key is None:
+            raise ValueError("image-only requires a reference")
         plan = self._plan(query)
         processing = self._prepare_query(query, plan)
         errors: dict[str, str] = {}
+        vectors: dict[str, np.ndarray] = {}
+        provider_parameters = signature(self.feedback_provider).parameters
+        scoped_provider = "batch_id" in provider_parameters or any(
+            p.kind == Parameter.VAR_KEYWORD for p in provider_parameters.values()
+        )
+        if selected and not scoped_provider:
+            raise RuntimeError("canonical feedback requires a batch-aware provider")
+        def load(channel: str, keys: Sequence[tuple[str, int]]) -> np.ndarray:
+            kwargs = {"batch_id": batch} if scoped_provider and batch else {}
+            if batch == "aic26-b2":
+                if channel != "organizer_clip":
+                    raise ValueError("B02 feedback is only compatible with Organizer CLIP")
+                kwargs["coordinate"] = "keyframe_ordinal"
+            return np.asarray(self.feedback_provider(channel, keys, **kwargs), dtype=np.float32)
         for channel in self.dense_channels:
+            # Legacy names are visual aliases; semantic_text is never image-compatible.
+            if channel.name not in _VISUAL_DENSE_CHANNELS | {"native", "organizer"}:
+                continue
             try:
-                positive = (
-                    np.asarray(self.feedback_provider(channel.name, positive_ids), dtype=np.float32)
-                    if positive_ids
-                    else None
-                )
-                negative = (
-                    np.asarray(self.feedback_provider(channel.name, negative_ids), dtype=np.float32)
-                    if negative_ids
-                    else None
-                )
+                reference_vector = None
+                if reference_key is not None and (image_only or reference_key not in positive_ids):
+                    reference_vector = unit_vector(load(channel.name, (reference_key,))[0],
+                                                   dimension=getattr(channel.store, "vector_size", None))
+                if image_only:
+                    vectors[channel.name] = reference_vector
+                    continue
+                positive = load(channel.name, positive_ids) if positive_ids else None
+                negative = load(channel.name, negative_ids) if negative_ids else None
                 variants = self.query_adapter.dense_variants(channel.name, processing)
                 if not variants:
                     raise RuntimeError("translation is unavailable for this dense channel")
@@ -2427,15 +2682,23 @@ class TextualKISPipeline:
                     [encode_query_mean(channel.encoder, value.text) for value in variants]
                 )
                 original = self._normalized_vector(originals.mean(axis=0))
-                updated = alpha * original
-                if positive is not None:
-                    updated += beta * positive.mean(axis=0)
-                if negative is not None:
-                    updated -= gamma * negative.mean(axis=0)
-                updated = self._normalized_vector(updated)
-                return self.search(query, limit=limit, query_vectors={channel.name: updated})
+                vectors[channel.name] = rocchio(
+                    original, positive=positive, negative=negative,
+                    reference=reference_vector, alpha=alpha, beta=beta, gamma=gamma,
+                )
             except Exception as error:
-                errors[channel.name] = f"{type(error).__name__}: {error}"
+                errors[channel.name] = type(error).__name__
+        if vectors:
+            results = self.search(query, limit=limit, query_vectors=vectors, refine_raw=False)
+            self.last_query_processing = {
+                **self.last_query_processing,
+                "interactive_feedback": {
+                    "updated_channels": sorted(vectors), "unavailable_channels": errors,
+                    "image_only": bool(image_only), "reference_used": reference_id is not None,
+                    "positive_count": len(positive_ids), "negative_count": len(negative_ids),
+                },
+            }
+            return results
         detail = "; ".join(f"{name}={message}" for name, message in errors.items())
         raise RuntimeError(f"no dense channel can apply the supplied feedback: {detail}")
 

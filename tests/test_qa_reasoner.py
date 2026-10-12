@@ -78,6 +78,51 @@ class _OllamaHTTP:
         return _Response(self.chat)
 
 
+def test_local_event_contact_sheet_one_attempt_deadline_and_no_motion_claim():
+    http = _OllamaHTTP(chat={"message": {"content": json.dumps({
+        "verdict": "insufficient_evidence", "explanation": "A still image cannot establish motion."})}})
+    reasoner = OllamaQwenReasoner(http=http, expected_digest_prefix="fb90415cde1e")
+    blob = io.BytesIO()
+    Image.new("RGB", (16, 16), "red").save(blob, format="PNG")
+    data = blob.getvalue()
+    images = [QAImage(data=data, mime_type="image/png", index=i+1,
+                      source_frame_idx=i, timestamp_ms=i*1000, sha256=hashlib.sha256(data).hexdigest())
+              for i in range(3)]
+    assert reasoner.inspect_event("Does a person run?", images, deadline=time.monotonic()+5)["reason_code"] == "model_digest_not_verified"
+    reasoner.probe(deadline=time.monotonic()+5)
+    result = reasoner.inspect_event("Does a person run?", images, deadline=time.monotonic()+5)
+    assert result["verdict"] == "insufficient_evidence"
+    calls = [call for call in http.calls if call[1].endswith("/api/chat")]
+    assert len(calls) == 1 and calls[0][1].startswith("http://127.0.0.1:")
+    payload = calls[0][2]["json"]
+    assert len(payload["messages"][1]["images"]) == 1
+    assert "Never infer motion" in payload["messages"][0]["content"]
+    assert sum(calls[0][2]["timeout"]) <= 5
+    expired = reasoner.inspect_event("question", images, deadline=time.monotonic()-1)
+    assert expired["reason_code"] == "local_inference_deadline"
+
+
+def test_cpu_mode_has_distinct_cache_identity_and_reports_last_inference():
+    http = _OllamaHTTP()
+    reasoner = OllamaQwenReasoner(http=http, execution_mode="cpu")
+    assert reasoner.fingerprint != OllamaQwenReasoner().fingerprint
+    assert reasoner.inference_verified is False
+    request = QAQueryRequest("q", "a cake", "How many?", reasoning_policy="local_only")
+    result = reasoner.reason(request, (_image(),), QACompetitionSpec.conservative_general_text())
+    assert result.normalized_answer == "3"
+    payload = http.calls[-1][2]["json"]
+    assert payload["options"]["num_gpu"] == 0
+    assert payload["options"]["num_batch"] == 64
+    assert payload["options"]["use_mmap"] is True
+    assert payload["options"]["num_ctx"] <= 2048
+    assert http.calls[-1][2]["timeout"][1] >= 120
+    assert reasoner.inference_verified is True
+    http.chat = {"message": {"content": "invalid response"}}
+    with pytest.raises(QAProviderResponseError):
+        reasoner.reason(request, (_image(),), QACompetitionSpec.conservative_general_text())
+    assert reasoner.inference_verified is False
+
+
 class _OpenRouterHTTP:
     def __init__(self, *, status_code: int = 200) -> None:
         self.calls = []

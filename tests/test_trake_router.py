@@ -73,6 +73,19 @@ def _config() -> dict:
     }
 
 
+def test_b02_temporal_quarantine_blocks_before_model_or_cache_use() -> None:
+    core = _Core("organizer_clip")
+    config = _config()
+    config["readiness"]["batches"]["aic26-b2"] = {
+        "kind": "reference", "trake_enabled": False,
+    }
+    router = TRAKEPipelineRouter({"organizer_clip": core}, config)
+    with pytest.raises(TRAKENotReadyError) as raised:
+        router.search(_request("aic26-b2"))
+    assert raised.value.reason_code == "batch_temporal_contract_unavailable"
+    assert core.calls == []
+
+
 def test_router_never_crosses_reference_and_native_vector_spaces() -> None:
     organizer = _Core("organizer_clip")
     visual = _Core("visual")

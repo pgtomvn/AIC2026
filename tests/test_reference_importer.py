@@ -164,7 +164,10 @@ class FakeVectorStore:
             payloads = [
                 payload
                 for payload in payloads
-                if all(payload.get(key) == value for key, value in filters.items())
+                if all(
+                    payload.get(key) in value if isinstance(value, list) else payload.get(key) == value
+                    for key, value in filters.items()
+                )
             ]
         return len(payloads)
 
@@ -254,6 +257,22 @@ def test_import_vectors_rejects_vector_store_count_mismatch(
         reference_pack.importer.import_vectors(FakeVectorStore(count_override=2))
 
 
+def test_bounded_import_only_writes_selected_video(reference_pack: ReferencePack) -> None:
+    store = FakeVectorStore()
+    seen = []
+    stats = reference_pack.importer.import_vectors(
+        store, video_ids=["L99_V002"], expected_videos=1, expected_frames=1,
+        before_video=seen.append,
+    )
+    assert stats.frames == 1
+    assert seen == ["L99_V002"]
+    assert store.upserts[0][0] == ["fixture-b1:L99_V002:ordinal:1"]
+    other = FakeVectorStore()
+    with pytest.raises(ValueError, match="subset"):
+        reference_pack.importer.import_vectors(other, video_ids=["not-in-map"])
+    assert other.create_calls == []
+
+
 def test_verify_existing_vectors_checks_every_payload_identity(
     reference_pack: ReferencePack,
 ) -> None:
@@ -318,6 +337,102 @@ def test_import_vectors_preserves_duplicate_source_mapping_rows(tmp_path: Path) 
     canonical = importer.import_canonical_frames(repository)
     assert canonical.canonical_frames == 1
     assert repository.frame_index_mappings("aic25-b1-reference") == {"L99_V001": {1: 480, 2: 480}}
+
+
+def test_b02_ordinal_import_keeps_equal_pts_and_source_rows(tmp_path: Path) -> None:
+    rows = {
+        "M08_V001": [(1, "190.04", "25", 4751), (2, "190.04", "25", 4751)],
+        "N001-V001": [(1, "2.000", "25", 50), (2, "2.520", "60", 50)],
+        "S01-V001": [(1, "1.2345", "30000/1001", 31)],
+    }
+    maps = _write_zip(
+        tmp_path / "maps.zip",
+        {f"maps/{video_id}.csv": _frame_map(values) for video_id, values in rows.items()},
+    )
+    features = _write_zip(
+        tmp_path / "features.zip",
+        {
+            f"features/{video_id}.npy": _npy(np.ones((len(values), 3), dtype=np.float16))
+            for video_id, values in rows.items()
+        },
+    )
+    keyframes = _write_zip(
+        tmp_path / "keyframes.zip",
+        {
+            f"keyframes/{video_id}/{ordinal:03d}.jpg": f"{video_id}:{ordinal}".encode()
+            for video_id, values in rows.items()
+            for ordinal, *_ in values
+        },
+    )
+    object_archives = [
+        _write_zip(
+            tmp_path / f"objects-{video_id}.zip",
+            {
+                f"{video_id}/{ordinal:03d}.json": json.dumps(
+                    {"detection_scores": [0.9], "detection_class_names": ["car"]}
+                ).encode()
+                for ordinal, *_ in values
+            },
+        )
+        for video_id, values in rows.items()
+    ]
+    media = _write_zip(
+        tmp_path / "media.zip",
+        {
+            "media-info/M08_V001.json": b"{}",
+            "media-info/S01_V001.json": b"{}",
+        },
+    )
+    importer = OrganizerReferenceImporter(
+        map_archive=maps,
+        feature_archive=features,
+        keyframe_archives=(keyframes,),
+        object_archives=object_archives,
+        metadata_archive=media,
+        metadata_policy="partial",
+        identity_mode="ordinal",
+        batch_id="aic26-b2",
+    )
+    assert importer.validate(expected_videos=3, expected_frames=5) == ReferenceStats(
+        3, 5, 5, 5, 2
+    )
+    repository = ArtifactRepository(tmp_path / "artifacts.sqlite3")
+    repository.initialize()
+    assert importer.import_canonical_frames(repository) == CanonicalReferenceStats(3, 5, 5)
+    assert repository.get_ordinal_frame("aic26-b2", "M08_V001", 1).timestamp_ms == 190_040
+    assert repository.get_ordinal_frame("aic26-b2", "M08_V001", 2).timestamp_ms == 190_040
+    assert repository.get_ordinal_frame("aic26-b2", "M08_V001", 1).image_uri != (
+        repository.get_ordinal_frame("aic26-b2", "M08_V001", 2).image_uri
+    )
+    assert [
+        frame.timestamp_ms
+        for frame in repository.iter_ordinal_frames(batch_id="aic26-b2", video_id="N001-V001")
+    ] == [2_000, 2_520]
+    assert repository.get_frame("aic26-b2", "M08_V001", 4751) is None
+    assert repository.batch_counts("aic26-b2").frame_count == 5
+    exact = repository.get_ordinal_frame("aic26-b2", "S01-V001", 1)
+    assert (exact.pts, exact.time_base, exact.timestamp_ms) == (2469, "1/2000", 1234)
+
+    store = FakeVectorStore()
+    importer.import_vectors(store, expected_videos=3, expected_frames=5)
+    n_payloads = next(payloads for ids, _, payloads in store.upserts if "N001-V001" in ids[0])
+    assert [(item["keyframe_ordinal"], item["source_frame_idx"], item["timestamp_ms"])
+            for item in n_payloads] == [(1, 50, 2_000), (2, 50, 2_520)]
+    assert all(item["trake_eligible"] is False for item in n_payloads)
+    m_payloads = next(payloads for ids, _, payloads in store.upserts if "M08_V001" in ids[0])
+    assert all(item["trake_eligible"] is False for item in m_payloads)
+    s_payloads = next(payloads for ids, _, payloads in store.upserts if "S01-V001" in ids[0])
+    assert s_payloads[0]["trake_eligible"] is True
+    assert importer.verify_vector_store(store).frames == 5
+
+    object_store = FakeTextStore()
+    assert importer.import_objects(object_store) == 5
+    m_objects = [
+        item for item in object_store.documents if item["video_id"] == "M08_V001"
+    ]
+    assert [item["keyframe_ordinal"] for item in m_objects] == [1, 2]
+    assert [item["source_frame_idx"] for item in m_objects] == [4751, 4751]
+    assert importer.import_metadata(FakeTextStore()) == 0
 
 
 def test_validate_rejects_map_and_feature_video_mismatch(tmp_path: Path) -> None:

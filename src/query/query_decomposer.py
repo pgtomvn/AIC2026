@@ -10,7 +10,7 @@ from typing import Literal, Sequence
 from src.query.entity_extractor import EntityMode, NamedEntity, fold_entity_text
 from src.query.spatial_types import SpatialRelationEnum
 
-QUERY_DECOMPOSER_VERSION = "entity-query-decomposer-v7-instance-sequence-views"
+QUERY_DECOMPOSER_VERSION = "entity-query-decomposer-v8-color-subject-binding"
 
 QueryIntent = Literal["visual_dense", "lexical_dominant", "spatial_color"]
 SemanticViewRole = Literal[
@@ -672,6 +672,13 @@ def _coordinated_color_constraints(
     for match in pattern.finditer(text):
         if _span_overlaps(match.start(), match.end(), blocked_spans):
             continue
+        # This pattern handles prenominal English adjectives. Vietnamese
+        # postnominal colors are bound by _find_constraints instead.
+        if any(character in _VIETNAMESE_MARKED for character in match.group("colors").casefold()):
+            continue
+        if re.match(r"(?:stands?|standing|walks?|walking|runs?|running)\b",
+                    match.group("subject"), re.IGNORECASE):
+            continue
         subject = _clean_subject(_tokens(match.group("subject")), take_last=False)
         subject = _without_color_words(subject) if subject else None
         if not subject:
@@ -937,6 +944,10 @@ def _relation_role(text: str, *, take_last: bool) -> tuple[str | None, str | Non
     fragment = _bounded_role_fragment(cleaned)
     color = _color_in_text(fragment)
     without_color = _without_color_words(fragment)
+    without_color = re.split(
+        r"\b(?:stands?|standing|walks?|walking|runs?|running|đứng|đi|chạy)\b",
+        without_color, maxsplit=1, flags=re.IGNORECASE,
+    )[0]
     label = _clean_subject(_tokens(without_color), take_last=take_last)
     return label, color
 
@@ -1135,13 +1146,27 @@ def _find_constraints(
                     continue
                 occupied_colors.append(identity)
                 before_text = normalized[max(0, match.start() - 12):match.start()].casefold()
-                prefer_before = "màu" in before_text or "color" in before_text
+                # Vietnamese color adjectives follow the noun. English usually
+                # puts them first, except predicates such as "person in red".
+                vietnamese_color = alias not in {
+                    "red", "blue", "yellow", "green", "black", "white", "pink",
+                    "purple", "violet",
+                }
+                predicate_color = bool(re.search(
+                    r"\b(?:in|is|are|wearing)\s*$", before_text
+                ))
+                prefer_before = (
+                    vietnamese_color or predicate_color or "màu" in before_text
+                    or "color" in before_text
+                )
                 subject = _subject_around(
                     normalized,
                     match.start(),
                     match.end(),
                     prefer_before=prefer_before,
                 )
+                if subject and vietnamese_color and "mặc" in _tokens(subject.casefold()):
+                    subject = re.split(r"\bmặc\b", subject, flags=re.IGNORECASE)[-1].strip()
                 colors.append(
                     ColorConstraint(
                         _without_color_words(subject) if subject else None,

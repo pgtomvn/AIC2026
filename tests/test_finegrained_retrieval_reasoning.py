@@ -631,13 +631,14 @@ def test_tier2_deadline_returns_exact_stage1_snapshot(
         for index in range(100)
     ]
     before = json.dumps(stage1, sort_keys=True, separators=(",", ":"))
+    wall_clock = time.perf_counter
     monkeypatch.setattr(
-        "src.retrieval.color_filter.time.monotonic", _AdvancingClock()
+        "src.retrieval.color_filter.time.perf_counter", _AdvancingClock()
     )
 
-    wall_started = time.perf_counter()
+    wall_started = wall_clock()
     output = reranker(QueryTextAdapter().prepare("a purple tofu"), stage1)
-    wall_ms = (time.perf_counter() - wall_started) * 1_000
+    wall_ms = (wall_clock() - wall_started) * 1_000
 
     assert wall_ms <= 25.0
     assert json.dumps(output, sort_keys=True, separators=(",", ":")) == before

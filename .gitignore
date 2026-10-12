@@ -73,7 +73,10 @@ Thumbs.db
 # Notebooks
 .ipynb_checkpoints/
 
-# Local remediation notes
+# Local-only research workspace (paper drafts, study runs, annotations)
+/research/
+
+# Local remediation notes and one-off probes
 BUG_FIX_PLAN.md
-# One-off local query probe; reusable diagnostics remain versioned.
 /scripts/debug_long_kis_queries.py
+/pytest-cache-files-*/

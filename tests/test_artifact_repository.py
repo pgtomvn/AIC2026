@@ -131,6 +131,7 @@ def test_constructor_is_side_effect_free_and_initialize_enables_wal(
     assert {
         "canonical_frames",
         "canonical_frame_mappings",
+        "canonical_ordinal_frames",
         "canonical_text_segments",
         "raw_refined_frames",
     } <= tables
@@ -177,7 +178,58 @@ def test_schema_v1_migrates_additively_without_changing_canonical_counts(
     assert migrated.get_frame("b2", "L99_V001", 25) is not None
     assert migrated.refined_frame_count("b2") == 0
     with sqlite3.connect(repository.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+
+
+def test_schema_v2_adds_ordinal_frames_without_changing_source_rows(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    original = _frame(25, 1_000, keyframe_ordinal=1)
+    repository.upsert_frame(original)
+    with sqlite3.connect(repository.path) as connection:
+        connection.execute("DROP TABLE canonical_ordinal_frames")
+        connection.execute("PRAGMA user_version = 2")
+        connection.commit()
+
+    migrated = ArtifactRepository(repository.path)
+    migrated.initialize()
+
+    assert migrated.get_frame("b2", "L99_V001", 25) == original
+    assert migrated.count_ordinal_frames("b2") == 0
+    with sqlite3.connect(repository.path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+
+
+def test_ordinal_frames_preserve_equal_source_and_pts_rows(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    first = _frame(25, 1_000, batch_id="aic26-b2", video_id="M08_V001", keyframe_ordinal=1)
+    second = replace(first, keyframe_ordinal=2, image_uri="frames://M08_V001/2.jpg")
+    third = _frame(25, 1_040, batch_id="aic26-b2", video_id="N001-V001", keyframe_ordinal=1)
+
+    result = repository.upsert_ordinal_frames((first, second, third), fingerprint="b02-map:v1")
+    assert result.inserted == 3
+    assert repository.upsert_ordinal_frames((first, second), fingerprint="b02-map:v1").unchanged == 2
+    assert repository.count_ordinal_frames("aic26-b2") == 3
+    assert list(repository.iter_ordinal_frames(batch_id="aic26-b2", video_id="M08_V001")) == [
+        first, second
+    ]
+    assert repository.get_ordinal_frame("aic26-b2", "M08_V001", 2) == second
+    assert repository.nearest_ordinal_frame("aic26-b2", "M08_V001", 1_000) == first
+    assert repository.batch_counts("aic26-b2").frame_count == 3
+    assert repository.batch_counts("aic26-b2").index_ready_frame_count == 0
+    assert repository.set_video_index_ready("aic26-b2", "M08_V001", True) == 2
+    assert list(repository.iter_ordinal_frames(
+        batch_id="aic26-b2", video_id="M08_V001", index_ready_only=True
+    )) == [first, second]
+
+    restarted = ArtifactRepository(repository.path)
+    restarted.initialize()
+    assert restarted.get_ordinal_frame("aic26-b2", "M08_V001", 2) == second
+    with pytest.raises(ArtifactConflictError, match="canonical content"):
+        repository.upsert_ordinal_frames(
+            (replace(second, image_uri="frames://changed.jpg"),), fingerprint="b02-map:v1"
+        )
+    with pytest.raises(ArtifactConflictError, match="ordinal frame identity"):
+        repository.upsert_frames((first,))
 
 
 def test_refined_frames_are_durable_but_excluded_from_canonical_counts(

@@ -9,6 +9,7 @@ from inspect import Parameter, signature
 from typing import Any, Protocol
 
 from src.contracts import FrameRecord, QACandidateFrame, QACandidateWindow
+from src.ingest.frame_identity import candidate_identity, image_identity, resolve_image_frame
 from src.retrieval.fusion import canonical_key
 
 
@@ -167,10 +168,16 @@ class VisualQARetriever:
                 batch_id = self._batch_id(hit, filters)
             except (KeyError, TypeError, ValueError):
                 continue
-            identity = (batch_id, video_id, source_frame_idx)
+            reference = {"batch_id": batch_id, "video_id": video_id,
+                         "source_frame_idx": source_frame_idx,
+                         "keyframe_ordinal": _value(hit, "keyframe_ordinal")}
+            try:
+                identity = image_identity(reference)
+                frame = resolve_image_frame(self.frame_repository, reference)
+            except ValueError:
+                continue
             if identity in seen:
                 continue
-            frame = self.frame_repository.get_frame(batch_id, video_id, source_frame_idx)
             if frame is None:
                 continue
             raw_ranks = hit.get("channel_ranks", {})
@@ -196,7 +203,7 @@ class VisualQARetriever:
             )
             candidates.append(
                 QACandidateFrame(
-                    candidate_id=f"{batch_id}:{video_id}:{source_frame_idx}",
+                    candidate_id=candidate_identity(reference),
                     retrieval_rank=len(candidates) + 1,
                     retrieval_score=score,
                     batch_id=batch_id,
@@ -209,6 +216,7 @@ class VisualQARetriever:
                     # evidence can contain backend payloads or media URIs and
                     # must never cross the QA session trust boundary.
                     evidence={"retrieval_channels": sorted(channel_ranks)},
+                    keyframe_ordinal=frame.keyframe_ordinal if batch_id == "aic26-b2" else None,
                 )
             )
             seen.add(identity)

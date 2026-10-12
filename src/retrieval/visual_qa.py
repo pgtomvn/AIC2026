@@ -95,6 +95,9 @@ _PROVIDER_ERROR_CATEGORIES = frozenset(
         "network_unreachable",
         "not_configured",
         "ollama_context_exceeded",
+        "inference_timeout",
+        "gpu_runtime_incompatible",
+        "worker_terminated",
         "ollama_timeout",
         "ollama_response_invalid",
         "provider_chain_exhausted",
@@ -1173,10 +1176,12 @@ class VisualQAPipeline:
         if not callable(get_frame):
             raise RuntimeError("canonical frame repository is unavailable")
 
-        frame = get_frame(request.batch_id, request.video_id, request.source_frame_idx)
+        from src.ingest.frame_identity import candidate_identity, resolve_image_frame
+
+        frame = resolve_image_frame(repository, request)
         if frame is None:
             raise QAInjectedFrameNotFoundError("qa_injected_frame_not_found")
-        candidate_id = f"{frame.batch_id}:{frame.video_id}:{frame.source_frame_idx}"
+        candidate_id = candidate_identity(frame)
         media_started = time.perf_counter()
         try:
             resolved = self.image_resolver.resolve(frame)
@@ -1201,6 +1206,7 @@ class VisualQAPipeline:
             shot_id=str(frame.shot_id or f"reference:{frame.source_frame_idx}"),
             channel_ranks={},
             evidence={"origin": request.source},
+            keyframe_ordinal=frame.keyframe_ordinal if frame.batch_id == "aic26-b2" else None,
         )
         search_id = str(session_id or uuid.uuid4().hex)
         session = self.session_store.create_session(
@@ -1360,9 +1366,9 @@ class VisualQAPipeline:
                 "candidate_id is not part of this QA session"
             )
         repository = getattr(self.retriever, "frame_repository", None)
-        frame = repository.get_frame(
-            candidate.batch_id, candidate.video_id, candidate.source_frame_idx
-        ) if repository is not None else None
+        from src.ingest.frame_identity import resolve_image_frame
+
+        frame = resolve_image_frame(repository, candidate) if repository is not None else None
         if frame is None or frame.timestamp_ms != candidate.timestamp_ms:
             raise QACandidateNotCanonicalError(
                 "candidate frame is no longer canonical"
@@ -1523,6 +1529,8 @@ class VisualQAPipeline:
             answers = dict(state.get("answers", {}))
             failures = dict(state.get("failures", {}))
             failures.pop(candidate.candidate_id, None)
+            if prediction is not None and candidate.batch_id == "aic26-b2":
+                prediction["keyframe_ordinal"] = candidate.keyframe_ordinal
             answers[candidate.candidate_id] = {
                 "candidate_id": candidate.candidate_id,
                 "status": "answered" if prediction is not None else "unanswerable",
@@ -1650,6 +1658,8 @@ class VisualQAPipeline:
                 "cache_status": "bypass",
             },
         ).to_dict()
+        if candidate.batch_id == "aic26-b2":
+            prediction["keyframe_ordinal"] = candidate.keyframe_ordinal
         answers[candidate.candidate_id] = {
             "candidate_id": candidate.candidate_id,
             "status": "answered",

@@ -54,6 +54,8 @@ class TRAKEPipelineRouter:
         config: Mapping[str, Any],
         *,
         readiness_service: Any = None,
+        artifact_repository: Any = None,
+        batch_pipelines: Mapping[str, TRAKEPipeline] | None = None,
         readiness_cache_seconds: float = 60.0,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -62,8 +64,10 @@ class TRAKEPipelineRouter:
         if unexpected:
             raise ValueError(f"unsupported TRAKE dense channels: {sorted(unexpected)!r}")
         self.pipelines = dict(pipelines)
+        self.batch_pipelines = dict(batch_pipelines or {})
         self.config = config
         self.readiness_service = readiness_service
+        self.artifact_repository = artifact_repository
         if readiness_cache_seconds < 0:
             raise ValueError("readiness_cache_seconds must not be negative")
         self.readiness_cache_seconds = float(readiness_cache_seconds)
@@ -73,6 +77,9 @@ class TRAKEPipelineRouter:
         ] = {}
         self._readiness_lock = threading.RLock()
         self.last_query_processing: dict[str, Any] = {}
+
+    def pipeline_for_batch(self, batch_id: str) -> TRAKEPipeline | None:
+        return self.batch_pipelines.get(batch_id, self.pipelines.get(self.channel_for_batch(batch_id)))
 
     def channel_for_batch(self, batch_id: str) -> str:
         """Return the sole compatible dense channel for one batch identity."""
@@ -106,7 +113,13 @@ class TRAKEPipelineRouter:
         """Return readiness without loading a model or exposing service details."""
 
         channel_name = self.channel_for_batch(batch_id)
-        pipeline = self.pipelines.get(channel_name)
+        pipeline = self.pipeline_for_batch(batch_id)
+        specification = self.config.get("readiness", {}).get("batches", {}).get(batch_id, {})
+        if specification.get("trake_enabled", True) is False:
+            return False, {channel_name: {
+                "state": "not_provisioned",
+                "reason_code": "batch_temporal_contract_unavailable",
+            }}
         now = self._monotonic()
         with self._readiness_lock:
             cached = self._readiness_cache.get(batch_id)
@@ -179,10 +192,31 @@ class TRAKEPipelineRouter:
 
         if not isinstance(request, TRAKEQueryRequest):
             request = TRAKEQueryRequest.model_validate(request)
+        if len(request.batch_filters) > 1:
+            from src.retrieval.batch_scope import validate_scope
+
+            results, statuses, processing = [], {}, {}
+            for batch in validate_scope(request.batch_filters):
+                response = self.search(request.model_copy(update={"batch_filters": (batch,)}))
+                if any(item.batch_id != batch for item in response.results):
+                    raise ValueError("TRAKE returned an out-of-scope batch identity")
+                results.extend(response.results)
+                statuses.update({f"{batch}:{name}": value for name, value in response.channel_statuses.items()})
+                processing[batch] = dict(self.last_query_processing)
+            # Each independently validated chain is indivisible. Equal RRF rank
+            # contributions avoid comparing confidence values across corpora.
+            order = validate_scope(request.batch_filters)
+            results.sort(key=lambda item: (item.rank, order.index(item.batch_id)))
+            ranked = tuple(item.model_copy(update={"rank": rank})
+                           for rank, item in enumerate(results[:request.top_k], 1))
+            self.last_query_processing = {"batch_search": {
+                "policy": "equal_batch_rrf_v1", "batches": list(order), "processing": processing,
+            }}
+            return TRAKEResponse(query_id=request.query_id, results=ranked, channel_statuses=statuses)
         batch_id = request.resolve_batch(default_batch_id)
         channel_name = self.channel_for_batch(batch_id)
         usable, statuses = self.channel_readiness(batch_id)
-        pipeline = self.pipelines.get(channel_name)
+        pipeline = self.pipeline_for_batch(batch_id)
         if not usable or pipeline is None:
             reason = str(statuses[channel_name].get("reason_code") or "not_provisioned")
             raise TRAKENotReadyError(
@@ -216,6 +250,23 @@ class TRAKEPipelineRouter:
             channel_statuses=statuses,
         )
         processing = getattr(pipeline, "last_query_processing", {})
+        if batch_id == "aic26-b2":
+            getter = getattr(self.artifact_repository, "get_trake_frame", None)
+            if not callable(getter):
+                raise TRAKENotReadyError(channel_name, "canonical_ordinal_repository_unavailable")
+            enriched = []
+            for item in response.results:
+                matches = []
+                for match in item.stage_matches:
+                    frame = getter(batch_id, item.video_id, match.source_frame_idx,
+                                   timestamp_ms=match.timestamp_ms)
+                    if frame is None or frame.keyframe_ordinal is None:
+                        raise TRAKENotReadyError(channel_name, "canonical_ordinal_mismatch")
+                    matches.append(match.model_copy(update={"keyframe_ordinal": frame.keyframe_ordinal}))
+                if any(a.keyframe_ordinal >= b.keyframe_ordinal for a, b in zip(matches, matches[1:])):
+                    raise TRAKENotReadyError(channel_name, "canonical_ordinal_order_invalid")
+                enriched.append(item.model_copy(update={"stage_matches": tuple(matches)}))
+            response = response.model_copy(update={"results": tuple(enriched)})
         self.last_query_processing = (
             dict(processing) if isinstance(processing, Mapping) else {}
         )
@@ -226,7 +277,7 @@ class TRAKEPipelineRouter:
 
         channel_name = self.channel_for_batch(batch_id)
         usable, statuses = self.channel_readiness(batch_id)
-        pipeline = self.pipelines.get(channel_name)
+        pipeline = self.pipeline_for_batch(batch_id)
         if not usable or pipeline is None:
             reason = str(statuses[channel_name].get("reason_code") or "not_provisioned")
             raise TRAKENotReadyError(

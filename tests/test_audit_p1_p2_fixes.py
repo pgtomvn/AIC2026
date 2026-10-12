@@ -313,11 +313,12 @@ def test_tier2_monotonic_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
         for index in range(100)
     ]
     clock = _AdvancingClock()
-    monkeypatch.setattr("src.retrieval.color_filter.time.monotonic", clock)
+    wall_clock = time.perf_counter
+    monkeypatch.setattr("src.retrieval.color_filter.time.perf_counter", clock)
 
-    wall_started = time.perf_counter()
+    wall_started = wall_clock()
     output = reranker(processing, stage1, precision_profile="standard")
-    wall_elapsed_ms = (time.perf_counter() - wall_started) * 1_000
+    wall_elapsed_ms = (wall_clock() - wall_started) * 1_000
 
     assert wall_elapsed_ms <= 25.0
     assert output == stage1

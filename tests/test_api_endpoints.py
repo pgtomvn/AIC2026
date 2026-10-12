@@ -174,6 +174,127 @@ def _endpoint(app, path: str, method: str):
     raise AssertionError(f"route not found: {method} {path}")
 
 
+def test_b02_ordinal_image_and_neighbor_routes_preserve_collisions(tmp_path):
+    context = _context(tmp_path, FakePipeline())
+    frames = {n: SimpleNamespace(
+        batch_id="aic26-b2", video_id="M08_V001", keyframe_ordinal=n,
+        source_frame_idx=4751, timestamp_ms=190040,
+    ) for n in (72, 73)}
+    calls = []
+
+    def get(batch, video, ordinal):
+        calls.append((batch, video, ordinal))
+        return frames.get(ordinal) if (batch, video) == ("aic26-b2", "M08_V001") else None
+
+    context.artifact_repository = SimpleNamespace(get_ordinal_frame=get)
+    context.qa_image_resolver = SimpleNamespace(resolve=lambda frame: SimpleNamespace(
+        data=f"jpeg-{frame.keyframe_ordinal}".encode(), mime_type="image/jpeg",
+        content_sha256=str(frame.keyframe_ordinal),
+    ))
+    app = create_app(context)
+    image = _endpoint(app, "/v1/keyframes/{batch_id}/{video_id}/{keyframe_ordinal}/image", "GET")
+    assert image("aic26-b2", "M08_V001", 72).body == b"jpeg-72"
+    assert image("aic26-b2", "M08_V001", 73).body == b"jpeg-73"
+    with pytest.raises(HTTPException) as missing:
+        image("aic26-b2", "M08_V001", 74)
+    assert missing.value.status_code == 404
+    with pytest.raises(HTTPException) as invalid:
+        image("aic25-b1", "M08_V001", 72)
+    assert invalid.value.status_code == 422
+    neighbors = _endpoint(app, "/v1/keyframes/{batch_id}/{video_id}/{keyframe_ordinal}/neighbors", "GET")
+    values = neighbors("aic26-b2", "M08_V001", 72, 1)
+    assert [row["keyframe_ordinal"] for row in values["neighbors"]] == [72, 73]
+    assert len({row["thumbnail_url"] for row in values["neighbors"]}) == 2
+    assert "image_uri" not in str(values)
+    with pytest.raises(HTTPException) as radius:
+        neighbors("aic26-b2", "M08_V001", 72, 200)
+    assert radius.value.status_code == 422
+
+
+def test_edit_preview_does_not_search_and_confirmation_never_inferred(tmp_path):
+    from unittest.mock import Mock
+
+    pipeline = FakePipeline()
+    context = _context(tmp_path, pipeline)
+    logger = Mock(mode="shadow")
+    context.interaction_logger = logger
+    context.artifact_repository = SimpleNamespace(get_frame=lambda *a: object())
+    app = create_app(context)
+    preview = _endpoint(app, "/v1/kis/preview-edit", "POST")
+    result = preview({"query": "a red shirt", "instruction": "replace red shirt with blue shirt"})
+    assert result["draft_text"] == "a blue shirt" and not pipeline.search_calls
+    logger.record_confirmation.assert_not_called()
+    confirm = _endpoint(app, "/v1/kis/confirm-answer", "POST")
+    request = QueryRequest("q", "a blue shirt", interaction_session_id="s1", interaction_turn=2,
+                           event_source="benchmark")
+    payload = {"request": request.to_dict(), "frame": {"batch_id": "b", "video_id": "v", "source_frame_idx": 0},
+               "elapsed_ms": 1200, "confirmed": True}
+    assert confirm(payload) == {"recorded": True, "human_label": False}
+    with pytest.raises(HTTPException):
+        confirm({**payload, "confirmed": False})
+    assert logger.record_confirmation.call_count == 1
+
+
+def test_interactive_feedback_contract_and_safe_proof(tmp_path: Path) -> None:
+    pipeline = FakePipeline(refine_hits=[{
+        "batch_id": "b", "video_id": "L21_V001", "source_frame_idx": 0,
+        "evidence": [{"channel": "temporal_sequence", "temporal_steps": [
+            {"step": 0, "source_frame_idx": 0, "timestamp_ms": 0, "path": "private"},
+            {"step": 1, "source_frame_idx": 10, "timestamp_ms": 1000},
+        ]}],
+    }])
+    context = _context(tmp_path, pipeline)
+    route = _endpoint(create_app(context), "/v1/kis/refine", "POST")
+    value = route({"query_id": "q", "original_text": "người đang đi", "batch_filters": ["b"],
+                   "reference_frame": {"batch_id": "b", "video_id": "L21_V001", "source_frame_idx": 0}})
+    assert pipeline.refine_calls[0]["request"].reference_frame.source_frame_idx == 0
+    assert value["hits"][0]["evidence"]["items"][0]["temporal_steps"][0] == {
+        "step": 0, "source_frame_idx": 0, "timestamp_ms": 0,
+    }
+
+
+def test_evidence_api_caps_budget_and_honors_rollback(tmp_path: Path) -> None:
+    context = _context(tmp_path, FakePipeline())
+    context.artifact_repository = SimpleNamespace(
+        get_frame=lambda *args: SimpleNamespace(timestamp_ms=1000),
+        text_segments_in_range=lambda *args, **kwargs: (),
+    )
+    route = _endpoint(create_app(context), "/v1/frames/{batch_id}/{video_id}/{source_frame_idx}/evidence", "GET")
+    assert route("b", "v", 0)["anchor"]["timestamp_ms"] == 1000
+    with pytest.raises(HTTPException) as invalid:
+        route("b", "v", 0, 201)
+    assert invalid.value.status_code == 422
+    context.config["retrieval"] = {"interactive": {"evidence_enabled": False}}
+    with pytest.raises(HTTPException) as disabled:
+        route("b", "v", 0)
+    assert disabled.value.status_code == 409
+
+
+def test_evidence_api_uses_indexed_text_channels(tmp_path: Path) -> None:
+    from unittest.mock import Mock
+
+    pipeline = FakePipeline()
+    ocr_store = SimpleNamespace(search=Mock(return_value=[{
+        "id": "ocr-segment", "payload": {
+            "batch_id": "b", "video_id": "v", "kind": "ocr",
+            "start_ms": 0, "end_ms": 0, "source_frame_idx": 0,
+            "text_nfc": "VISIBLE SIGN",
+        },
+    }]))
+    pipeline.lexical_channels = (SimpleNamespace(name="ocr", store=ocr_store),)
+    context = _context(tmp_path, pipeline)
+    context.artifact_repository = SimpleNamespace(
+        get_frame=lambda *args: SimpleNamespace(timestamp_ms=0),
+        text_segments_in_range=lambda *args, **kwargs: (),
+    )
+
+    route = _endpoint(create_app(context), "/v1/frames/{batch_id}/{video_id}/{source_frame_idx}/evidence", "GET")
+    response = route("b", "v", 0)
+
+    assert [item["text"] for item in response["segments"]] == ["VISIBLE SIGN"]
+    assert ocr_store.search.call_args.kwargs["top_k"] == 100
+
+
 def test_search_validates_request_and_returns_editable_explicit_plan(tmp_path: Path) -> None:
     hit = {
         "rank": 1,
@@ -484,8 +605,10 @@ def test_provisioning_reuses_readiness_and_keeps_reference_ingest_null(
 
 
 def test_health_status_reuses_snapshot_and_returns_sanitized_aggregates(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Alias equivalence must not depend on host RSS/disk changes between calls.
+    monkeypatch.setattr("src.api._resource_snapshot", lambda context: {"process_rss_bytes": 100})
     channels = (
         ChannelReadiness(
             "organizer_clip",

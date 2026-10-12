@@ -130,8 +130,8 @@ def load_qrels_pack(manifest_path: str | Path) -> QrelsPack:
         intervals = tuple(
             GroundTruthInterval(
                 _required_text(item.get("video_id"), "video_id"),
-                int(item.get("start_frame_idx")),
-                int(item.get("end_frame_idx")),
+                item.get("start_frame_idx"),
+                item.get("end_frame_idx"),
             )
             for item in intervals_raw
             if isinstance(item, Mapping)

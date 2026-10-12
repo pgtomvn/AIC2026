@@ -38,6 +38,8 @@ class BatchedFrameResolver:
         batch, video = payload.get("batch_id"), payload.get("video_id")
         if not isinstance(batch, str) or not isinstance(video, str):
             return None
+        if batch == "aic26-b2":
+            return None  # handled by the explicit ordinal path, never the source cache
         raw = payload.get("source_frame_idx")
         try:
             frame = -1 if isinstance(raw, bool) else int(raw)
@@ -66,6 +68,15 @@ class BatchedFrameResolver:
                     self._local.frames[(batch, video, frame)] = found.get((video, frame))
 
     def __call__(self, result: dict[str, Any]) -> dict[str, Any] | None:
+        payload = result.get("payload", result)
+        if payload.get("batch_id") == "aic26-b2":
+            from src.ingest.frame_identity import resolve_image_frame
+
+            try:
+                frame = resolve_image_frame(self.repository, payload)
+            except ValueError:
+                return None
+            return {**result, "payload": {**payload, **frame.to_dict()}} if frame else None
         if not self._enabled():
             return self.scalar_fallback(result)
         self._ensure_cache()

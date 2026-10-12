@@ -411,6 +411,14 @@ class WarmupService:
                 continue
             required = tuple(contract["required_channels"])
             unavailable = [value for value in required if not channel_usable(value)]
+            if name == "trake" and "batch_temporal_contract_unavailable" in contract["unavailable_channels"]:
+                results[name] = {
+                    "state": "not_configured", "usable": False,
+                    "reason_code": "batch_temporal_contract_unavailable",
+                    "required_channels": list(required),
+                    "unavailable_channels": ["batch_temporal_contract_unavailable"],
+                }
+                continue
             if name == "kis":
                 workflow_failure = any(warmed.get(value) == "failed" for value in required)
                 workflow_failure = workflow_failure or warmed.get("raw_refiner") == "failed"
@@ -630,7 +638,7 @@ class WarmupService:
 
             advanced_reranker = getattr(self.pipeline, "advanced_reranker", None)
             object_archive = getattr(advanced_reranker, "object_archive", None)
-            if object_archive is not None and callable(
+            if self.batch_id != "aic26-b2" and object_archive is not None and callable(
                 getattr(object_archive, "warmup", None)
             ):
 
@@ -647,6 +655,7 @@ class WarmupService:
             has_refinable = False
             if (
                 self.include_raw_refiner
+                and self.batch_id != "aic26-b2"
                 and refiner is not None
                 and self.artifact_repository is not None
                 and callable(getattr(self.artifact_repository, "has_refinable_frames", None))
@@ -675,7 +684,9 @@ class WarmupService:
             )
 
             selected_trake_channel: str | None = None
-            if self.trake_pipeline is not None:
+            trake_contract = contracts.get("trake") or {}
+            if (self.trake_pipeline is not None
+                    and "batch_temporal_contract_unavailable" not in trake_contract.get("unavailable_channels", ())):
                 selected_trake_channel = self.trake_pipeline.channel_for_batch(self.batch_id)
             if (
                 selected_trake_channel is not None

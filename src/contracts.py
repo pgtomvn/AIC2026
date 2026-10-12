@@ -333,6 +333,23 @@ class TextSegment:
 
 
 @dataclass(frozen=True, slots=True)
+class FrameReference:
+    """Batch-scoped image identity; frame zero is valid."""
+
+    batch_id: str
+    video_id: str
+    source_frame_idx: int
+    keyframe_ordinal: int | None = None
+
+    def __post_init__(self) -> None:
+        _require_text(self.batch_id, "batch_id")
+        _require_text(self.video_id, "video_id")
+        _require_int(self.source_frame_idx, "source_frame_idx", minimum=0)
+        if self.batch_id == "aic26-b2":
+            _require_int(self.keyframe_ordinal, "keyframe_ordinal", minimum=1)
+
+
+@dataclass(frozen=True, slots=True)
 class QueryRequest:
     """A Textual KIS request, including optional temporal clauses and feedback."""
 
@@ -356,12 +373,73 @@ class QueryRequest:
     entity_constraints: tuple[EntityConstraint, ...] = ()
     refine_raw: bool = True
     precision_profile: str = "standard"
+    reference_frame: FrameReference | None = None
+    positive_frames: tuple[FrameReference, ...] = ()
+    negative_frames: tuple[FrameReference, ...] = ()
+    feedback_text: str | None = None
+    image_only: bool = False
+    temporal_steps: tuple[str, ...] = ()
+    temporal_target: int | None = None
+    use_temporal_sequence: bool = False
+    temporal_mode: str = "auto"
+    interaction_session_id: str | None = None
+    interaction_turn: int | None = None
+    event_source: str = "unknown"
 
     def __post_init__(self) -> None:
         _require_text(self.query_id, "query_id")
         _require_text(self.original_text, "original_text")
         if len(self.original_text) > 8_192:
             raise ValueError("original_text cannot exceed 8192 Unicode code points")
+        if self.temporal_mode not in {"auto", "manual", "off"}:
+            raise ValueError("temporal_mode must be auto, manual or off")
+        if self.event_source not in {"unknown", "user", "benchmark", "agent"}:
+            raise ValueError("invalid event_source")
+        if self.interaction_session_id is not None:
+            if not isinstance(self.interaction_session_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", self.interaction_session_id):
+                raise ValueError("invalid interaction_session_id")
+        if self.interaction_turn is not None:
+            _require_int(self.interaction_turn, "interaction_turn", minimum=1)
+        for name in ("image_only", "use_temporal_sequence"):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"{name} must be boolean")
+        if self.feedback_text is not None:
+            _require_text(self.feedback_text, "feedback_text")
+            if len(self.feedback_text) > 8192:
+                raise ValueError("feedback_text exceeds budget")
+        reference = self.reference_frame
+        if isinstance(reference, Mapping):
+            reference = FrameReference(**reference)
+            object.__setattr__(self, "reference_frame", reference)
+        if reference is not None and not isinstance(reference, FrameReference):
+            raise TypeError("reference_frame must be a frame identity")
+        for name in ("positive_frames", "negative_frames"):
+            frames = tuple(
+                FrameReference(**v) if isinstance(v, Mapping) else v
+                for v in getattr(self, name)
+            )
+            if len(frames) > 20 or any(not isinstance(v, FrameReference) for v in frames):
+                raise ValueError("feedback requires at most 20 canonical identities")
+            object.__setattr__(self, name, tuple(dict.fromkeys(frames)))
+        if set(self.positive_frames) & set(self.negative_frames):
+            raise ValueError("positive and negative frames must be disjoint")
+        if reference in self.negative_frames:
+            raise ValueError("reference cannot also be negative")
+        if self.image_only and reference is None:
+            raise ValueError("image_only requires reference_frame")
+        if self.mode == "asr_only" and (
+            reference is not None or self.positive_frames or self.negative_frames
+            or self.use_temporal_sequence
+        ):
+            raise ValueError("image feedback and temporal sequence require visual retrieval")
+        steps = _as_string_tuple(self.temporal_steps, "temporal_steps")
+        if steps and (not 2 <= len(steps) <= 6 or sum(map(len, steps)) > 8192):
+            raise ValueError("temporal_steps requires 2 to 6 bounded events")
+        object.__setattr__(self, "temporal_steps", steps)
+        if self.temporal_target is not None:
+            _require_int(self.temporal_target, "temporal_target", minimum=0)
+            if not steps or self.temporal_target >= len(steps):
+                raise ValueError("temporal_target must identify an explicit step")
         if self.mode not in _KIS_QUERY_MODES:
             raise ValueError(f"mode must be one of {sorted(_KIS_QUERY_MODES)}")
         if self.query_language not in {"auto", "vi", "en"}:
@@ -533,7 +611,9 @@ class QACandidateRequest:
         if len(filters) != len(set(filters)):
             raise ValueError("batch_filters must not contain duplicates")
         if len(filters) > 1:
-            raise ValueError("Visual Q&A retrieval requires exactly one batch")
+            from src.retrieval.batch_scope import validate_scope
+
+            validate_scope(filters)
         object.__setattr__(self, "batch_filters", filters)
         _require_int(self.top_k, "top_k", minimum=1)
         if self.top_k > 50:
@@ -560,11 +640,14 @@ class QAFrameInjectionRequest:
     source_frame_idx: int
     source: str
     event_description: str
+    keyframe_ordinal: int | None = None
 
     def __post_init__(self) -> None:
         for name in ("query_id", "batch_id", "video_id", "event_description"):
             _require_text(getattr(self, name), name)
         _require_int(self.source_frame_idx, "source_frame_idx", minimum=0)
+        if self.batch_id == "aic26-b2":
+            _require_int(self.keyframe_ordinal, "keyframe_ordinal", minimum=1)
         if self.source not in {"kis_bridge", "manual"}:
             raise ValueError("source must be kis_bridge or manual")
 
@@ -672,11 +755,14 @@ class QACandidateFrame:
     shot_id: str
     channel_ranks: Mapping[str, int] = field(default_factory=dict)
     evidence: Mapping[str, Any] = field(default_factory=dict)
+    keyframe_ordinal: int | None = None
 
     def __post_init__(self) -> None:
         for name in ("candidate_id", "batch_id", "video_id", "shot_id"):
             _require_text(getattr(self, name), name)
-        expected_id = f"{self.batch_id}:{self.video_id}:{self.source_frame_idx}"
+        from src.ingest.frame_identity import candidate_identity
+
+        expected_id = candidate_identity(self)
         if self.candidate_id != expected_id:
             raise ValueError("candidate_id must match the canonical frame identity")
         _require_int(self.retrieval_rank, "retrieval_rank", minimum=1)
@@ -1298,7 +1384,12 @@ class TRAKEQueryRequest(_TRAKEModel):
         if any(not item.strip() for item in value):
             raise ValueError("batch_filters must contain only non-empty strings")
         if len(value) > 1:
-            raise ValueError("TRAKE requires exactly one batch after runtime resolution")
+            from src.retrieval.batch_scope import validate_scope
+
+            try:
+                validate_scope(value)
+            except ValueError:
+                raise ValueError("TRAKE requires exactly one batch outside audited B01 + B02 scope") from None
         return value
 
     @model_validator(mode="after")
@@ -1319,6 +1410,8 @@ class TRAKEQueryRequest(_TRAKEModel):
     def resolve_batch(self, default_batch_id: str | None = None) -> str:
         """Return the sole requested batch after applying a runtime default."""
 
+        if len(self.batch_filters) > 1:
+            raise ValueError("alignment cores require exactly one batch")
         if self.batch_filters:
             return self.batch_filters[0]
         if not isinstance(default_batch_id, str) or not default_batch_id.strip():
@@ -1333,6 +1426,7 @@ class TRAKEStageMatch(_TRAKEModel):
     source_frame_idx: int = Field(ge=0, strict=True)
     timestamp_ms: int = Field(ge=0, strict=True)
     similarity: float = Field(ge=-1.0, le=1.0, allow_inf_nan=False, strict=True)
+    keyframe_ordinal: int | None = Field(default=None, ge=1, strict=True, exclude_if=lambda value: value is None)
 
 
 class TRAKEResponseItem(_TRAKEModel):

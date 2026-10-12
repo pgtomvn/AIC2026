@@ -63,12 +63,17 @@ class HSVColorVerifier:
         self._cache_bytes = 0
         self._cache_hits = 0
         self._cache_misses = 0
+        self._request = threading.local()
+
+    def begin_request(self) -> None:
+        """At most eight decoded frames, shared by ROIs within this thread's request."""
+        self._request.images = {}
 
     @property
     def fingerprint(self) -> str:
         resolver_value = str(getattr(self.resolver, "fingerprint", type(self.resolver).__name__))
         payload = (
-            f"hsv-color-v2-box-descriptor:{resolver_value}:{self.max_entries}:"
+            f"hsv-color-v3-batch-roi:{resolver_value}:{self.max_entries}:"
             f"{self.max_cache_bytes}"
         )
         return hashlib.sha256(payload.encode()).hexdigest()
@@ -131,7 +136,7 @@ class HSVColorVerifier:
         box_key = "full" if box is None else ",".join(f"{value:.5f}" for value in box)
         frame_revision = (
             f"{frame.source_sha256}:{frame.extractor_version}:"
-            f"{frame.video_id}:{frame.source_frame_idx}"
+            f"{frame.batch_id}:{frame.video_id}:{frame.source_frame_idx}:{frame.image_uri}"
         )
         key = hashlib.sha256(
             f"{self.fingerprint}:{frame_revision}:{box_key}".encode()
@@ -144,10 +149,15 @@ class HSVColorVerifier:
                 return dict(cached[0]), True
             self._cache_misses += 1
 
-        resolved = self.resolver.resolve(frame)
-        with Image.open(io.BytesIO(resolved.data)) as source:
-            image = self._crop(source.convert("RGB"), box).convert("HSV")
-            hsv = np.asarray(image, dtype=np.uint8)
+        images = getattr(self._request, "images", None)
+        rgb = images.get(frame_revision) if images is not None else None
+        if rgb is None:
+            resolved = self.resolver.resolve(frame)
+            with Image.open(io.BytesIO(resolved.data)) as source:
+                rgb = source.convert("RGB")
+            if images is not None and len(images) < 8 and rgb.width * rgb.height <= 1024 * 1024:
+                images[frame_revision] = rgb
+        hsv = np.asarray(self._crop(rgb, box).convert("HSV"), dtype=np.uint8)
         if hsv.size == 0:
             raise ValueError("empty color region")
         denominator = hsv.shape[0] * hsv.shape[1]
@@ -157,6 +167,9 @@ class HSVColorVerifier:
         }
         size = 512
         with self._guard:
+            prior = self._cache.pop(key, None)
+            if prior is not None:
+                self._cache_bytes -= prior[1]
             self._cache[key] = (dict(descriptor), size)
             self._cache_bytes += size
             while self._cache and (
@@ -201,6 +214,7 @@ class AdvancedKISReranker:
         negation_confidence_threshold: float = 0.60,
         negation_multiplier: float = 0.10,
         spatial_ontology: SpatialOntologyConfig | None = None,
+        verification_budget_ms: float = 20.0,
     ) -> None:
         if not 1 <= spatial_depth <= 100 or not 1 <= color_depth <= spatial_depth:
             raise ValueError("advanced KIS depths are invalid")
@@ -224,6 +238,8 @@ class AdvancedKISReranker:
             raise ValueError("negation confidence threshold must be in [0, 1]")
         if not 1 <= color_workers <= 2:
             raise ValueError("color_workers must be one or two")
+        if not 0 < verification_budget_ms <= 5_000:
+            raise ValueError("verification_budget_ms must be in (0, 5000]")
         self.repository = repository
         self.object_archive = object_archive
         self.color_verifier = color_verifier
@@ -239,18 +255,20 @@ class AdvancedKISReranker:
         self.negation_confidence_threshold = float(negation_confidence_threshold)
         self.negation_multiplier = float(negation_multiplier)
         self.spatial_ontology = spatial_ontology or SpatialOntologyConfig()
+        self.verification_budget_ms = float(verification_budget_ms)
         self._state = threading.local()
 
     @property
     def fingerprint(self) -> str:
         return hashlib.sha256(
             (
-                f"advanced-kis-v5-instance-prefetch-20ms:{self.object_archive.fingerprint}:"
+                f"advanced-kis-v6-configured-budget:{self.object_archive.fingerprint}:"
                 f"{self.color_verifier.fingerprint}:{self.spatial_depth}:{self.color_depth}:"
                 f"{self.spatial_beta}:{self.color_absent_multiplier}:{self.relation_beta}:"
                 f"{self.strict_color_threshold}:{self.strict_color_beta}:"
                 f"{self.strict_mismatch_multiplier}:{self.negation_confidence_threshold}:"
-                f"{self.negation_multiplier}:{self.spatial_ontology!r}"
+                f"{self.negation_multiplier}:{self.spatial_ontology!r}:"
+                f"{self.verification_budget_ms}"
             ).encode()
         ).hexdigest()
 
@@ -450,8 +468,9 @@ class AdvancedKISReranker:
 
         self._state.diagnostics = {
             "state": "deadline_exceeded",
+            "stage_timings_ms": dict(getattr(self._state, "stage_timings_ms", {})),
             "precision_profile": "automatic",
-            "deadline_budget_ms": 20.0,
+            "deadline_budget_ms": self.verification_budget_ms,
             "deadline_phase": phase,
             "processed_candidate_count": processed_candidates,
             "prefetch_latency_ms": round(
@@ -463,7 +482,7 @@ class AdvancedKISReranker:
             "negation_candidates": 0,
             "color_candidates": 0,
             "total_latency_ms": round(
-                max(0.0, (time.monotonic() - started) * 1_000),
+                max(0.0, (time.perf_counter() - started) * 1_000),
                 3,
             ),
         }
@@ -729,8 +748,12 @@ class AdvancedKISReranker:
             raise ValueError("unsupported KIS precision profile")
         stage1 = [dict(item) for item in candidates]
         strict = True
-        started = time.monotonic()
+        started = time.perf_counter()
         self._state.prefetch_latency_ms = 0.0
+        self._state.stage_timings_ms = {}
+        begin_colors = getattr(self.color_verifier, "begin_request", None)
+        if callable(begin_colors):
+            begin_colors()
         decomposition = processing.decomposition
         requested = bool(decomposition and decomposition.bound_constraint_count)
         if not requested or decomposition is None:
@@ -744,13 +767,15 @@ class AdvancedKISReranker:
             }
             return stage1
 
-        initial_ranks = {
-            canonical_key(item): rank for rank, item in enumerate(stage1, start=1)
+        identities = [(self._batch_id(item), *canonical_key(item)) for item in stage1]
+        initial_ranks = {key: rank for rank, key in enumerate(identities, start=1)}
+        rank_by_object = {
+            id(item): initial_ranks[key] for item, key in zip(stage1, identities, strict=True)
         }
-        spatial_started = time.monotonic()
-        evidence_by_key: dict[tuple[str, int], ObjectEvidence] = {}
-        frame_by_key: dict[tuple[str, int], FrameRecord | None] = {}
-        graph_by_key: dict[tuple[str, int], SpatialGraphMatch] = {}
+        spatial_started = time.perf_counter()
+        evidence_by_key: dict[tuple[str | None, str, int], ObjectEvidence] = {}
+        frame_by_key: dict[tuple[str | None, str, int], FrameRecord | None] = {}
+        graph_by_key: dict[tuple[str | None, str, int], SpatialGraphMatch] = {}
         object_states: set[str] = set()
         reranked: list[dict[str, Any]] = []
         verified_spatial = verified_relations = verified_negations = 0
@@ -758,36 +783,31 @@ class AdvancedKISReranker:
         geometry_elapsed_ms = 0.0
         negation_elapsed_ms = 0.0
 
-        prefetch_started = time.monotonic()
-        frame_snapshot: dict[tuple[str, str, int], FrameRecord] = {}
-        evidence_snapshot: dict[tuple[str, int], ObjectEvidence] = {}
+        prefetch_started = time.perf_counter()
+        frame_snapshot: dict[tuple[str, str, int], FrameRecord | None] = {}
+        evidence_snapshot: dict[tuple[str | None, str, int], ObjectEvidence] = {}
         get_frames = getattr(self.repository, "get_frames", None)
+        metadata_started = time.perf_counter()
         if callable(get_frames):
             identities_by_batch: dict[str, list[tuple[str, int]]] = {}
-            for raw in stage1[: self.spatial_depth]:
-                batch_id = self._batch_id(raw)
+            for batch_id, video_id, source_frame_idx in identities[: self.spatial_depth]:
                 if batch_id is None:
-                    continue
-                try:
-                    video_id, source_frame_idx = canonical_key(raw)
-                except ValueError:
                     continue
                 identities_by_batch.setdefault(batch_id, []).append(
                     (video_id, source_frame_idx)
                 )
             try:
-                for batch_id, identities in identities_by_batch.items():
-                    for key, frame in get_frames(batch_id, identities).items():
+                for batch_id, frame_ids in identities_by_batch.items():
+                    for key, frame in get_frames(batch_id, frame_ids).items():
                         frame_snapshot[(batch_id, key[0], key[1])] = frame
             except (KeyError, TypeError, ValueError):
                 frame_snapshot = {}
 
-        for raw in stage1[: self.spatial_depth]:
-            try:
-                key = canonical_key(raw)
-            except ValueError:
-                continue
-            batch_id = self._batch_id(raw)
+        self._state.stage_timings_ms["metadata"] = (time.perf_counter()-metadata_started)*1000
+        object_started = time.perf_counter()
+        for raw, (batch_id, *key) in zip(
+            stage1[: self.spatial_depth], identities[: self.spatial_depth], strict=True
+        ):
             frame = (
                 frame_snapshot.get((batch_id, key[0], key[1]))
                 if batch_id is not None
@@ -797,22 +817,27 @@ class AdvancedKISReranker:
                 frame = self._frame(raw)
                 if frame is not None and batch_id is not None:
                     frame_snapshot[(batch_id, key[0], key[1])] = frame
-            evidence_snapshot[key] = (
+            evidence_snapshot[(batch_id, *key)] = (
                 self.object_archive.get(frame)
                 if frame is not None
                 else ObjectEvidence("not_applicable")
             )
+            if batch_id is not None:
+                frame_snapshot[(batch_id, key[0], key[1])] = frame
 
-        prefetch_ms = (time.monotonic() - prefetch_started) * 1_000
+        self._state.stage_timings_ms["object_prefetch"] = (time.perf_counter()-object_started)*1000
+        prefetch_ms = (time.perf_counter() - prefetch_started) * 1_000
         self._state.prefetch_latency_ms = prefetch_ms
-        deadline = time.monotonic() + 0.020
+        # perf_counter is monotonic and high-resolution on Python 3.11 Windows;
+        # monotonic's ~15 ms ticks are unsuitable for this 20 ms budget.
+        deadline = time.perf_counter() + self.verification_budget_ms / 1_000
         deadline_exceeded = False
 
         def fallback_if_expired(
             phase: str,
             processed_candidates: int,
         ) -> list[dict[str, Any]] | None:
-            if time.monotonic() <= deadline:
+            if time.perf_counter() <= deadline:
                 return None
             return self._deadline_fallback(
                 stage1,
@@ -821,28 +846,26 @@ class AdvancedKISReranker:
                 processed_candidates=processed_candidates,
             )
 
-        for index, raw in enumerate(stage1):
-            if time.monotonic() > deadline:
+        for index, raw in enumerate(stage1[: self.spatial_depth]):
+            if time.perf_counter() > deadline:
                 deadline_exceeded = True
                 break
             item = dict(raw)
-            if index >= self.spatial_depth:
-                reranked.append(item)
-                continue
-            key = canonical_key(item)
-            batch_id = self._batch_id(item)
+            rank_by_object[id(item)] = rank_by_object[id(raw)]
+            batch_id, *key = identities[index]
             frame = (
                 frame_snapshot.get((batch_id, key[0], key[1]))
                 if batch_id is not None
                 else None
             )
-            if frame is None:
+            if frame is None and (batch_id, key[0], key[1]) not in frame_snapshot:
                 frame = self._frame(item)
             fallback = fallback_if_expired("frame_resolution", index)
             if fallback is not None:
                 return fallback
-            frame_by_key[key] = frame
-            evidence = evidence_snapshot.get(key)
+            scoped_key = (batch_id, *key)
+            frame_by_key[scoped_key] = frame
+            evidence = evidence_snapshot.get(scoped_key)
             if evidence is None:
                 evidence = (
                     self.object_archive.get(frame)
@@ -859,7 +882,7 @@ class AdvancedKISReranker:
                     evidence.cache_hit,
                     evidence.read_ms,
                 )
-            evidence_by_key[key] = evidence
+            evidence_by_key[scoped_key] = evidence
             object_states.add(evidence.state)
             fallback = fallback_if_expired("object_evidence", index)
             if fallback is not None:
@@ -907,14 +930,14 @@ class AdvancedKISReranker:
             if fallback is not None:
                 return fallback
             if strict and decomposition.relative_constraints:
-                relation_started = time.monotonic()
+                relation_started = time.perf_counter()
                 graph_match = match_spatial_graph(
                     decomposition.relative_constraints,
                     evidence.detections,
                     config=self.spatial_ontology,
                     detections_are_nms=True,
                 )
-                graph_by_key[key] = graph_match
+                graph_by_key[scoped_key] = graph_match
                 item["relation_rerank_state"] = graph_match.state
                 if graph_match.state == "verified" and graph_match.score is not None:
                     item["score"] = float(item.get("score", 0.0)) * (
@@ -936,13 +959,13 @@ class AdvancedKISReranker:
                     )
                     item["evidence"] = evidence_items
                 geometry_elapsed_ms += graph_match.geometry_latency_ms
-                relation_elapsed_ms += (time.monotonic() - relation_started) * 1_000
+                relation_elapsed_ms += (time.perf_counter() - relation_started) * 1_000
                 fallback = fallback_if_expired("relative_spatial", index)
                 if fallback is not None:
                     return fallback
 
             if strict and evidence.state == "ready":
-                negation_started = time.monotonic()
+                negation_started = time.perf_counter()
                 forbidden_states: list[dict[str, Any]] = []
                 forbidden_present = False
                 for constraint in decomposition.negation_constraints:
@@ -988,7 +1011,7 @@ class AdvancedKISReranker:
                         {"channel": "negative_object", "constraints": forbidden_states}
                     )
                     item["evidence"] = evidence_items
-                negation_elapsed_ms += (time.monotonic() - negation_started) * 1_000
+                negation_elapsed_ms += (time.perf_counter() - negation_started) * 1_000
                 fallback = fallback_if_expired("negation", index)
                 if fallback is not None:
                     return fallback
@@ -1005,6 +1028,8 @@ class AdvancedKISReranker:
                 phase="candidate_start",
                 processed_candidates=len(reranked),
             )
+        # These candidates have no Tier-2 work; keep all of them and their scores.
+        reranked.extend(stage1[self.spatial_depth :])
         fallback = fallback_if_expired("candidate_loop", len(stage1))
         if fallback is not None:
             return fallback
@@ -1012,9 +1037,10 @@ class AdvancedKISReranker:
         fallback = fallback_if_expired("spatial_sort", len(stage1))
         if fallback is not None:
             return fallback
-        spatial_ms = (time.monotonic() - spatial_started) * 1_000
+        spatial_ms = (time.perf_counter() - spatial_started) * 1_000
+        self._state.stage_timings_ms["geometry"] = geometry_elapsed_ms
 
-        color_started = time.monotonic()
+        color_started = time.perf_counter()
         head = reranked[: self.color_depth]
         tail = reranked[self.color_depth :]
         color_requested = bool(
@@ -1027,19 +1053,21 @@ class AdvancedKISReranker:
                 fallback = fallback_if_expired("color_start", len(stage1) + color_index)
                 if fallback is not None:
                     return fallback
-                key = canonical_key(item)
-                verified_head.append(
-                    self._verify_colors(
-                        item,
-                        frame_by_key.get(key) or self._frame(item),
-                        evidence_by_key.get(key, ObjectEvidence("not_applicable")),
-                        decomposition.color_constraints,
-                        decomposition.object_instances,
-                        decomposition.negation_constraints,
-                        graph_match=graph_by_key.get(key),
-                        strict=strict,
-                    )
+                key = (self._batch_id(item), *canonical_key(item))
+                color_item_started = time.perf_counter()
+                verified_item = self._verify_colors(
+                    item,
+                    frame_by_key[key] if key in frame_by_key else self._frame(item),
+                    evidence_by_key.get(key, ObjectEvidence("not_applicable")),
+                    decomposition.color_constraints,
+                    decomposition.object_instances,
+                    decomposition.negation_constraints,
+                    graph_match=graph_by_key.get(key),
+                    strict=strict,
                 )
+                rank_by_object[id(verified_item)] = rank_by_object[id(item)]
+                verified_head.append(verified_item)
+                self._state.stage_timings_ms["color"] = self._state.stage_timings_ms.get("color", 0.0) + (time.perf_counter()-color_item_started)*1000
                 fallback = fallback_if_expired(
                     "color_verification",
                     len(stage1) + color_index + 1,
@@ -1050,14 +1078,21 @@ class AdvancedKISReranker:
         fallback = fallback_if_expired("color_complete", len(stage1) + len(head))
         if fallback is not None:
             return fallback
-        output = self._sort([*head, *tail])
+        fusion_started = time.perf_counter()
+        output = self._sort([*head, *tail]) if color_requested else reranked
+        finalized: list[dict[str, Any]] = []
         for rank, item in enumerate(output, start=1):
             fallback = fallback_if_expired("rank_delta", len(stage1) + rank - 1)
             if fallback is not None:
                 return fallback
-            initial_rank = initial_ranks.get(canonical_key(item), rank)
+            initial_rank = rank_by_object[id(item)]
+            # The untouched tail shares the fallback snapshot. Never add rank
+            # diagnostics to it until the complete operation has succeeded.
+            item = dict(item)
             item["advanced_rank_delta"] = initial_rank - rank
-        color_ms = (time.monotonic() - color_started) * 1_000
+            finalized.append(item)
+        self._state.stage_timings_ms["fusion"] = (time.perf_counter()-fusion_started)*1000
+        color_ms = (time.perf_counter() - color_started) * 1_000
         color_verified = sum(
             value.get("color_rerank_state") == "verified" for value in head
         )
@@ -1066,6 +1101,7 @@ class AdvancedKISReranker:
         )
         self._state.diagnostics = {
             "state": "degraded" if object_evidence_degraded else "ready",
+            "stage_timings_ms": dict(self._state.stage_timings_ms),
             "reason_code": (
                 "object_evidence_unavailable" if object_evidence_degraded else "query_completed"
             ),
@@ -1092,12 +1128,13 @@ class AdvancedKISReranker:
             "color_verified": color_verified,
             "color_latency_ms": round(color_ms, 3),
             "prefetch_latency_ms": round(prefetch_ms, 3),
-            "total_latency_ms": round((time.monotonic() - started) * 1_000, 3),
+            "deadline_budget_ms": self.verification_budget_ms,
+            "total_latency_ms": round((time.perf_counter() - started) * 1_000, 3),
             "object_cache": self.object_archive.diagnostics,
             "object_states": sorted(object_states),
             "color_cache": self.color_verifier.diagnostics,
         }
-        return output
+        return finalized
 
 
 __all__ = ["AdvancedKISReranker", "HSVColorVerifier"]

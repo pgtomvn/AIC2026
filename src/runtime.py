@@ -25,10 +25,10 @@ from src.evaluation.tuning import (
     load_tuning_override,
 )
 from src.indexing.text_store import TextStore
-from src.indexing.vector_store import BatchVectorStore, VectorStore
+from src.indexing.vector_store import BatchVectorStore
 from src.ingest.ledger import JobLedger, LedgerError
 from src.ingest.native_pipeline import ScratchManager
-from src.organizer_verification import organizer_verification_passed
+from src.organizer_verification import organizer_batch_verification_passed
 from src.query.translator import OfflineVietnameseTranslator, QueryTextAdapter, TranslationCache
 from src.retrieval.raw_refiner import LocalFrameRefiner, PersistentRefinedFrameSink
 from src.retrieval.textual_kis import DenseChannel, LexicalChannel, TextualKISPipeline
@@ -83,12 +83,18 @@ class RuntimeContext:
     trake_pipeline: Any = None
     interaction_logger: Any = None
 
+    @property
+    def default_search_batches(self) -> tuple[str, ...]:
+        from src.retrieval.batch_scope import search_batches
+
+        return search_batches(self.config, self.selected_batch_id)
+
     def validate_batch_filters(self, batch_filters: Iterable[str] | None = None) -> tuple[str, ...]:
         """Validate explicit filters, defaulting empty input to the selected batch."""
 
         if isinstance(batch_filters, str):
             raise TypeError("batch_filters must be an iterable of batch identifiers")
-        values = tuple(batch_filters or (self.selected_batch_id,))
+        values = tuple(batch_filters or self.default_search_batches)
         if not values:
             values = (self.selected_batch_id,)
         validated: list[str] = []
@@ -287,19 +293,32 @@ def build_pipeline(config: dict[str, Any] | None = None) -> TextualKISPipeline:
             text_max_chunks=text_max_chunks,
             text_chunk_overlap=text_chunk_overlap,
         )
-        if organizer_verification_passed(
-            organizer,
-            expected_fingerprint=organizer_encoder.fingerprint,
-            project_root=PROJECT_ROOT,
-        ):
+        verified_organizer_batches = {
+            str(batch_id)
+            for batch_id, specification in readiness_batches.items()
+            if isinstance(specification, Mapping)
+            and specification.get("kind") == "reference"
+            and specification.get("retrieval_enabled", True)
+            and organizer_batch_verification_passed(
+                organizer,
+                batch_id=str(batch_id),
+                expected_fingerprint=organizer_encoder.fingerprint,
+                project_root=PROJECT_ROOT,
+            )
+        }
+        if verified_organizer_batches:
             dense.append(
                 DenseChannel(
                     "organizer_clip",
                     organizer_encoder,
-                    VectorStore(
+                    BatchVectorStore(
                         url=qdrant["url"],
                         api_key=qdrant.get("api_key"),
-                        collection_name=qdrant["collections"]["organizer_frames"],
+                        collection_template=qdrant["collections"]["organizer_compatible_frames"],
+                        collection_overrides={
+                            "aic25-b1-reference": qdrant["collections"]["organizer_frames"]
+                        },
+                        readable_batches=verified_organizer_batches,
                         vector_size=int(organizer["embedding_dim"]),
                         distance=qdrant["distance"],
                         **qdrant_transport,
@@ -353,6 +372,13 @@ def build_pipeline(config: dict[str, Any] | None = None) -> TextualKISPipeline:
         )
         for name in ("ocr", "asr", "metadata")
     ]
+    b02 = readiness_batches.get("aic26-b2", {})
+    if b02.get("retrieval_enabled", False):
+        lexical.append(LexicalChannel(
+            "objects", TextStore(url=meili["url"], api_key=meili.get("api_key"),
+                                 index_name="aic26_b2_objects_v1"),
+            float(b02.get("object_weight", 0.3)), int(b02.get("object_depth", 100)),
+        ))
     diversity = retrieval.get("diversity", {})
     entity_routing = retrieval.get("entity_routing", {})
     from src.retrieval.ocr_quality import OCRQualityConfig, OCRQualityStore
@@ -386,6 +412,7 @@ def build_pipeline(config: dict[str, Any] | None = None) -> TextualKISPipeline:
         video_local=retrieval.get("video_local"),
         ocr_quality=ocr_quality,
         ocr_quality_store=ocr_quality_store,
+        interactive=retrieval.get("interactive"),
     )
 
 
@@ -421,6 +448,16 @@ def build_runtime(config: dict[str, Any] | None = None) -> RuntimeContext:
             video_id = payload.get("video_id")
             if not isinstance(batch_id, str) or not isinstance(video_id, str):
                 return None
+            if batch_id == "aic26-b2":
+                from src.ingest.frame_identity import resolve_image_frame
+
+                try:
+                    frame = resolve_image_frame(repository, payload)
+                except ValueError:
+                    return None
+                if frame is None:
+                    return None
+                return {**result, "payload": {**payload, **frame.to_dict()}}
             frame = None
             raw_frame_idx = payload.get("source_frame_idx")
             if not isinstance(raw_frame_idx, bool):
@@ -541,6 +578,7 @@ def build_runtime(config: dict[str, Any] | None = None) -> RuntimeContext:
                 advanced_kis.get("color_absent_multiplier", 0.65)
             ),
             color_workers=int(advanced_kis.get("color_workers", 2)),
+            verification_budget_ms=float(advanced_kis.get("verification_budget_ms", 20)),
             relation_beta=float(advanced_kis.get("relation_beta", 0.40)),
             strict_color_threshold=float(
                 advanced_kis.get("strict_color_roi_threshold", 0.12)
@@ -680,6 +718,8 @@ def build_runtime(config: dict[str, Any] | None = None) -> RuntimeContext:
         )
         if channel_name == pipeline.video_local.source_channel:
             pipeline.video_local_trajectories = trajectory_cache
+        if channel_name == "organizer_clip":
+            pipeline.temporal_trajectories = trajectory_cache
         trake_cores[channel_name] = TRAKEPipeline(
             encoder=channel.encoder,
             vector_store=channel.store,
@@ -705,18 +745,46 @@ def build_runtime(config: dict[str, Any] | None = None) -> RuntimeContext:
             query_adapter=pipeline.query_adapter,
             lexical_channels=pipeline.lexical_channels,
         )
+    from src.retrieval.batch_scope import search_batches
+
+    scope = search_batches(settings, selected_batch_id)
+    batch_cores = {}
+    if len(scope) > 1:
+        # Both audited references share an encoder, but must retain independent
+        # resident trajectories. Never swap/reload the full cache in a request.
+        from copy import copy
+
+        organizer = trake_cores.get("organizer_clip")
+        if organizer is not None:
+            batch_cores[scope[0]] = organizer
+            alternate = copy(organizer)
+            original_cache = organizer.trajectory_cache
+            alternate.trajectory_cache = TRAKETrajectoryCache(
+                original_cache.vector_store, vector_size=original_cache.vector_size,
+                batch_size=original_cache.batch_size,
+                fingerprint_provider=original_cache.fingerprint_provider,
+                snapshot_store=original_cache.snapshot_store,
+            )
+            batch_cores[scope[1]] = alternate
     trake_pipeline = TRAKEPipelineRouter(
         trake_cores,
         settings,
         readiness_service=readiness_service,
+        artifact_repository=repository,
+        batch_pipelines=batch_cores,
         readiness_cache_seconds=float(trake_settings.get("readiness_cache_seconds", 300)),
     )
 
-    def feedback(channel_name: str, keys: Any) -> Any:
+    def feedback(channel_name: str, keys: Any, *, batch_id: str | None = None,
+                 coordinate: str = "source_frame_idx") -> Any:
         channel = dense_by_name.get(channel_name)
         if channel is None or not hasattr(channel.store, "vectors_for_frames"):
             raise ValueError(f"channel {channel_name!r} cannot provide feedback vectors")
-        return channel.store.vectors_for_frames(keys)
+        if coordinate == "keyframe_ordinal":
+            if batch_id != "aic26-b2" or channel_name != "organizer_clip":
+                raise ValueError("unsupported ordinal vector space")
+            return channel.store.vectors_for_frames(keys, batch_id=batch_id, coordinate=coordinate)
+        return channel.store.vectors_for_frames(keys, batch_id=batch_id)
 
     pipeline.feedback_provider = feedback
     refinement = settings["retrieval"].get("raw_refinement", {})
@@ -797,6 +865,7 @@ def build_runtime(config: dict[str, Any] | None = None) -> RuntimeContext:
             timeout_seconds=float(ollama.get("timeout_seconds", 60)),
             keep_alive=ollama.get("keep_alive", "15m"),
             num_ctx=int(ollama.get("num_ctx", 4096)),
+            execution_mode=str(ollama.get("execution_mode", "auto")),
             max_new_tokens=int(ollama.get("max_new_tokens", 64)),
             max_images=int(ollama.get("max_images", 1)),
             max_total_image_bytes=int(qa.get("image_max_request_bytes", 20 * 1024 * 1024)),
@@ -816,14 +885,15 @@ def build_runtime(config: dict[str, Any] | None = None) -> RuntimeContext:
         )
         florence = settings.get("models", {}).get("florence2", {})
         if bool(florence.get("enabled", False)):
-            from src.vlm.florence2 import Florence2TaskReasoner
+            from src.vlm.isolated_florence import IsolatedFlorence2TaskReasoner
 
-            florence_reasoner = Florence2TaskReasoner(
+            florence_reasoner = IsolatedFlorence2TaskReasoner(
                 _project_path(str(florence["model_path"])),
                 model_name=str(florence.get("model_name", "microsoft/Florence-2-base")),
                 revision=str(florence["revision"]),
                 expected_weights_sha256=florence.get("weights_sha256"),
                 max_new_tokens=int(florence.get("max_new_tokens", 256)),
+                timeout_seconds=float(florence.get("timeout_seconds", 90)),
             )
 
         specs = (
@@ -857,6 +927,7 @@ def build_runtime(config: dict[str, Any] | None = None) -> RuntimeContext:
                     warmed_report = report_getter()
             if (
                 warmed_report is not None
+                and len(batches) == 1
                 and getattr(warmed_report, "batch_id", None) in batches
             ):
                 channel_snapshot = [
@@ -937,9 +1008,30 @@ def build_runtime(config: dict[str, Any] | None = None) -> RuntimeContext:
             trake_pipeline=trake_pipeline,
             startup_budget_seconds=float(warmup_config.get("startup_budget_seconds", 90)),
         )
+        if len(scope) > 1:
+            from src.batch_warmup import BatchWarmup
+
+            services = {}
+            for batch in scope:
+                services[batch] = warmup_service if batch == selected_batch_id else WarmupService(
+                    pipeline=pipeline, readiness_service=readiness_service, batch_id=batch,
+                    profile=str(settings.get("profile", "laptop")), artifact_repository=repository,
+                    warm_query=warmup_service.warm_query,
+                    include_raw_refiner=warmup_service.include_raw_refiner,
+                    trake_pipeline=trake_pipeline,
+                    startup_budget_seconds=warmup_service.startup_budget_seconds,
+                )
+            warmup_service = BatchWarmup(services, primary=selected_batch_id)
     if gpu_coordinator is not None:
         gpu_coordinator.warmup = warmup_service
     from src.evaluation.interaction_log import InteractionLogger
+    from src.retrieval.temporal_router import load_release_record
+    from src.runtime_contract import source_contract_fingerprint
+
+    pipeline.temporal_source_fingerprint = source_contract_fingerprint()
+    release_path = _project_path(str(settings.get("retrieval", {}).get("interactive", {}).get(
+        "temporal_release_record", "outputs/evaluation/temporal-english-local-release.json")))
+    pipeline.temporal_release_record = load_release_record(release_path, PROJECT_ROOT)
 
     interaction_settings = settings.get("retrieval", {}).get("interaction_log", {})
     interaction_logger = InteractionLogger(

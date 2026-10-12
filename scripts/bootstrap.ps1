@@ -160,7 +160,7 @@ QDRANT_URL=http://127.0.0.1:6333
 MEILISEARCH_URL=http://127.0.0.1:7700
   # Single-frame Visual Q&A: consent-gated Gemini with local Ollama fallback.
   OLLAMA_URL=http://127.0.0.1:11434
-  OLLAMA_LLM_LIBRARY=vulkan
+  OLLAMA_LLM_LIBRARY=
   GEMINI_API_KEY=
 AIC_API_URL=http://127.0.0.1:8080
 CUDA_VISIBLE_DEVICES=0

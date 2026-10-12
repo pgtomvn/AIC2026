@@ -10,7 +10,12 @@ from types import SimpleNamespace
 import pytest
 from PIL import Image
 
-from src.api import _public_hits, _safe_frame_neighbor, _safe_query_processing
+from src.api import (
+    _public_hits,
+    _safe_channel_statuses,
+    _safe_frame_neighbor,
+    _safe_query_processing,
+)
 from src.contracts import FrameRecord
 from src.ingest.artifacts import ArtifactRepository
 from src.query.query_decomposer import ColorConstraint, SpatialConstraint, decompose_query
@@ -71,6 +76,20 @@ class _Resolver:
         del frame
         self.calls += 1
         return SimpleNamespace(data=self.data)
+
+
+def test_color_rois_share_decode_only_within_request_and_batch():
+    resolver = _Resolver(_jpeg((255, 0, 0)))
+    verifier = HSVColorVerifier(resolver)
+    verifier.begin_request()
+    first, _ = verifier.ratio(_frame(), "red", box=(0., 0., .5, .5))
+    second, _ = verifier.ratio(_frame(), "red", box=(.5, .5, 1., 1.))
+    assert resolver.calls == 1 and first == second
+    verifier.ratio(_frame(batch_id="other"), "red", box=(0., 0., .5, .5))
+    assert resolver.calls == 2
+    verifier.begin_request()
+    verifier.ratio(_frame(), "red", box=(.1, .1, .9, .9))
+    assert resolver.calls == 3
 
 
 def test_query_intent_precedence_and_bound_constraints() -> None:
@@ -185,6 +204,15 @@ class _Repository:
         return None
 
 
+def test_raw_unavailable_and_deadline_diagnostics_survive_api_sanitizer() -> None:
+    value = {
+        "raw_refinement": {"state": "not_applicable", "reason_code": "reference_only_source",
+                           "result_count": 20, "refined_count": 0},
+        "advanced_rerank": {"state": "degraded", "reason_code": "tier2_deadline_exceeded"},
+    }
+    assert _safe_channel_statuses(value) == value
+
+
 class _Objects:
     fingerprint = "objects:test"
     diagnostics = {"archive_state": "ready"}
@@ -195,6 +223,55 @@ class _Objects:
             "ready",
             (ObjectDetection("car", 0.9, (0.1, 0.1, 0.9, 0.9)),),
         )
+
+
+def test_tier2_batched_identity_snapshot_keeps_full_tail(monkeypatch) -> None:
+    frame = _frame()
+    class BatchedRepository(_Repository):
+        def get_frames(self, batch_id, identities):
+            return {(frame.video_id, frame.source_frame_idx): frame}
+    reranker = AdvancedKISReranker(
+        BatchedRepository(frame), _Objects(), HSVColorVerifier(_Resolver(_jpeg((255, 0, 0)))),
+        spatial_depth=1, color_depth=1,
+    )
+    # Deterministic scoring check, separate from deadline enforcement tests.
+    monkeypatch.setattr("src.retrieval.color_filter.time.perf_counter", lambda: 1.)
+    candidates = [
+        {"batch_id": frame.batch_id, "video_id": frame.video_id,
+         "source_frame_idx": frame.source_frame_idx + i, "score": 1. - i / 2000}
+        for i in range(1000)
+    ]
+    result = reranker(QueryTextAdapter().prepare("a car on the left"), candidates)
+    assert len(result) == len(candidates)
+    assert reranker.last_diagnostics["state"] == "ready"
+    assert all(result[i]["score"] == candidates[i]["score"] for i in range(1, 1000))
+    assert all("advanced_rank_delta" not in c for c in candidates)
+
+
+def test_tier2_late_rank_timeout_does_not_mutate_fallback_tail(monkeypatch) -> None:
+    import inspect
+
+    frame = _frame()
+    reranker = AdvancedKISReranker(
+        _Repository(frame), _Objects(), HSVColorVerifier(_Resolver(_jpeg((255, 0, 0)))),
+        spatial_depth=1, color_depth=1,
+    )
+    candidates = [
+        {"batch_id": frame.batch_id, "video_id": frame.video_id,
+         "source_frame_idx": frame.source_frame_idx + i, "score": 1. - i / 2000}
+        for i in range(1000)
+    ]
+    def clock():
+        caller = inspect.currentframe().f_back
+        if (caller.f_locals.get("phase") == "rank_delta"
+                and caller.f_locals.get("processed_candidates", 0) > 1500):
+            return 2.
+        return 1.
+    monkeypatch.setattr("src.retrieval.color_filter.time.perf_counter", clock)
+    result = reranker(QueryTextAdapter().prepare("a car on the left"), candidates)
+    assert result == candidates
+    assert reranker.last_diagnostics["deadline_phase"] == "rank_delta"
+    assert all("advanced_rank_delta" not in item for item in result)
 
 
 def test_automatic_color_mismatch_penalty_is_applied_only_once() -> None:

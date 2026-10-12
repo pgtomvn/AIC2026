@@ -484,6 +484,14 @@ def test_gpu_coordinator_keeps_cpu_encoder_and_clears_at_threshold(monkeypatch) 
     assert metrics["cuda_encoders_unloaded"] == 1
     assert coordinator.release_vlm_for_retrieval("b1-reference") is False
 
+    calls.clear()
+    fake_cuda.mem_get_info = lambda: (80, 100)
+    metrics = coordinator.before_vlm_inference("aic25-b1-reference")
+    # A CPU CLIP query does not imply that SigLIP has relinquished the GPU.
+    assert calls == ["cuda:0", "sync", "empty"]
+    assert metrics["cuda_encoders_unloaded"] == 1
+    assert metrics["cuda_cache_cleared"] is True
+
 
 def test_florence_is_offline_and_rejects_general_questions(tmp_path: Path) -> None:
     reasoner = Florence2TaskReasoner(

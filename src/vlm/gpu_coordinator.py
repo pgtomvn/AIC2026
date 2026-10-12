@@ -61,7 +61,9 @@ class GPUModelCoordinator:
         with self._lock:
             started = self._monotonic()
             evicted: list[str] = []
-            for channel in self._cuda_channels(batch_id):
+            # All resident CUDA encoders share the device, even when the
+            # current batch's preferred query encoder happens to run on CPU.
+            for channel in self._cuda_channels():
                 encoder = getattr(channel, "encoder", None)
                 unload = getattr(encoder, "unload", None)
                 if callable(unload):
@@ -77,7 +79,7 @@ class GPUModelCoordinator:
                     free_bytes, total_bytes = torch.cuda.mem_get_info()
                     if total_bytes > 0:
                         used_ratio = 1.0 - (float(free_bytes) / float(total_bytes))
-                    if used_ratio is not None and used_ratio >= self.clear_threshold:
+                    if evicted or (used_ratio is not None and used_ratio >= self.clear_threshold):
                         torch.cuda.synchronize()
                         torch.cuda.empty_cache()
                         cache_cleared = True

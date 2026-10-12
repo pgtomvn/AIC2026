@@ -12,6 +12,7 @@ from typing import Any, Callable, Mapping
 
 import numpy as np
 
+from src.retrieval.trake_scope import B02_TRAKE_POLICY, trake_filters, trake_video_allowed
 from src.retrieval.trake_snapshot import (
     TRAKETrajectorySnapshot,
     TRAKETrajectorySnapshotError,
@@ -171,10 +172,15 @@ class TRAKETrajectoryCache:
 
     def _fingerprint(self, batch_id: str) -> str:
         if self.fingerprint_provider is None:
-            return self._default_fingerprint(batch_id)
-        value = self.fingerprint_provider(batch_id)
+            value = self._default_fingerprint(batch_id)
+            if batch_id != "aic26-b2":
+                return value
+        else:
+            value = self.fingerprint_provider(batch_id)
         if not isinstance(value, str) or not value:
             raise ValueError("trajectory fingerprint provider returned an invalid value")
+        if batch_id == "aic26-b2":
+            value = f"{value}:{B02_TRAKE_POLICY}"
         return hashlib.sha256(
             (
                 f"{TRAKE_TRAJECTORY_CACHE_VERSION}:"
@@ -233,6 +239,11 @@ class TRAKETrajectoryCache:
             if not isinstance(payload, Mapping) or payload.get("batch_id") != batch_id:
                 return
             video_id = payload.get("video_id")
+            if batch_id == "aic26-b2" and (
+                not isinstance(video_id, str) or not trake_video_allowed(batch_id, video_id)
+                or payload.get("trake_eligible") is not True
+            ):
+                return
             frame_idx = self._payload_int(payload, "source_frame_idx")
             timestamp_ms = self._payload_int(payload, "timestamp_ms")
             if (
@@ -261,7 +272,7 @@ class TRAKETrajectoryCache:
         )
         if callable(batch_iterator):
             batches = batch_iterator(
-                {"batch_id": batch_id},
+                trake_filters(batch_id),
                 batch_size=self.batch_size,
             )
             for point_batch in batches:
@@ -280,7 +291,7 @@ class TRAKETrajectoryCache:
                     retain_payload(payload, batch_index, row_index)
         else:
             points = self.vector_store.iter_points_with_vectors(
-                {"batch_id": batch_id},
+                trake_filters(batch_id),
                 batch_size=self.batch_size,
             )
             for point in points:
@@ -315,6 +326,8 @@ class TRAKETrajectoryCache:
             finite = np.all(np.isfinite(matrix), axis=1)
             norms = np.linalg.norm(matrix, axis=1)
             valid = finite & np.isfinite(norms) & (norms > 0)
+            if batch_id == "aic26-b2" and not np.all(valid):
+                raise ValueError("invalid B02 TRAKE vector")
             if not np.any(valid):
                 continue
             matrix = matrix[valid] / norms[valid, None]
@@ -331,6 +344,13 @@ class TRAKETrajectoryCache:
                 existing = by_frame.get(frame_idx)
                 if existing is None:
                     by_frame[frame_idx] = (timestamp_ms, vector.copy(), shot_code)
+                elif batch_id == "aic26-b2":
+                    # A rounded source index can name two DIFFERENT images.
+                    # Keep the earlier PTS image, never average their vectors.
+                    if existing[0] == timestamp_ms:
+                        raise ValueError("ambiguous B02 TRAKE source/PTS identity")
+                    if timestamp_ms < existing[0]:
+                        by_frame[frame_idx] = (timestamp_ms, vector.copy(), shot_code)
                 else:
                     by_frame[frame_idx] = (
                         min(existing[0], timestamp_ms),
@@ -372,6 +392,8 @@ class TRAKETrajectoryCache:
                     previous_frame = int(frame_idx)
                     previous_timestamp = int(timestamp_ms)
             if keep:
+                if batch_id == "aic26-b2" and len(keep) != len(merged_frames):
+                    raise ValueError("non-monotonic B02 TRAKE mapping")
                 canonical[video_id] = (
                     merged_frames[keep],
                     merged_times[keep],

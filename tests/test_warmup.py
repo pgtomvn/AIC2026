@@ -77,6 +77,30 @@ def _service(pipeline: _Pipeline, readiness: _Readiness) -> WarmupService:
     )
 
 
+def test_b02_warmup_never_builds_legacy_object_or_trajectory_cache():
+    def forbidden(*args):
+        raise AssertionError("unreleased B02 cache path")
+    pipeline = _Pipeline()
+    pipeline.advanced_reranker = SimpleNamespace(object_archive=SimpleNamespace(warmup=forbidden))
+    pipeline.raw_refiner = SimpleNamespace(encoder=SimpleNamespace(encode_text=forbidden))
+    class DisabledReadiness(_Readiness):
+        def check(self, *args, **kwargs):
+            report = super().check(*args, **kwargs)
+            report.trake = SimpleNamespace(state="blocked", required_channels=("organizer_clip",),
+                unavailable_channels=("batch_temporal_contract_unavailable",))
+            return report
+    service = WarmupService(pipeline=pipeline, readiness_service=DisabledReadiness({}, ()),
+        batch_id="aic26-b2", profile="laptop",
+        artifact_repository=SimpleNamespace(has_refinable_frames=forbidden),
+        trake_pipeline=SimpleNamespace(channel_for_batch=lambda batch: "organizer_clip", warm=forbidden),
+        resource_snapshot=lambda: {})
+    service.start()
+    snapshot = service.wait(5)
+    assert all(row["name"] not in {"object_evidence", "raw_refiner", "trake_organizer_clip_trajectory"}
+               for row in snapshot["channels"])
+    assert snapshot["workflows"]["trake"]["reason_code"] == "batch_temporal_contract_unavailable"
+
+
 def test_resource_snapshot_reports_process_memory_without_optional_psutil() -> None:
     resources = safe_resource_snapshot()
 

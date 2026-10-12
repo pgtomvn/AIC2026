@@ -212,6 +212,64 @@ def test_source_from_uri_parses_loose_and_zip_video_sources(tmp_path: Path) -> N
     assert zip_source.size_bytes == len(b"zipped-video")
 
 
+def test_raw_missing_zip_member_keeps_coarse_without_gpu(tmp_path: Path) -> None:
+    archive = tmp_path / "videos.zip"
+    with ZipFile(archive, "w") as handle:
+        handle.writestr("another.mp4", b"fixture")
+    candidate = {**_candidate(0), "video_uri": f"zip://{archive}!/missing.mp4"}
+    encoder = FakeEncoder((1., 0.), ((1., 0.),))
+    refiner = LocalFrameRefiner(encoder, FakeScratch(tmp_path / "scratch"), frame_sink=RecordingSink())
+    assert refiner(build_query_plan("a person"), [candidate]) == [candidate]
+    assert encoder.text_calls == encoder.image_calls == []
+    assert refiner.last_diagnostics["reason_code"] == "raw_source_unavailable"
+    assert refiner.last_diagnostics["refined_count"] == 0
+    assert not refiner.scratch.root.exists()
+
+
+def test_raw_scratch_permission_failure_keeps_coarse(tmp_path: Path, monkeypatch) -> None:
+    encoder = FakeEncoder((1., 0.), ((1., 0.),))
+    refiner = LocalFrameRefiner(encoder, FakeScratch(tmp_path / "scratch"), frame_sink=RecordingSink())
+    def denied(*args, **kwargs):
+        raise PermissionError("fixture denied")
+    monkeypatch.setattr(Path, "mkdir", denied)
+    candidate = _candidate(0)
+    assert refiner(build_query_plan("a person"), [candidate]) == [candidate]
+    assert refiner.last_diagnostics["reason_code"] == "raw_storage_unavailable"
+    assert encoder.text_calls == []
+
+
+def test_raw_null_sampling_reasons_and_diagnostics_reset(tmp_path: Path) -> None:
+    candidate = {**_candidate(0), "sampling_reasons": None}
+    assert LocalFrameRefiner.is_eligible(candidate)
+    refiner = LocalFrameRefiner(FakeEncoder((1., 0.), ((1., 0.),)), FakeScratch(tmp_path))
+    refiner._state.diagnostics = {"state": "degraded"}
+    assert refiner(build_query_plan("a person"), [candidate]) == [candidate]
+    assert refiner.last_diagnostics["state"] == "not_applicable"
+
+
+def test_raw_invalid_query_vector_is_not_media_fallback(tmp_path: Path) -> None:
+    refiner = StubFrameRefiner(
+        FakeEncoder((float('nan'), 0.), ((1., 0.),)), FakeScratch(tmp_path / "scratch"),
+        decoded_frames=[{"path": tmp_path / "sample.jpg"}], frame_sink=RecordingSink(),
+    )
+    with pytest.raises(ValueError, match="invalid mean|finite non-zero norm"):
+        refiner(build_query_plan("a person"), [_candidate(0)])
+
+
+def test_raw_reference_uri_never_decodes_or_encodes(tmp_path: Path) -> None:
+    encoder = FakeEncoder((1., 0.), ((1., 0.),))
+    refiner = StubFrameRefiner(
+        encoder, FakeScratch(tmp_path / "scratch"), frame_sink=RecordingSink(),
+        decoded_frames=[{"path": tmp_path / "should-not-be-read.jpg"}],
+    )
+    candidate = {**_candidate(0), "video_uri": "reference://b2/L21_V001"}
+    assert refiner(build_query_plan("a person"), [candidate]) == [candidate]
+    assert refiner.last_diagnostics["reason_code"] == "reference_only_source"
+    assert encoder.text_calls == encoder.image_calls == []
+    assert not refiner.scratch.sources
+    assert not refiner.scratch.root.exists()
+
+
 def test_raw_decode_uses_pts_anchor_for_exact_vfr_source_ordinals(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

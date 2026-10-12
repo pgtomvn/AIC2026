@@ -16,6 +16,7 @@ def _comma_values(value: str) -> tuple[str, ...]:
 def render_text_encoding_diagnostics(statuses: dict[str, dict[str, Any]]) -> None:
     """Explain dense-query chunking without exposing tokenizer internals."""
 
+    notes: list[str] = []
     for channel_name, status in sorted(statuses.items()):
         if not isinstance(status, dict) or not status.get("query_chunked"):
             continue
@@ -28,9 +29,13 @@ def render_text_encoding_diagnostics(statuses: dict[str, dict[str, Any]]) -> Non
                 "Phần đầu và cuối vẫn được giữ."
             )
         else:
-            st.caption(
+            notes.append(
                 f"Kênh {channel_name} đã chia truy vấn thành {chunk_count} phần để giữ đủ nội dung."
             )
+    if notes:
+        with st.expander("Mã hóa truy vấn"):
+            for note in notes:
+                st.caption(note)
 
 
 def render_query_input(
@@ -46,7 +51,7 @@ def render_query_input(
     text = st.text_area(
         "Mô tả sự kiện bằng ngôn ngữ tự nhiên",
         key=f"{key_prefix}_text",
-        placeholder="Một người mặc áo đỏ đi bộ qua cây cầu...",
+        placeholder="A person in a red shirt walks across a bridge…",
         height=110,
     )
     plan = None

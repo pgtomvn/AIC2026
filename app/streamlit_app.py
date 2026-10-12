@@ -21,6 +21,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 import streamlit as st  # noqa: E402
 
+from app.components.b02_export import combined_enabled, export_rows  # noqa: E402
 from app.components.cyberpunk_theme import (  # noqa: E402
     hud_container_key,
     inject_cyberpunk_theme,
@@ -30,6 +31,11 @@ from app.components.cyberpunk_theme import (  # noqa: E402
     render_hud_timeline_strip,
 )
 from app.components.export_panel import render_export_panel  # noqa: E402
+from app.components.interactive_search import (  # noqa: E402
+    remember_search,
+    render_interactive_search,
+    select_feedback,
+)
 from app.components.query_input import (  # noqa: E402
     render_query_input,
     render_text_encoding_diagnostics,
@@ -95,7 +101,7 @@ _QA_FAILURE_CODES = frozenset(
 )
 
 _ENTITY_EXTRACTOR = EntityExtractor()
-_EXPECTED_RUNTIME_CONTRACT_VERSION = 6
+_EXPECTED_RUNTIME_CONTRACT_VERSION = 8
 _EXPECTED_RUNTIME_CONTRACT_FEATURES = frozenset(
     {
         "entity_constraints.kis",
@@ -112,6 +118,13 @@ _EXPECTED_RUNTIME_CONTRACT_FEATURES = frozenset(
         "kis.experimental_cross_modal_calibration",
         "dataset.multimodal_coverage",
         "kis.full_spatial_ontology",
+        "kis.interactive_feedback",
+        "kis.session_conversation",
+        "kis.manual_temporal_sequence",
+        "kis.frame_evidence",
+        "kis.edit_preview",
+        "kis.gated_english_temporal",
+        "kis.manual_event_inspection",
     }
 )
 _QA_PROVIDER_ERROR_CATEGORIES = frozenset(
@@ -194,6 +207,7 @@ def _render_query_processing(value: Any) -> None:
 
     if not isinstance(value, dict) or not value:
         return
+    diagnostics = st.expander("Phân tích truy vấn")
     language = str(value.get("detected_language") or "unknown")
     intent = str(value.get("intent") or "visual_dense")
     effective_k = value.get("effective_rrf_k")
@@ -208,7 +222,7 @@ def _render_query_processing(value: Any) -> None:
                 for name, weight in sorted(weights.items())
                 if isinstance(weight, (int, float)) and not isinstance(weight, bool)
             )
-        st.caption("⌁ " + detail)
+        diagnostics.caption("⌁ " + detail)
     constraints = [
         *(
             value.get("spatial_constraints")
@@ -231,7 +245,7 @@ def _render_query_processing(value: Any) -> None:
             state = "BOUND" if constraint.get("bound") else "DIAGNOSTIC"
             labels.append(f"[{subject} → {target} · {state}]")
         if labels:
-            st.caption("▦ Spatial/Color: " + " ".join(labels))
+            diagnostics.caption("▦ Spatial/Color: " + " ".join(labels))
     relation_labels = []
     for constraint in value.get("relative_constraints", ()):
         if not isinstance(constraint, dict):
@@ -256,10 +270,10 @@ def _render_query_processing(value: Any) -> None:
         color = f" {constraint['color']}" if constraint.get("color") else ""
         relation_labels.append(f"[KHÔNG:{color} {constraint.get('subject', '?')}]")
     if relation_labels:
-        st.caption("⌖ Relation/Negation: " + " ".join(relation_labels[:16]))
+        diagnostics.caption("⌖ Relation/Negation: " + " ".join(relation_labels[:16]))
     ambiguous = value.get("ambiguous_relations")
     if isinstance(ambiguous, list) and ambiguous:
-        st.caption(
+        diagnostics.caption(
             "⌁ Quan hệ BETWEEN cần nêu rõ vật ở giữa và đủ hai vật mốc; "
             "cụm mơ hồ hiện chỉ dùng cho truy vấn dense/lexical."
         )
@@ -284,7 +298,7 @@ def _render_query_processing(value: Any) -> None:
             if isinstance(latency, (int, float)) and not isinstance(latency, bool)
             else ""
         )
-        st.info(f'🌐 Auto-translated ({source}{suffix}): “{english}”')
+        diagnostics.info(f'🌐 Auto-translated ({source}{suffix}): “{english}”')
     elif language == "vi" and value.get("failure_code"):
         st.warning(
             "Bộ dịch Việt–Anh chưa sẵn sàng; các kênh OpenCLIP tiếng Anh được bỏ qua "
@@ -300,7 +314,7 @@ def _render_query_processing(value: Any) -> None:
             matched = " · MATCH" if entity.get("boost_applied") else ""
             labels.append(f"[{entity['text']} · {mode}{matched}]")
         if labels:
-            st.caption("🏷️ Phân tích thực thể: " + " ".join(labels))
+            diagnostics.caption("🏷️ Phân tích thực thể: " + " ".join(labels))
     required_status = value.get("required_entity_status")
     if required_status == "required_entity_evidence_unavailable":
         st.warning("Không có kênh OCR/ASR/metadata khả dụng để xác minh thực thể bắt buộc.")
@@ -377,10 +391,17 @@ def _report_ui_error(
         query_or_session_id=query_or_session_id,
         latency_ms=latency_ms,
     )
-    st.error(
-        "Đã xảy ra lỗi khi xử lý yêu cầu. Vui lòng thử lại hoặc tra cứu nhật ký "
-        f"bằng mã tương quan `{event_id}`."
-    )
+    if isinstance(error, BackendError) and error.code == "staging_revision_conflict":
+        st.warning(
+            "Submission Hub đã thay đổi ở phiên khác. Hãy tải lại trang để nhận "
+            "thứ hạng mới nhất rồi ghim lại lựa chọn; yêu cầu vừa rồi chưa được lưu. "
+            f"Mã tra cứu: `{event_id}`."
+        )
+    else:
+        st.error(
+            "Đã xảy ra lỗi khi xử lý yêu cầu. Vui lòng thử lại hoặc tra cứu nhật ký "
+            f"bằng mã tương quan `{event_id}`."
+        )
     return event_id
 
 
@@ -452,6 +473,10 @@ def _kis_image_loader(context: RuntimeContext, item: dict[str, Any]) -> bytes | 
     batch_id = item.get("batch_id")
     video_id = item.get("video_id")
     source_frame_idx = item.get("source_frame_idx")
+    if batch_id == "aic26-b2":
+        from app.components.ordinal_images import load_ordinal_image
+
+        return load_ordinal_image(context, item)
     if (
         not isinstance(batch_id, str)
         or not isinstance(video_id, str)
@@ -734,7 +759,8 @@ def _open_kis_scrubber(item: dict[str, Any]) -> None:
     st.session_state.kis_scrub_anchor = {
         "batch_id": identity[0],
         "video_id": identity[1],
-        "source_frame_idx": identity[2],
+        "source_frame_idx": int(item["source_frame_idx"]),
+        **({"keyframe_ordinal": identity[2]} if identity[0] == "aic26-b2" else {}),
         "rank": int(item.get("rank", 0) or 0),
     }
     st.session_state.kis_scrub_frames = []
@@ -767,6 +793,8 @@ def _pin_temporal_neighbor(
             ]
         },
     }
+    if frame.batch_id == "aic26-b2":
+        item["keyframe_ordinal"] = frame.keyframe_ordinal
     identity = result_identity(item)
     widget_key = pin_widget_key(identity)
     st.session_state[widget_key] = True
@@ -780,7 +808,7 @@ def _render_kis_temporal_scrubber(context: RuntimeContext) -> None:
     identity = (
         str(anchor.get("batch_id", "")),
         str(anchor.get("video_id", "")),
-        int(anchor.get("source_frame_idx", -1)),
+        int(anchor.get("keyframe_ordinal" if anchor.get("batch_id") == "aic26-b2" else "source_frame_idx", -1)),
     )
     digest = hashlib.sha256(
         "\0".join((identity[0], identity[1], str(identity[2]))).encode("utf-8")
@@ -788,19 +816,18 @@ def _render_kis_temporal_scrubber(context: RuntimeContext) -> None:
     with st.container(key=f"kis-temporal-scrubber-{digest}", border=True):
         st.markdown("### Temporal scrubber · ordinal canonical ±5")
         st.caption(
-            f"Anchor {identity[1]} · source frame {identity[2]} · "
+            f"Anchor {identity[1]} · {'ảnh ordinal' if identity[0] == 'aic26-b2' else 'source frame'} {identity[2]} · "
             "không dùng phép cộng/trừ source frame."
         )
         values = st.session_state.get("kis_scrub_frames")
         if not isinstance(values, list) or not values:
             try:
                 with st.spinner("Đang tải metadata khung hình lân cận..."):
-                    pairs = context.artifact_repository.adjacent_frames(
-                        identity[0],
-                        identity[1],
-                        identity[2],
-                        radius=5,
-                    )
+                    if identity[0] == "aic26-b2":
+                        neighbors = context.artifact_repository.ordinal_neighbors(*identity, radius=5)
+                        pairs = [(f.keyframe_ordinal - identity[2], f) for f in neighbors]
+                    else:
+                        pairs = context.artifact_repository.adjacent_frames(*identity, radius=5)
                 values = [
                     {
                         "offset": int(offset),
@@ -846,12 +873,11 @@ def _render_kis_temporal_scrubber(context: RuntimeContext) -> None:
                 f"{frame.timestamp_ms / 1000:.3f}s · offset {selected_offset:+d}",
                 language=None,
             )
-            image = _source_frame_image(
-                context,
-                frame.batch_id,
-                frame.video_id,
-                frame.source_frame_idx,
-            )
+            image = _kis_image_loader(context, {
+                "batch_id": frame.batch_id, "video_id": frame.video_id,
+                "source_frame_idx": frame.source_frame_idx,
+                "keyframe_ordinal": getattr(frame, "keyframe_ordinal", None),
+            })
             if image is not None:
                 st.image(image, width="stretch")
                 if st.button(
@@ -863,6 +889,49 @@ def _render_kis_temporal_scrubber(context: RuntimeContext) -> None:
                     st.success("Đã thêm khung lân cận vào danh sách KIS đang ghim.")
             else:
                 st.warning("Ảnh canonical của khung lân cận hiện không khả dụng.")
+            neighbor = {"batch_id": frame.batch_id, "video_id": frame.video_id,
+                        "source_frame_idx": frame.source_frame_idx, "timestamp_ms": frame.timestamp_ms}
+            if frame.batch_id == "aic26-b2":
+                neighbor["keyframe_ordinal"] = frame.keyframe_ordinal
+            if st.button("Dùng khung này làm ảnh mẫu", key=f"kis_scrub_reference_{digest}",
+                         disabled=not context.config.get("retrieval", {}).get("interactive", {}).get("feedback_enabled", True)):
+                select_feedback(neighbor, "reference")
+            if st.button("Gửi khung này sang Visual Q&A", key=f"kis_scrub_qa_{digest}"):
+                _bridge_kis_result_to_qa(context, neighbor)
+            from app.components.event_inspection import render_event_inspection
+            render_event_inspection(context, neighbor, key=f"kis_scrub_{digest}")
+            if context.config.get("retrieval", {}).get("interactive", {}).get("evidence_enabled", True):
+                if st.button("Tải OCR / transcript ±30 giây", key=f"kis_load_evidence_{digest}"):
+                    try:
+                        loader = getattr(context.artifact_repository, "frame_evidence", None)
+                        if frame.batch_id == "aic26-b2":
+                            evidence = context.artifact_repository.ordinal_evidence(frame.batch_id, frame.video_id, frame.keyframe_ordinal)
+                        elif callable(loader):
+                            evidence = loader(frame.batch_id, frame.video_id, frame.source_frame_idx)
+                        else:
+                            from src.retrieval.frame_evidence import frame_evidence
+                            text_stores = {
+                                channel.name: channel.store
+                                for channel in getattr(context.pipeline, "lexical_channels", ())
+                                if channel.name in {"ocr", "asr"}
+                            }
+                            evidence = frame_evidence(
+                                context.artifact_repository, frame.batch_id, frame.video_id,
+                                frame.source_frame_idx, text_stores=text_stores,
+                            )
+                        st.session_state.kis_frame_evidence = evidence
+                    except Exception:
+                        st.warning("Bằng chứng chưa tải được; không thay đổi kết quả.")
+                evidence = st.session_state.get("kis_frame_evidence", {})
+                evidence_anchor = evidence.get("anchor", {})
+                evidence_keys = ("batch_id", "video_id", "keyframe_ordinal") if frame.batch_id == "aic26-b2" else ("batch_id", "video_id", "source_frame_idx")
+                if all(evidence_anchor.get(k) == neighbor[k] for k in evidence_keys):
+                    st.caption("Transcript là lời thoại, không phải xác nhận nội dung hình ảnh. Tối đa 200 segment.")
+                    segments = evidence.get("segments", [])
+                    if segments:
+                        st.dataframe(segments, hide_index=True, width="stretch")
+                    else:
+                        st.info("B02 chưa nhập OCR/ASR; objects không phải OCR." if frame.batch_id == "aic26-b2" else "Không có OCR hoặc lời thoại trong khoảng ±30 giây quanh khung này.")
         if st.button("Đóng scrubber", key=f"kis_scrub_close_{digest}"):
             st.session_state.kis_scrub_anchor = None
             st.session_state.kis_scrub_frames = []
@@ -885,6 +954,7 @@ def _result_fingerprint(*, workflow: str, batch_id: str, rows: list[dict[str, An
                 "batch_id",
                 "video_id",
                 "source_frame_idx",
+                "keyframe_ordinal",
                 "answer",
                 "stage_matches",
             )
@@ -1022,6 +1092,11 @@ def _validated_batch_filters(
     context: RuntimeContext,
     values: tuple[str, ...] | None = None,
 ) -> tuple[str, ...]:
+    if values is None and combined_enabled(context):
+        from src.retrieval.batch_scope import BATCHES
+
+        scope = st.session_state.get("search_scope", "all")
+        values = BATCHES if scope == "all" else (scope,) if scope in BATCHES else BATCHES
     validator = getattr(context, "validate_batch_filters", None)
     if callable(validator):
         validated = validator(values or None)
@@ -1054,7 +1129,8 @@ def _render_launch_identity(context: RuntimeContext) -> None:
         f"ID `{launch_id}` · khóa `{lock_fingerprint}`"
     )
     if identity.get("canonical") is True:
-        st.caption(details)
+        with st.sidebar.expander("Phiên chạy"):
+            st.caption(details)
         return
     recommended_port = port if isinstance(port, int) and 1 <= port <= 65_535 else 8501
     launcher = (
@@ -1109,6 +1185,9 @@ def _cached_or_live_readiness(context: RuntimeContext, batch_id: str) -> Any:
 
 
 def _render_readiness(context: RuntimeContext) -> None:
+    if combined_enabled(context):
+        st.caption("Health chi tiết dưới đây: " + str(_selected_batch_id(context)) +
+                   ". B02 có readiness riêng; không kế thừa nhãn Full Multi-Modal của B01.")
     # The exact canonical-image audit may inspect every archive member.  It is
     # deliberately performed by WarmupService off the Streamlit script thread;
     # probing here while that audit is running would freeze the first page and
@@ -1153,19 +1232,24 @@ def _render_readiness(context: RuntimeContext) -> None:
     trake = report.get("trake", {})
     kis_state = str(kis.get("state", "blocked")) if isinstance(kis, dict) else "blocked"
     qa_state = str(qa.get("state", "blocked")) if isinstance(qa, dict) else "blocked"
+    qa_retrieval_state = (
+        str(_warmup_workflow_snapshot(warmup_snapshot, "qa").get("state", qa_state))
+        if warmup_snapshot is not None else qa_state
+    )
     trake_state = str(trake.get("state", "blocked")) if isinstance(trake, dict) else "blocked"
     message = (
         f"Trạng thái hệ thống · {batch_id} · KIS {_vi_status(kis_state)} · "
-        f"Hỏi đáp hình ảnh {_vi_status(qa_state)} · TRAKE {_vi_status(trake_state)}"
+        f"QA tìm ứng viên {_vi_status(qa_retrieval_state)} · TRAKE {_vi_status(trake_state)}"
     )
-    if "blocked" in {kis_state, qa_state, trake_state}:
+    if "blocked" in {kis_state, qa_retrieval_state, trake_state}:
         st.error(message)
-    elif "degraded" in {kis_state, qa_state, trake_state}:
+    elif "degraded" in {kis_state, qa_retrieval_state, trake_state}:
         st.warning(message)
-    else:
+    elif not report.get("multimodal", {}).get("status_label"):
         st.success(message)
 
     multimodal = report.get("multimodal", {})
+    coverage_detail = ""
     if isinstance(multimodal, dict) and multimodal:
         status_label = str(multimodal.get("status_label") or "").strip()
         full_multimodal = multimodal.get("full_multimodal", {})
@@ -1187,7 +1271,7 @@ def _render_readiness(context: RuntimeContext) -> None:
         ocr = multimodal.get("ocr", {})
         asr = multimodal.get("asr", {})
         if all(isinstance(value, dict) for value in (siglip, ocr, asr)):
-            st.caption(
+            coverage_detail = (
                 "MULTIMODAL // "
                 f"{mm_status.upper()} · SigLIP2 "
                 f"{int(siglip.get('canonical_frames', 0) or 0):,}/"
@@ -1219,12 +1303,15 @@ def _render_readiness(context: RuntimeContext) -> None:
             "Các kênh bắt buộc đang lỗi: "
             + ", ".join(str(row.get("name")) for row in required_failures)
         )
-    if optional_missing:
-        st.caption(
-            "Các kênh tùy chọn chưa được cung cấp: "
-            + ", ".join(str(row.get("name")) for row in optional_missing)
-        )
-    with st.expander("Ma trận trạng thái hệ thống"):
+    with st.sidebar.expander("Trạng thái & dữ liệu"):
+        st.caption(message)
+        if coverage_detail:
+            st.caption(coverage_detail)
+        if optional_missing:
+            st.caption(
+                "Kênh tùy chọn chưa có: "
+                + ", ".join(str(row.get("name")) for row in optional_missing)
+            )
         st.dataframe(rows, width="stretch", hide_index=True)
 
 
@@ -1247,6 +1334,10 @@ def _warmup_snapshot(context: RuntimeContext) -> dict[str, Any] | None:
         value = snapshot()
     except Exception:
         return {"state": "failed", "search_usable": False, "channels": []}
+    if isinstance(value, dict) and combined_enabled(context):
+        from src.batch_warmup import scoped_snapshot
+
+        return scoped_snapshot(value, _validated_batch_filters(context))
     return dict(value) if isinstance(value, dict) else None
 
 
@@ -1277,8 +1368,10 @@ def _hud_state(value: object) -> str:
     """Map sanitized readiness states to the compact operator HUD vocabulary."""
 
     state = str(value or "").strip().lower()
-    if state in {"ready", "online", "configured", "configured_unverified"}:
+    if state in {"ready", "online"}:
         return "READY"
+    if state in {"configured", "configured_unverified"}:
+        return "UNVERIFIED"
     if state in {"idle", "warming", "evicted", "loading", "not_provisioned", "skipped"}:
         return "STANDBY"
     if state in {"degraded", "partial", "incompatible_index"}:
@@ -1340,6 +1433,8 @@ def _hud_service_statuses(
     translation = capabilities.get("query_translation", {})
     translation = translation if isinstance(translation, dict) else {}
     model = str(local.get("model") or "Qwen2.5-VL")
+    if local.get("execution_mode") == "cpu":
+        model += " · CPU, suy luận chậm"
     fastapi_state = "ONLINE" if bool(getattr(context, "is_remote", False)) else "STANDBY"
     fastapi_detail = (
         "runtime API đang phục vụ giao diện"
@@ -1361,7 +1456,14 @@ def _hud_service_statuses(
             _aggregate_hud_channels(channels, {"ocr", "asr", "metadata"}),
             "lexical retrieval",
         ),
-        ("Ollama", _hud_state(ollama_status.get("state")), model),
+        (
+            "Ollama",
+            "UNVERIFIED" if ollama_status.get("state") == "ready"
+            and not local.get("inference_verified", False)
+            else _hud_state(ollama_status.get("state")),
+            f"{model} · chưa kiểm chứng suy luận" if not local.get("inference_verified", False)
+            else model,
+        ),
         (
             "Gemini Flash",
             _hud_state(gemini_status.get("state")),
@@ -1378,6 +1480,13 @@ def _hud_service_statuses(
 @st.fragment(run_every="1s")
 def _render_warmup_sidebar(context: RuntimeContext) -> None:
     snapshot = _warmup_snapshot(context)
+    refresh_capabilities = getattr(context, "refresh_capabilities", None)
+    if callable(refresh_capabilities):
+        try:
+            refresh_capabilities()
+        except Exception:
+            # Do not keep presenting old provider badges after a failed poll.
+            context.capabilities = {}
     if snapshot is None:
         state = "ready"
         snapshot = {"state": state, "search_usable": True, "channels": []}
@@ -1402,72 +1511,55 @@ def _render_warmup_sidebar(context: RuntimeContext) -> None:
             st.rerun(scope="app")
     label = _WARMUP_VI.get(state, "Không xác định")
     with st.sidebar:
-        st.markdown(
-            render_hud_status_panel(
-                "SYSTEM LINK STATUS",
-                _hud_service_statuses(context, snapshot),
-            ),
-            unsafe_allow_html=True,
-        )
-        st.subheader("Bộ máy truy xuất")
-        if state == "ready":
-            st.success(label)
-        elif state == "degraded":
+        if state == "degraded":
             st.warning(label)
         elif state in {"idle", "warming", "evicted"}:
             st.info(label)
-        else:
+        elif state != "ready":
             st.error(label)
-        duration = snapshot.get("duration_ms")
-        if isinstance(duration, (int, float)):
-            st.caption(f"Thời gian làm nóng: {float(duration) / 1000:.1f} giây")
         channels = snapshot.get("channels", ())
-        if isinstance(channels, list) and channels:
-            with st.expander("Chi tiết kênh warm-up"):
+        failed_channels = [
+            str(channel.get("name")) for channel in channels
+            if isinstance(channel, dict) and channel.get("state") == "failed"
+        ] if isinstance(channels, list) else []
+        if failed_channels:
+            st.warning("Kênh warm-up chưa chạy được: " + ", ".join(failed_channels))
+        with st.expander("Dịch vụ & warm-up"):
+            st.markdown(
+                render_hud_status_panel("SYSTEM LINK STATUS", _hud_service_statuses(context, snapshot)),
+                unsafe_allow_html=True,
+            )
+            duration = snapshot.get("duration_ms")
+            if isinstance(duration, (int, float)):
+                st.caption(f"Làm nóng: {float(duration) / 1000:.1f} giây")
+            if isinstance(channels, list) and channels:
                 st.dataframe(channels, width="stretch", hide_index=True)
 
 
 def _render_kis(context: RuntimeContext) -> None:
-    st.subheader("Tìm kiếm sự kiện đã biết bằng văn bản")
-    results_col, refinement_col = st.columns((1, 1))
-    with results_col:
-        top_k = st.slider("Số kết quả KIS", 1, 100, 20, key="kis_top_k")
-    with refinement_col:
-        refine_raw = st.checkbox("Tinh chỉnh cục bộ từ video gốc", value=True, key="kis_refine_raw")
-
+    st.subheader("Tìm kiếm")
     runtime_ready = _warmup_search_usable(context)
+    with st.expander("Tùy chọn tìm kiếm"):
+        results_col, language_col = st.columns(2)
+        with results_col:
+            top_k = st.slider("Số kết quả KIS", 1, 100, 20, key="kis_top_k")
+            refine_raw = st.checkbox("Tinh chỉnh cục bộ từ video gốc", value=True, key="kis_refine_raw")
+        with language_col:
+            query_language = st.selectbox(
+                "Ngôn ngữ truy vấn", ("auto", "vi", "en"),
+                format_func=lambda value: {"auto": "Tự động", "vi": "Tiếng Việt", "en": "English"}[value],
+                key="kis_query_language",
+            )
+            edit_translation = st.checkbox("Chỉnh bản dịch tiếng Anh", key="kis_translation_edit")
+            english_override = (
+                st.text_input("Bản dịch tiếng Anh cho dense OpenCLIP", key="kis_english_override",
+                              placeholder="Để trống để dùng bộ dịch offline")
+                if edit_translation else ""
+            )
     values = render_query_input(disabled=not runtime_ready)
     kis_entity_constraints = _render_entity_controls(
-        str(values.get("text", "")),
-        state_key="kis_entity_modes",
-        scope="kis",
+        str(values.get("text", "")), state_key="kis_entity_modes", scope="kis",
     )
-    language_col, override_col = st.columns((1, 2))
-    with language_col:
-        query_language = st.selectbox(
-            "Ngôn ngữ truy vấn",
-            ("auto", "vi", "en"),
-            format_func=lambda value: {
-                "auto": "Tự động",
-                "vi": "Tiếng Việt",
-                "en": "English",
-            }[value],
-            key="kis_query_language",
-        )
-    with override_col:
-        edit_translation = st.checkbox(
-            "Chỉnh bản dịch tiếng Anh",
-            key="kis_translation_edit",
-        )
-        english_override = (
-            st.text_input(
-                "Bản dịch tiếng Anh cho dense OpenCLIP",
-                key="kis_english_override",
-                placeholder="Để trống để dùng bộ dịch offline",
-            )
-            if edit_translation
-            else ""
-        )
     if not runtime_ready:
         st.info("Bộ máy truy xuất đang được làm nóng; bạn vẫn có thể soạn truy vấn.")
     if values["submitted"]:
@@ -1480,6 +1572,7 @@ def _render_kis(context: RuntimeContext) -> None:
                 batch_filters = _validated_batch_filters(context)
                 request = QueryRequest(
                     query_id=str(uuid4()),
+                    interaction_session_id=str(uuid4()), interaction_turn=1, event_source="user",
                     original_text=values["text"],
                     mode=str(values.get("mode", "automatic")),
                     batch_filters=batch_filters,
@@ -1501,6 +1594,8 @@ def _render_kis(context: RuntimeContext) -> None:
                         request, limit=top_k, refine_raw=refine_raw
                     )
                     st.session_state.kis_last_request = request
+                    remember_search(request, st.session_state.kis_results, initial=True)
+                    st.session_state.kis_interactive_reset_draft = True
                     st.session_state.kis_history.append(values["text"])
                     st.session_state.kis_last_failure = None
             except (TypeError, ValueError):
@@ -1558,14 +1653,15 @@ def _render_kis(context: RuntimeContext) -> None:
         ]
         with st.expander("Trạng thái các kênh KIS"):
             st.dataframe(rows, width="stretch", hide_index=True)
+        # Keep truncation warnings visible; routine encoding notes are collapsed.
         render_text_encoding_diagnostics(channel_statuses)
     _render_query_processing(
         getattr(context.pipeline, "last_query_processing", {})
     )
 
-    if st.session_state.kis_last_request is None:
-        st.caption("Nhập mô tả và chọn Tìm kiếm để truy xuất các khung hình đã lập chỉ mục.")
-    else:
+    if st.session_state.kis_last_request is not None:
+        render_interactive_search(context, ready=runtime_ready, limit=top_k)
+        feedback_enabled = context.config.get("retrieval", {}).get("interactive", {}).get("feedback_enabled", True)
         render_result_gallery(
             st.session_state.kis_results,
             image_loader=lambda item: _kis_image_loader(context, item),
@@ -1573,6 +1669,9 @@ def _render_kis(context: RuntimeContext) -> None:
             on_pin_change=_change_kis_pin,
             on_send_to_qa=lambda item: _bridge_kis_result_to_qa(context, item),
             on_open_scrubber=_open_kis_scrubber,
+            on_reference=(lambda item: select_feedback(item, "reference")) if feedback_enabled else None,
+            on_positive=(lambda item: select_feedback(item, "positive")) if feedback_enabled else None,
+            on_negative=(lambda item: select_feedback(item, "negative")) if feedback_enabled else None,
         )
 
     if st.session_state.kis_results and st.session_state.kis_last_request is not None:
@@ -1594,7 +1693,7 @@ def _render_kis(context: RuntimeContext) -> None:
             elif st.button(
                 "Tinh chỉnh bằng phản hồi Rocchio",
                 key="kis_feedback",
-                disabled=not runtime_ready,
+                disabled=not runtime_ready or any(x.get("batch_id") == "aic26-b2" for x in st.session_state.kis_results),
             ):
                 try:
                     st.session_state.kis_results = context.pipeline.refine(
@@ -1603,6 +1702,7 @@ def _render_kis(context: RuntimeContext) -> None:
                         negative_ids=tuple(choices[label] for label in negative),
                         limit=top_k,
                     )
+                    remember_search(st.session_state.kis_last_request, st.session_state.kis_results)
                     st.rerun()
                 except Exception as error:
                     _report_ui_error(
@@ -1617,11 +1717,10 @@ def _render_kis(context: RuntimeContext) -> None:
                         query_or_session_id=st.session_state.kis_last_request.query_id,
                     )
 
-    st.divider()
-    st.subheader("Các ứng viên KIS đã ghim")
     if not st.session_state.kis_pinned:
-        st.caption("Ghim kết quả để tạo danh sách cuối cùng đã được kiểm tra.")
         return
+    st.divider()
+    st.subheader(f"Đã ghim · {len(st.session_state.kis_pinned)}")
     st.dataframe(
         [
             {
@@ -1657,6 +1756,12 @@ def _render_kis(context: RuntimeContext) -> None:
     batch_ids = {
         str(item["batch_id"]) for item in st.session_state.kis_pinned if item.get("batch_id")
     }
+    if combined_enabled(context):
+        from app.components.b02_export import render_b02_export
+
+        render_b02_export(context, _kis_export_snapshot(st.session_state.kis_pinned), task="kis")
+        st.button("Xóa các ứng viên KIS đã ghim", key="kis_clear_pinned", on_click=_clear_kis_pins)
+        return
     if len(batch_ids) != 1 or context.artifact_repository is None:
         st.error(
             "Trước khi xuất, các ứng viên đã ghim phải thuộc cùng một batch đang hoạt động "
@@ -1665,6 +1770,12 @@ def _render_kis(context: RuntimeContext) -> None:
     else:
         batch_id = next(iter(batch_ids))
         snapshot = _kis_export_snapshot(st.session_state.kis_pinned)
+        if batch_id == "aic26-b2":
+            from app.components.b02_export import render_b02_export
+
+            render_b02_export(context, snapshot, task="kis")
+            st.button("Xóa các ứng viên KIS đã ghim", key="kis_clear_pinned", on_click=_clear_kis_pins)
+            return
         canonical_check, evidence, _ = _submission_validation_context(context, batch_id, snapshot)
         render_export_panel(
             snapshot,
@@ -2071,6 +2182,7 @@ def _bridge_kis_result_to_qa(context: RuntimeContext, result: dict[str, Any]) ->
             source_frame_idx=int(result["source_frame_idx"]),
             source="kis_bridge",
             event_description=event_description,
+            keyframe_ordinal=result.get("keyframe_ordinal"),
         )
         _inject_qa_frame(context, request)
         st.session_state.qa_event_description = event_description
@@ -2212,13 +2324,9 @@ def _apply_qa_edit(context: RuntimeContext, window_id: str, edited: str) -> None
 
 
 def _pin_qa_prediction(prediction: dict) -> None:
-    identity = (
-        prediction["video_id"],
-        prediction["source_frame_idx"],
-        prediction["answer"],
-    )
+    identity = (*result_identity(prediction), prediction["answer"])
     pinned = {
-        (item["video_id"], item["source_frame_idx"], item["answer"]): item
+        (*result_identity(item), item["answer"]): item
         for item in st.session_state.qa_pinned
     }
     pinned[identity] = dict(prediction)
@@ -2551,6 +2659,10 @@ def _build_qa_export_cache(
         raise ValueError("the QA answer specification is unavailable")
     ranked = [dict(item, rank=index) for index, item in enumerate(rows, 1)]
     spec = QACompetitionSpec.for_spec_id(request.answer_spec_id)
+    if combined_enabled(context) or batch_id == "aic26-b2":
+        data = export_rows(context, ranked, task="qa", answer_spec_id=request.answer_spec_id)
+        return {"fingerprint": _result_fingerprint(workflow="qa", batch_id=batch_id, rows=ranked),
+                "filename": filename, "data": data, "sha256": hashlib.sha256(data).hexdigest()}
     canonical_check, evidence, _ = _submission_validation_context(context, batch_id, ranked)
     data = serialize_qa_submission(
         ranked,
@@ -2579,6 +2691,15 @@ def _render_qa_export(
         st.caption("Ghim các khung hình có bằng chứng để chuẩn bị bài nộp ba cột.")
         return
     rows = [dict(item, rank=index) for index, item in enumerate(pinned, 1)]
+    if combined_enabled(context) or any(row.get("batch_id") == "aic26-b2" for row in rows):
+        from app.components.b02_export import render_b02_export
+
+        if not combined_enabled(context) and not all(row.get("batch_id") == "aic26-b2" for row in rows):
+            st.warning("Không trộn bài nộp B01 và B02; bỏ ghim batch khác trước khi xuất.")
+            return
+        request = st.session_state.qa_request
+        render_b02_export(context, rows, task="qa", answer_spec_id=request.answer_spec_id)
+        return
     st.dataframe(
         [
             {
@@ -3132,7 +3253,7 @@ def _render_qa(context: RuntimeContext) -> None:
         placeholder="Ví dụ: p1-15, 01, round1_01",
     )
     batch_id = _selected_batch_id(context)
-    st.caption(f"Batch hiện hành: `{batch_id or 'chưa chọn'}`")
+    st.caption("Phạm vi: " + " + ".join(_validated_batch_filters(context, None if combined_enabled(context) else (batch_id,))))
 
     top_k = st.select_slider(
         "Số lượng ứng viên Stage 1 (Top-K)",
@@ -3141,17 +3262,24 @@ def _render_qa(context: RuntimeContext) -> None:
     )
 
     with st.expander("🛠️ Nạp khung hình thủ công / Nhập ID trực tiếp"):
+        manual_batch = batch_id
+        if combined_enabled(context):
+            from src.retrieval.batch_scope import BATCHES
+
+            manual_batch = st.selectbox("Nguồn khung nhập tay", BATCHES,
+                                       format_func=lambda value: "B02 (M/N/S)" if value == "aic26-b2" else "B01 (L)",
+                                       key="qa_manual_batch")
         manual_video_id = st.text_input(
             "Tên Video (Video ID)",
             key="vqa_manual_video_id",
             placeholder="L01_V028",
         )
         manual_source_frame_idx = st.number_input(
-            "Source Frame Index",
-            min_value=0,
+            "Keyframe ordinal (B02)" if manual_batch == "aic26-b2" else "Source Frame Index",
+            min_value=1 if manual_batch == "aic26-b2" else 0,
             step=1,
             key="vqa_manual_frame_idx",
-            help="Đây là source_frame_idx canonical, không phải keyframe ordinal.",
+            help="B02 dùng số thứ tự ảnh; B01 dùng source_frame_idx canonical.",
         )
         manual_load = st.button(
             "🔍 Nạp & Xem trước khung hình",
@@ -3161,11 +3289,18 @@ def _render_qa(context: RuntimeContext) -> None:
         )
         if manual_load:
             try:
+                manual_ordinal = int(manual_source_frame_idx) if manual_batch == "aic26-b2" else None
+                manual_frame = None
+                if manual_ordinal is not None:
+                    manual_frame = context.artifact_repository.get_ordinal_frame(manual_batch, manual_video_id.strip(), manual_ordinal)
+                    if manual_frame is None:
+                        raise ValueError("canonical ordinal missing")
                 injection = QAFrameInjectionRequest(
                     query_id=str(uuid4()),
-                    batch_id=str(batch_id),
+                    batch_id=str(manual_batch),
                     video_id=manual_video_id.strip(),
-                    source_frame_idx=int(manual_source_frame_idx),
+                    source_frame_idx=manual_frame.source_frame_idx if manual_frame else int(manual_source_frame_idx),
+                    keyframe_ordinal=manual_ordinal,
                     source="manual",
                     event_description=(
                         event_description.strip()
@@ -3210,7 +3345,7 @@ def _render_qa(context: RuntimeContext) -> None:
             request = QACandidateRequest(
                 query_id=str(uuid4()),
                 event_description=event_description,
-                batch_filters=(batch_id,),
+                batch_filters=_validated_batch_filters(context, None if combined_enabled(context) else (batch_id,)),
                 top_k=int(top_k),
                 query_language=qa_query_language,
                 event_description_en=qa_event_description_en or None,
@@ -3323,12 +3458,7 @@ def _render_qa(context: RuntimeContext) -> None:
         ):
             image_candidates.append(selected_candidate)
         candidate_images = {
-            str(candidate["candidate_id"]): _source_frame_image(
-                context,
-                str(candidate["batch_id"]),
-                str(candidate["video_id"]),
-                int(candidate["source_frame_idx"]),
-            )
+            str(candidate["candidate_id"]): _kis_image_loader(context, candidate)
             for candidate in image_candidates
         }
         snapshot_state = dict(st.session_state.get("qa_snapshot") or {})
@@ -3403,7 +3533,7 @@ def _render_qa(context: RuntimeContext) -> None:
                             unsafe_allow_html=True,
                         )
                         st.caption(
-                            f"Frame {candidate['source_frame_idx']} · "
+                            f"{'B02' if candidate['batch_id'] == 'aic26-b2' else 'B01'} · Frame {candidate['source_frame_idx']} · "
                             f"{int(candidate['timestamp_ms']) / 1000:.2f}s"
                         )
                         if st.button(
@@ -3422,7 +3552,7 @@ def _render_qa(context: RuntimeContext) -> None:
             index=candidate_ids.index(selected),
             format_func=lambda candidate_id: next(
                 (
-                    f"#{value['retrieval_rank']} · {value['video_id']} · "
+                    f"#{value['retrieval_rank']} · {'B02' if value['batch_id'] == 'aic26-b2' else 'B01'} · {value['video_id']} · "
                     f"frame {value['source_frame_idx']} · {int(value['timestamp_ms']) / 1000:.2f}s"
                     for value in candidates
                     if value["candidate_id"] == candidate_id
@@ -3621,7 +3751,7 @@ def _render_qa(context: RuntimeContext) -> None:
                 ).normalize_answer(manual_answer, question)
                 manual_preview = format_qa_submission_row(
                     str(selected_candidate_for_preview["video_id"]),
-                    int(selected_candidate_for_preview["source_frame_idx"]),
+                    int(selected_candidate_for_preview.get("submission_value", selected_candidate_for_preview["source_frame_idx"])),
                     preview_answer,
                 )
             except (TypeError, ValueError):
@@ -3634,6 +3764,10 @@ def _render_qa(context: RuntimeContext) -> None:
         if normalized_submission_id is not None:
             staged_name = _codabench_filename(normalized_submission_id, "qa")
             candidate_entry = st.session_state.get("codabench_staging", {}).get(staged_name)
+            if combined_enabled(context) or selected_candidate.get("batch_id") == "aic26-b2":
+                b02_data = st.session_state.get("b02_submission_files", {}).get(staged_name)
+                if b02_data is not None:
+                    candidate_entry = {"data": b02_data}
             if isinstance(candidate_entry, dict):
                 staged_qa_entry = candidate_entry
                 staged_qa_rows = _staged_row_values(candidate_entry)
@@ -3733,14 +3867,23 @@ def _render_qa(context: RuntimeContext) -> None:
                     "row_count": 1,
                     "source_ranks": None,
                 }
-                staged_filename = _append_or_update_codabench_row(
-                    context,
-                    task="qa",
-                    query_id=normalized_submission_id,
-                    current=current_entry,
-                    row_data=single_row_cache["data"],
-                    update_rank=qa_update_rank if qa_stage_action == "update" else None,
-                )
+                if combined_enabled(context) or batch == "aic26-b2":
+                    from app.components.b02_export import stage_b02_rows
+
+                    staged_filename = _codabench_filename(normalized_submission_id, "qa")
+                    stage_b02_rows(context, st.session_state, staged_filename, [dict(authoritative)],
+                                   task="qa", answer_spec_id=authoritative.get("answer_spec_id"),
+                                   append=qa_stage_action == "append",
+                                   update_rank=qa_update_rank if qa_stage_action == "update" else None)
+                else:
+                    staged_filename = _append_or_update_codabench_row(
+                        context,
+                        task="qa",
+                        query_id=normalized_submission_id,
+                        current=current_entry,
+                        row_data=single_row_cache["data"],
+                        update_rank=qa_update_rank if qa_stage_action == "update" else None,
+                    )
                 st.success(
                     f"Đã {manual_action_label.lower()} trong `{staged_filename}` "
                     "mà không gọi VLM."
@@ -3779,7 +3922,13 @@ def _render_qa(context: RuntimeContext) -> None:
         st.subheader("Kết quả single-frame")
         with st.container(key="hud-qa-evidence", border=True):
             st.markdown(
-                render_hud_readout("VLM ANSWER", result["answer"], tone="green"),
+                render_hud_readout(
+                    "MANUAL ANSWER" if result.get("answer_engine") == "manual"
+                    or str(result.get("answer_source", "")).startswith("operator")
+                    or result.get("evidence", {}).get("provider") == "operator"
+                    else "VLM ANSWER",
+                    result["answer"], tone="green",
+                ),
                 unsafe_allow_html=True,
             )
             try:
@@ -3805,12 +3954,7 @@ def _render_qa(context: RuntimeContext) -> None:
                     "Gemini tạm thời không khả dụng; kết quả này được trả bởi Qwen local "
                     f"({evidence.get('fallback_reason_code') or 'provider_unavailable'})."
                 )
-            image = _source_frame_image(
-                context,
-                str(result["batch_id"]),
-                str(result["video_id"]),
-                int(result["source_frame_idx"]),
-            )
+            image = _kis_image_loader(context, result)
             if image is not None:
                 st.image(image, caption="Frame bằng chứng duy nhất", width=640)
             if st.button("Ghim kết quả này", key="qa_pin_single_frame"):
@@ -3919,7 +4063,7 @@ def _trake_response_dict(value: Any) -> dict[str, Any]:
     return payload
 
 
-def _trake_result_rows(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _trake_result_rows(results: list[dict[str, Any]], *, include_batch: bool = False) -> list[dict[str, Any]]:
     """Project alignments onto safe Vietnamese table columns."""
 
     rows: list[dict[str, Any]] = []
@@ -3938,6 +4082,7 @@ def _trake_result_rows(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
             {
                 "Hạng": item.get("rank"),
                 "Video": item.get("video_id"),
+                **({"Batch": "B02" if item.get("batch_id") == "aic26-b2" else "B01"} if include_batch else {}),
                 "Khung nguồn theo giai đoạn": " → ".join(str(frame) for frame in frames),
                 "Độ tin cậy": item.get("confidence_score"),
             }
@@ -3950,8 +4095,12 @@ def _trake_frame_image(
     batch_id: str,
     video_id: str,
     source_frame_idx: int,
+    keyframe_ordinal: int | None = None,
 ) -> bytes | None:
     try:
+        if batch_id == "aic26-b2":
+            return _kis_image_loader(context, dict(batch_id=batch_id, video_id=video_id,
+                source_frame_idx=source_frame_idx, keyframe_ordinal=keyframe_ordinal))
         return _source_frame_image(context, batch_id, video_id, source_frame_idx)
     except Exception:
         return None
@@ -3970,6 +4119,10 @@ def _trake_csv_bytes(
     repository = getattr(context, "artifact_repository", None)
     if repository is None:
         raise TRAKESubmissionValidationError("không có ánh xạ khung hình chuẩn để xuất")
+    if combined_enabled(context) or batch_id == "aic26-b2":
+        if any(len(row.get("stage_matches", ())) != stage_count for row in results):
+            raise ValueError("TRAKE stage count mismatch")
+        return trake_submission_filename(query_id), export_rows(context, results, task="trake")
     canonical_check, evidence, timestamp_lookup = _submission_validation_context(
         context, batch_id, results
     )
@@ -4013,7 +4166,7 @@ def _trake_sequence_with_overrides(
     if not batch_id or not video_id or not isinstance(raw_matches, (list, tuple)):
         raise ValueError("invalid TRAKE candidate")
     repository = getattr(context, "artifact_repository", None)
-    getter = getattr(repository, "get_source_frame", None)
+    getter = getattr(repository, "get_ordinal_frame" if batch_id == "aic26-b2" else "get_source_frame", None)
     if not callable(getter):
         raise ValueError("canonical repository unavailable")
     matches: list[dict[str, Any]] = []
@@ -4026,7 +4179,21 @@ def _trake_sequence_with_overrides(
         source_frame_idx = int(
             overrides.get(stage_index, int(raw.get("source_frame_idx", -1)))
         )
-        frame = getter(batch_id, video_id, source_frame_idx)
+        if batch_id == "aic26-b2":
+            # B02 edits select an image ordinal, not a rounded source index.
+            from src.retrieval.trake_scope import trake_video_allowed
+
+            if not trake_video_allowed(batch_id, video_id):
+                raise ValueError("video is not eligible for TRAKE")
+            ordinal = overrides.get(stage_index, raw.get("keyframe_ordinal"))
+            frame = getter(batch_id, video_id, ordinal)
+            if frame is not None:
+                if stage_index not in overrides and (frame.source_frame_idx != raw.get("source_frame_idx")
+                        or frame.timestamp_ms != raw.get("timestamp_ms")):
+                    raise ValueError("stale canonical TRAKE match")
+                source_frame_idx = frame.source_frame_idx
+        else:
+            frame = getter(batch_id, video_id, source_frame_idx)
         if frame is None:
             raise ValueError("selected frame is not canonical")
         match = {
@@ -4034,9 +4201,12 @@ def _trake_sequence_with_overrides(
             "source_frame_idx": source_frame_idx,
             "timestamp_ms": int(frame.timestamp_ms),
         }
+        if batch_id == "aic26-b2":
+            match["keyframe_ordinal"] = frame.keyframe_ordinal
         similarity = raw.get("similarity")
         if (
             source_frame_idx == int(raw.get("source_frame_idx", -1))
+            and (batch_id != "aic26-b2" or frame.keyframe_ordinal == raw.get("keyframe_ordinal"))
             and isinstance(similarity, (int, float))
             and not isinstance(similarity, bool)
         ):
@@ -4058,7 +4228,8 @@ def _pin_trake_sequence(sequence: dict[str, Any]) -> None:
     pinned = [
         dict(value)
         for value in st.session_state.get("trake_pinned", ())
-        if isinstance(value, dict) and str(value.get("video_id")) != video_id
+        if isinstance(value, dict) and (str(value.get("video_id")), value.get("batch_id"))
+        != (video_id, sequence.get("batch_id"))
     ]
     pinned.append(dict(sequence))
     st.session_state.trake_pinned = [
@@ -4076,12 +4247,14 @@ def _render_trake(context: RuntimeContext) -> None:
         "Mỗi video chỉ giữ một chuỗi khung hình tốt nhất."
     )
     batch_id = _selected_batch_id(context)
-    st.caption(f"Batch hiện hành: `{batch_id or 'chưa chọn'}`")
+    st.caption("Phạm vi: " + " + ".join(_validated_batch_filters(context, None if combined_enabled(context) else (batch_id,))))
     st.text_input(
         "Query ID nộp bài TRAKE",
         key="codabench_query_id_trake",
         placeholder="Ví dụ: p1-4",
     )
+    if batch_id == "aic26-b2":
+        st.caption("TRAKE B02 · M/S · không dùng N; M08_V001 tạm loại do mapping trùng.")
     global_description_input = st.text_area(
         "Mô tả toàn bộ sự kiện",
         key="trake_global_description",
@@ -4213,9 +4386,7 @@ def _render_trake(context: RuntimeContext) -> None:
             search_started = time.monotonic()
             request: TRAKEQueryRequest | None = None
             try:
-                batches = _validated_batch_filters(context, (batch_id,))
-                if len(batches) != 1:
-                    raise ValueError("TRAKE requires exactly one batch")
+                batches = _validated_batch_filters(context, None if combined_enabled(context) else (batch_id,))
                 request = TRAKEQueryRequest(
                     query_id=str(uuid4()),
                     global_description=global_description,
@@ -4276,7 +4447,7 @@ def _render_trake(context: RuntimeContext) -> None:
             st.info("Không tìm thấy video có chuỗi giai đoạn phù hợp.")
         return
 
-    st.dataframe(_trake_result_rows(results), width="stretch", hide_index=True)
+    st.dataframe(_trake_result_rows(results, include_batch=combined_enabled(context)), width="stretch", hide_index=True)
     choices = {
         f"{item.get('batch_id', batch_id)}:{item.get('video_id')}": item
         for item in results
@@ -4297,6 +4468,7 @@ def _render_trake(context: RuntimeContext) -> None:
         ),
     )
     selected = choices[selected_id]
+    batch_id = str(selected["batch_id"])
     all_overrides = dict(st.session_state.get("trake_frame_overrides", {}))
     selected_overrides = {
         int(stage_index): int(frame_idx)
@@ -4352,6 +4524,7 @@ def _render_trake(context: RuntimeContext) -> None:
                             str(selected.get("batch_id", batch_id)),
                             str(selected.get("video_id", "")),
                             source_frame_idx,
+                            match.get("keyframe_ordinal"),
                         )
                         if image is not None:
                             st.image(image, width="stretch")
@@ -4382,7 +4555,14 @@ def _render_trake(context: RuntimeContext) -> None:
         repository = getattr(context, "artifact_repository", None)
         neighbor_values: tuple[Any, ...] = ()
         neighbor_loader = getattr(repository, "neighbors", None)
-        if callable(neighbor_loader):
+        if selected_sequence.get("batch_id", batch_id) == "aic26-b2":
+            try:
+                neighbor_values = tuple(repository.ordinal_neighbors(
+                    "aic26-b2", str(selected_sequence["video_id"]),
+                    anchor["keyframe_ordinal"], radius=2))
+            except Exception:
+                neighbor_values = ()
+        elif callable(neighbor_loader):
             try:
                 neighbor_values = tuple(
                     neighbor_loader(
@@ -4432,17 +4612,20 @@ def _render_trake(context: RuntimeContext) -> None:
                         str(frame.batch_id),
                         str(frame.video_id),
                         int(frame.source_frame_idx),
+                        getattr(frame, "keyframe_ordinal", None),
                     )
                     if image is not None:
                         st.image(image, width="stretch")
                     if st.button(
-                        f"Chọn {int(frame.source_frame_idx)}",
+                        (f"Chọn ảnh {frame.keyframe_ordinal}" if frame.batch_id == "aic26-b2"
+                         else f"Chọn {int(frame.source_frame_idx)}"),
                         key=(
                             f"trake_swap_{hashlib.sha256(selected_id.encode()).hexdigest()[:8]}_"
-                            f"{stage_choice}_{int(frame.source_frame_idx)}"
+                            f"{stage_choice}_{frame.keyframe_ordinal if frame.batch_id == 'aic26-b2' else int(frame.source_frame_idx)}"
                         ),
                     ):
-                        selected_overrides[int(stage_choice)] = int(frame.source_frame_idx)
+                        selected_overrides[int(stage_choice)] = int(
+                            frame.keyframe_ordinal if frame.batch_id == "aic26-b2" else frame.source_frame_idx)
                         all_overrides[selected_id] = selected_overrides
                         st.session_state.trake_frame_overrides = all_overrides
                         st.session_state.trake_export_cache = None
@@ -4466,7 +4649,11 @@ def _render_trake(context: RuntimeContext) -> None:
         if submission_id is not None:
             staged_name = _codabench_filename(submission_id, "trake")
             staged_entry = st.session_state.get("codabench_staging", {}).get(staged_name)
-            if isinstance(staged_entry, dict):
+            if combined_enabled(context) or batch_id == "aic26-b2":
+                for index, row in enumerate(st.session_state.get("b02_submission_rows", {}).get(staged_name, []), 1):
+                    if (row.get("batch_id"), row.get("video_id")) == (batch_id, selected_sequence.get("video_id")):
+                        staged_rank = index
+            if not combined_enabled(context) and batch_id != "aic26-b2" and isinstance(staged_entry, dict):
                 for index, row in enumerate(_staged_row_values(staged_entry), start=1):
                     if row and row[0] == str(selected_sequence.get("video_id", "")):
                         staged_rank = index
@@ -4474,6 +4661,7 @@ def _render_trake(context: RuntimeContext) -> None:
         pin_label = (
             f"📌 Cập nhật chuỗi ở Rank #{staged_rank}"
             if staged_rank is not None
+            else "📌 Ghim chuỗi vào CSV B02" if batch_id == "aic26-b2"
             else "📌 Ghim chuỗi vào Submission Hub"
         )
         if st.button(
@@ -4501,14 +4689,17 @@ def _render_trake(context: RuntimeContext) -> None:
                     "row_count": 1,
                     "source_ranks": None,
                 }
-                staged_filename = _append_or_update_codabench_row(
-                    context,
-                    task="trake",
-                    query_id=submission_id,
-                    current=current,
-                    row_data=row_data,
-                    update_rank=staged_rank,
-                )
+                if combined_enabled(context) or batch_id == "aic26-b2":
+                    from app.components.b02_export import stage_b02_rows
+
+                    staged_filename = _codabench_filename(submission_id, "trake")
+                    stage_b02_rows(context, st.session_state, staged_filename, [single],
+                                   task="trake", append=True, update_rank=staged_rank)
+                else:
+                    staged_filename = _append_or_update_codabench_row(
+                        context, task="trake", query_id=submission_id, current=current,
+                        row_data=row_data, update_rank=staged_rank,
+                    )
                 _pin_trake_sequence(selected_sequence)
             except (BackendError, TypeError, ValueError) as error:
                 if isinstance(error, BackendError) and error.code == "staging_revision_conflict":
@@ -4522,6 +4713,11 @@ def _render_trake(context: RuntimeContext) -> None:
     submission_results = list(st.session_state.get("trake_pinned", ()))
     if not submission_results:
         st.caption("Ghim ít nhất một chuỗi để chuẩn bị CSV TRAKE cục bộ.")
+        return
+    if combined_enabled(context) or batch_id == "aic26-b2":
+        from app.components.b02_export import render_b02_export
+
+        render_b02_export(context, submission_results, task="trake")
         return
     export_fingerprint = _result_fingerprint(
         workflow="trake",
@@ -5106,16 +5302,8 @@ def _render_staged_rank_manager(
 def _render_codabench_submission_hub(context: RuntimeContext, active_workflow: str) -> None:
     """Stage validated CSV bytes and request server-owned Codabench packaging."""
 
-    st.divider()
-    st.subheader("Codabench Submission Hub")
-    st.caption(
-        "Profile `codabench_10187_2025`: ZIP chỉ chứa thư mục `submission/`. "
-        "Không tự động tải dữ liệu lên Codabench."
-    )
     if st.session_state.get("codabench_staging_error"):
         st.warning("Không thể tải staging bền vững; dữ liệu trên đĩa chưa bị thay đổi.")
-    else:
-        st.success("💾 Persistent State: Active · Preserved on F5 / Refresh")
     columns = st.columns(3)
     for column, task, label in zip(
         columns,
@@ -5432,7 +5620,7 @@ def render_app(context: RuntimeContext) -> None:
         page_title="AIC 2026 - Truy xuất video đa phương thức",
         page_icon="🔎",
         layout="wide",
-        initial_sidebar_state="auto",
+        initial_sidebar_state="collapsed",
     )
     inject_cyberpunk_theme()
     try:
@@ -5446,15 +5634,21 @@ def render_app(context: RuntimeContext) -> None:
         _hydrate_submission_staging(context)
         st.markdown(
             render_hud_header(
-                "SYSTEM ONLINE // AIC 2026",
-                "Truy xuất video đa phương thức",
-                "Textual KIS · Visual Q&A · TRAKE temporal alignment",
+                "AIC 2026",
+                "Truy xuất video",
+                "",
             ),
             unsafe_allow_html=True,
         )
         _render_warmup_sidebar(context)
         _render_launch_identity(context)
         _render_readiness(context)
+        if combined_enabled(context):
+            from src.retrieval.batch_scope import BATCHES
+
+            st.selectbox("Phạm vi tìm kiếm", ("all", *BATCHES), key="search_scope",
+                         format_func=lambda value: {"all": "Tất cả dữ liệu — B01 + B02",
+                                                   BATCHES[0]: "Chỉ B01", BATCHES[1]: "Chỉ B02"}[value])
         workflows = ("kis", "qa", "trake")
         if st.session_state.get("active_workflow") not in workflows:
             st.session_state.active_workflow = "kis"
@@ -5475,7 +5669,20 @@ def render_app(context: RuntimeContext) -> None:
             _render_trake(context)
         else:
             _render_kis(context)
-        _render_codabench_submission_hub(context, str(active or "kis"))
+        with st.expander("Bài nộp · CSV / ZIP"):
+            if combined_enabled(context):
+                from app.components.b02_export import render_prepared_downloads
+
+                render_prepared_downloads(context, key="hub")
+                if not st.session_state.get("b02_submission_files"):
+                    st.caption("Ghim kết quả và chuẩn bị CSV ở quy trình tương ứng.")
+                if st.session_state.get("codabench_staging"):
+                    with st.expander("Bài nộp B01 cũ — không tự trộn vào ZIP mới"):
+                        _render_codabench_submission_hub(context, str(active or "kis"))
+            elif _selected_batch_id(context) == "aic26-b2":
+                st.caption("B02 dùng CSV/ZIP trong phần đã ghim; không dùng validator L-series của B01.")
+            else:
+                _render_codabench_submission_hub(context, str(active or "kis"))
     except Exception as error:
         _report_ui_error(
             error,

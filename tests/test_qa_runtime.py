@@ -53,6 +53,8 @@ def test_laptop_runtime_is_lazy_local_first_and_secret_safe(
     }
     assert context.selected_batch_id == "aic25-b1-reference"
     assert context.launch_identity["canonical"] is False
+    assert context.validate_batch_filters(None) == ("aic25-b1-reference", "aic26-b2")
+    context.config["retrieval"]["all_batches"]["enabled"] = False
     assert context.validate_batch_filters(None) == ("aic25-b1-reference",)
 
 
