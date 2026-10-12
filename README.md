@@ -164,16 +164,6 @@ or network access are opt-in integration checks.
 
 All documentation is indexed in [docs/README.md](docs/README.md).
 
-## Current limitations
-
-- The official AIC 2026 output schemas and scoring rules are not yet encoded; the 2025-style
-  adapters are versioned placeholders.
-- No models, datasets, or indexes are bundled. Preparing them and ingesting the corpus are
-  explicit, local, and potentially long-running operations.
-- Fusion tuning and accuracy claims require labeled historical queries that are not included.
-- The accelerated (12–24 GiB GPU) profile is implemented but has not been validated on target
-  hardware. Object-detector inference remains scaffolding.
-
 ## Acknowledgements
 
 Built for the Ho Chi Minh City AI Challenge 2026.

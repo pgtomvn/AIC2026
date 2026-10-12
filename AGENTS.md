@@ -2,10 +2,11 @@
 
 ## Mission and current state
 
-This repository is an early AIC 2026 multimodal video-retrieval scaffold. Preserve the three
-intended workflows: Textual KIS, Visual Q&A, and TRAKE. Do not describe the system as complete:
-many model, storage, retrieval, and evaluation methods are deliberate stubs, and the Streamlit
-results are placeholders.
+This repository is the completed AIC 2026 multimodal video-retrieval system, published as a
+public MIT-licensed project. Preserve its three workflows: Textual KIS, Visual Q&A, and TRAKE.
+Changes are maintenance: keep the public README, `docs/`, and behavior consistent with each
+other. Models, datasets, and search indexes are prepared locally and are never part of Git.
+`research/` is a local-only workspace (gitignored); do not commit or publish it.
 
 ## Safe working contract
 
@@ -28,7 +29,7 @@ results are placeholders.
 
 ## Architecture
 
-- `app/`: Streamlit UI and components. It is a placeholder consumer of retrieval pipelines.
+- `app/`: Streamlit UI and components; an HTTP client of the FastAPI runtime (`src/api.py`).
 - `config/settings.yaml`: central data/model/service/retrieval configuration.
 - `scripts/`: command-line orchestration. Extraction must remain validated, idempotent, and
   opt-in for the full corpus.
