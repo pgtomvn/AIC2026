@@ -130,6 +130,44 @@ class _SignalingLeaseStore(QASessionStore):
         return acquired
 
 
+class _WindowLeaseReleaseStore(QASessionStore):
+    def __init__(self, path: Path, released: threading.Event) -> None:
+        super().__init__(path)
+        self.released = released
+
+    def release_cache_lease(self, cache_key: str, owner_token: str) -> None:
+        super().release_cache_lease(cache_key, owner_token)
+        if cache_key.startswith("window-work:"):
+            self.released.set()
+
+
+class _WindowTakeoverAfterReleaseStore(QASessionStore):
+    """Let the owner commit and release just before the waiter's retry acquisition."""
+
+    def __init__(
+        self,
+        path: Path,
+        waiting: threading.Event,
+        provider_release: threading.Event,
+        owner_released: threading.Event,
+    ) -> None:
+        super().__init__(path)
+        self.waiting = waiting
+        self.provider_release = provider_release
+        self.owner_released = owner_released
+        self.window_attempts = 0
+
+    def acquire_cache_lease(self, cache_key: str, owner_token: str, *, ttl_seconds: float) -> bool:
+        if cache_key.startswith("window-work:"):
+            self.window_attempts += 1
+            if self.window_attempts == 1:
+                self.waiting.set()
+            else:
+                self.provider_release.set()
+                assert self.owner_released.wait(timeout=5)
+        return super().acquire_cache_lease(cache_key, owner_token, ttl_seconds=ttl_seconds)
+
+
 class _ReasoningLeaseReleaseStore(QASessionStore):
     def __init__(self, path: Path, released: threading.Event) -> None:
         super().__init__(path)
@@ -504,6 +542,60 @@ def test_cross_pipeline_window_lease_skips_waiter_image_normalization(
     assert second_resolver.resolve_calls == 0
     assert reasoner.calls == 1
     outcome = second_pipeline.get_search("window-two")["window_outcomes"][0]
+    assert outcome["cache_layers"]["window_work"] == "wait_hit"
+
+
+def test_window_lease_takeover_rechecks_cache_after_owner_releases(tmp_path: Path) -> None:
+    path = tmp_path / "qa-window-work-release-race.sqlite3"
+    waiter_waiting = threading.Event()
+    owner_released = threading.Event()
+    provider_started = threading.Event()
+    provider_release = threading.Event()
+    first_store = _WindowLeaseReleaseStore(path, owner_released)
+    second_store = _WindowTakeoverAfterReleaseStore(
+        path, waiter_waiting, provider_release, owner_released
+    )
+    first_store.initialize()
+    second_store.initialize()
+    reasoner = _BlockingReasoner(provider_started, provider_release)
+    second_resolver = _ProbeResolver()
+    first_pipeline = VisualQAPipeline(
+        top_k_retrieve=1,
+        retriever=_Retriever(1),
+        reasoner=reasoner,
+        image_resolver=_ProbeResolver(),
+        session_store=first_store,
+        competition_spec=QACompetitionSpec.historical_numeric(),
+    )
+    second_pipeline = VisualQAPipeline(
+        top_k_retrieve=1,
+        retriever=_Retriever(1),
+        reasoner=reasoner,
+        image_resolver=second_resolver,
+        session_store=second_store,
+        competition_spec=QACompetitionSpec.historical_numeric(),
+    )
+    requests = (
+        QAQueryRequest("takeover-one", "people holding fruit", "How many?"),
+        QAQueryRequest("takeover-two", "people holding fruit", "How many?"),
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        first_future = workers.submit(
+            first_pipeline.search, requests[0], session_id="takeover-one"
+        )
+        assert provider_started.wait(timeout=5)
+        second_future = workers.submit(
+            second_pipeline.search, requests[1], session_id="takeover-two"
+        )
+        first = first_future.result(timeout=10)
+        second = second_future.result(timeout=10)
+
+    assert waiter_waiting.is_set()
+    assert first[0]["answer"] == second[0]["answer"]
+    assert second_resolver.resolve_calls == 0
+    assert reasoner.calls == 1
+    outcome = second_pipeline.get_search("takeover-two")["window_outcomes"][0]
     assert outcome["cache_layers"]["window_work"] == "wait_hit"
 
 

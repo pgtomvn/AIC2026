@@ -2110,6 +2110,14 @@ class VisualQAPipeline:
                     if not window_lease_acquired:
                         deadline = time.monotonic() + reasoning_lease_ttl
                         while time.monotonic() < deadline:
+                            # Acquire before reading: the owner may commit and release
+                            # between a cache miss and our acquisition, so a takeover
+                            # must still observe its result before redoing the work.
+                            window_lease_acquired = sessions.acquire_cache_lease(
+                                window_lease_key,
+                                window_owner_token,
+                                ttl_seconds=reasoning_lease_ttl,
+                            )
                             persisted = sessions.get_image_fingerprints(
                                 probe.cache_key for probe in typed_probes
                             )
@@ -2135,11 +2143,6 @@ class VisualQAPipeline:
                                     cache_layers["reasoning"] = "hit"
                                     cache_layers["window_work"] = "wait_hit"
                                     break
-                            window_lease_acquired = sessions.acquire_cache_lease(
-                                window_lease_key,
-                                window_owner_token,
-                                ttl_seconds=reasoning_lease_ttl,
-                            )
                             if window_lease_acquired:
                                 cache_layers["window_work"] = "takeover"
                                 break
