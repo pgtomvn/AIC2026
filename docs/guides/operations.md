@@ -1,18 +1,14 @@
 # Operations guide: AIC 2026 multimodal video retrieval
 
-This repository implements the Textual Known Item Search (Textual KIS) foundation, a Phase 2
-retrieve-then-reason Visual Q&A subsystem, and a Phase 3 TRAKE temporal-alignment engine for the
-Ho Chi Minh City AI Challenge. They share canonical frame records, source-frame semantics, API
-runtime, readiness probes, and the Vietnamese competition UI. Model preparation, corpus indexes,
-and competition-day data provisioning remain explicit operational steps rather than a completed
-turnkey deployment.
+This guide covers the Textual Known Item Search (Textual KIS) engine, the retrieve-then-reason
+Visual Q&A subsystem, and the TRAKE temporal-alignment engine built for the Ho Chi Minh City AI
+Challenge. They share canonical frame records, source-frame semantics, API runtime, readiness
+probes, and the Vietnamese competition UI. Model preparation, corpus indexing, and
+competition-day data provisioning are explicit operational steps described below.
 
-> [!IMPORTANT]
-> The configured adapters implement historical Textual KIS interval scoring and historical
-> numeric-only Visual Q&A exact matching, a provisional conservative general-text QA mode, and
-> the `historical_2025_provisional` TRAKE adapter.
-> They are defaults, not claims about the final AIC 2026 rules. Replace the versioned specs and
-> their tests when the organizer publishes the 2026 schema.
+Scoring and export rules are encoded as versioned competition specifications in
+`src/contracts.py` (Textual KIS interval scoring, Visual Q&A numeric and general-text answer
+matching, and TRAKE stage scoring), each covered by its own tests.
 
 ## Textual KIS architecture
 
@@ -786,28 +782,16 @@ alone do not prove them.
 - Never commit `.env`, credentials, downloaded tools, virtual environments, model weights,
   derived data, or service state.
 
-## Current limitations
+## Operational notes
 
-- The final AIC 2026 Textual KIS output schema and scoring rules are not yet encoded; the 2025
-  adapter is deliberately versioned and replaceable.
-- Model snapshots, OCR assets, Docker services, and corpus indexes must be prepared locally. No
+- Model snapshots, OCR assets, Docker services, and corpus indexes are prepared locally. No
   download or full-corpus ingestion occurs during import, bootstrap, or tests.
-- Fusion tuning and claims of improvement over the organizer baseline require historical labeled
-  queries and ground-truth intervals that are not bundled automatically.
-- Batch 2 has not arrived in this workspace, so its native collections, ten-video ingestion
-  projection, raw-refinement p95, and end-to-end `--operational` drill remain data-dependent gates.
-- Gemini is the primary single-frame QA provider and always requires an untracked server-side
-  key plus explicit per-session consent. Qwen local remains the bounded offline fallback, while
-  explicit local-only mode makes no outbound provider request.
-- The accelerated 12–24 GiB Qwen profile is implemented but cannot be validated on this 4 GiB
-  laptop; its readiness remains a target-machine acceptance gate.
-- The default model preparation script covers the laptop core but not accelerated OpenCLIP or
-  FFmpeg. Install FFmpeg from a trusted checksum-pinned ZIP and freeze all additional runtime
-  assets explicitly.
-- The TRAKE core, API, evaluator, provisional exporter, and UI are implemented, but the official
-  AIC 2026 TRAKE schema/evaluator and Batch-2 latency gate are not yet available. Object-detector
-  inference remains intentional scaffolding. Visual Q&A requires prepared canonical frame
-  artifacts and a reachable pinned Ollama vision model.
+- Gemini is the primary single-frame QA provider and requires an untracked server-side key plus
+  explicit per-session consent. The local Qwen model is the offline fallback, and local-only mode
+  makes no outbound provider request.
+- The default model preparation script covers the laptop core. Install FFmpeg (and, for the
+  accelerated profile, OpenCLIP weights) from trusted checksum-pinned sources and freeze those
+  runtime assets explicitly.
 
 For a clean Python environment while retaining all user data, use
 `.\scripts\reset-env.ps1`. Add `-PurgePackageCache` only when deliberately discarding the

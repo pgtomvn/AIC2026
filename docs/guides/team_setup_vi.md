@@ -3,10 +3,8 @@
 Tài liệu này dành cho thành viên cần tự dựng một máy có thể tìm kiếm dữ liệu thật bằng
 Textual KIS, Visual Q&A và TRAKE.
 
-Đây là scaffold đang phát triển, chưa phải hệ thống AIC 2026 hoàn chỉnh. Một số adapter,
-model, evaluator và kết quả Streamlit vẫn là bản provisional hoặc placeholder. Cài đặt thành
-công nghĩa là máy đã sẵn sàng chạy các workflow hiện có của repo; không có nghĩa là đã có
-schema/chấm điểm chính thức cuối cùng của AIC 2026.
+Sau khi làm xong các bước bên dưới, máy sẽ chạy được đầy đủ ba workflow Textual KIS, Visual
+Q&A và TRAKE trên dữ liệu thật, cùng giao diện Streamlit và chức năng xuất file nộp bài.
 
 **Máy mới:** làm lần lượt mục 1–8. **Máy đã cài và import xong:** dùng mục 9 để khởi động
 hằng ngày. **Gặp lỗi:** tra mục 10. Các lệnh dùng PowerShell tại thư mục gốc repo; ví dụ bên

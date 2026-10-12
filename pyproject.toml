@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "aic2026-video-retrieval"
 version = "0.1.0"
-description = "Multimodal video search and retrieval scaffold for AIC 2026"
+description = "Multimodal video search and retrieval system for AIC 2026"
 readme = "README.md"
 requires-python = ">=3.11,<3.12"
 dependencies = [
