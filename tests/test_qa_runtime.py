@@ -43,7 +43,7 @@ def test_laptop_runtime_is_lazy_local_first_and_secret_safe(
     assert isinstance(reasoner.local, OllamaQwenReasoner)
     assert isinstance(reasoner.gemini, GeminiFlashReasoner)
     assert reasoner.local._http is None
-    assert reasoner.gemini._client is None
+    assert reasoner.gemini._http is None
     assert not (tmp_path / "jobs.sqlite3").exists()
     assert not (tmp_path / "artifacts.sqlite3").exists()
     assert not (tmp_path / "qa.sqlite3").exists()

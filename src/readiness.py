@@ -1406,6 +1406,17 @@ class ReadinessService:
     def _probe_ollama_vlm(self, applicability: ChannelApplicability) -> ChannelReadiness:
         service = self.config.get("services", {}).get("ollama_vlm", {})
         model = str(service.get("model", "qwen2.5vl:3b-q4_K_M"))
+        from src.utils.io_helpers import service_enabled
+
+        if not service_enabled(service):
+            return ChannelReadiness(
+                "ollama_vlm",
+                applicability,
+                ChannelState.DISABLED_BY_PROFILE,
+                "local_vlm_disabled",
+                "enable_local_vlm",
+                resource_name=model,
+            )
         base_url = str(service.get("url", "http://127.0.0.1:11434")).rstrip("/")
         try:
             status, tags = self._request_json("GET", f"{base_url}/api/tags")

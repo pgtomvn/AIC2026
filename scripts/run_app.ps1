@@ -11,7 +11,8 @@ param(
     [ValidateRange(1, 65535)]
     [int]$OllamaPort = 11434,
     [switch]$AllowDegraded,
-    [switch]$StartServices
+    [switch]$StartServices,
+    [switch]$LegacyStreamlit
 )
 
 Set-StrictMode -Version Latest
@@ -93,7 +94,9 @@ if (-not $BatchId -or $BatchId -notmatch "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$") {
 function Assert-PortAvailable {
     param(
         [Parameter(Mandatory = $true)][int]$RequestedPort,
-        [Parameter(Mandatory = $true)][string]$Phase
+        [Parameter(Mandatory = $true)][string]$Phase,
+        [ValidateSet("-Port", "-ApiPort", "-OllamaPort")]
+        [string]$PortOption = "-ApiPort"
     )
 
     $probe = [System.Net.Sockets.TcpListener]::new(
@@ -117,10 +120,10 @@ function Assert-PortAvailable {
             $owner = Get-Process -Id $processId -ErrorAction SilentlyContinue
             $ownerName = if ($null -ne $owner) { $owner.ProcessName } else { "unknown" }
             $started = if ($null -ne $owner) { $owner.StartTime.ToUniversalTime().ToString("o") } else { "unknown" }
-            throw "Port $RequestedPort is already owned by PID $processId ($ownerName, started=$started) during $Phase. Choose another -Port; no process was stopped."
+            throw "Port $RequestedPort is already owned by PID $processId ($ownerName, started=$started) during $Phase. Choose another $PortOption; no process was stopped."
         }
     }
-    throw "Port $RequestedPort is already in use during $Phase. Choose another -Port; no process was stopped."
+    throw "Port $RequestedPort is already in use during $Phase. Choose another $PortOption; no process was stopped."
 }
 
 function Test-OllamaEndpoint {
@@ -218,9 +221,17 @@ print(source_contract_fingerprint(sys.argv[1]))
 if ($LASTEXITCODE -ne 0 -or $SourceContractHash -notmatch "^[0-9a-f]{64}$") {
     throw "Runtime source-contract fingerprint could not be computed."
 }
-Assert-PortAvailable -RequestedPort $Port -Phase "initial preflight"
-if ($ApiPort -eq $Port -or $OllamaPort -in @($Port, $ApiPort)) {
-    throw "Streamlit, FastAPI, and Ollama ports must be different."
+if ($LegacyStreamlit) {
+    Assert-PortAvailable -RequestedPort $Port -Phase "initial preflight" -PortOption "-Port"
+    if ($ApiPort -eq $Port -or $OllamaPort -eq $Port) {
+        throw "Legacy Streamlit, FastAPI, and Ollama ports must be different."
+    }
+}
+elseif ($PSBoundParameters.ContainsKey("Port")) {
+    Write-Warning "-Port applies only with -LegacyStreamlit. EviBind Browser and its API share -ApiPort $ApiPort."
+}
+if ($OllamaPort -eq $ApiPort) {
+    throw "FastAPI and Ollama ports must be different."
 }
 Assert-PortAvailable -RequestedPort $ApiPort -Phase "API preflight"
 
@@ -232,7 +243,7 @@ $env:PADDLE_PDX_CACHE_HOME = Join-Path $ProjectRoot ".cache/paddlex"
 $env:PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK = "True"
 $env:AIC_LAUNCH_CONTRACT = "run_app-v2"
 $env:AIC_LAUNCH_ID = [guid]::NewGuid().ToString()
-$env:AIC_LAUNCH_PORT = [string]$Port
+$env:AIC_LAUNCH_PORT = if ($LegacyStreamlit) { [string]$Port } else { [string]$ApiPort }
 $env:AIC_LAUNCH_BATCH = $BatchId
 $env:AIC_LAUNCH_PROFILE = $RuntimeProfile
 $env:AIC_LAUNCHED_AT_UTC = [DateTime]::UtcNow.ToString("o")
@@ -283,9 +294,16 @@ try {
         }
     }
 
-    if (-not (Test-OllamaEndpoint -RequestedPort $OllamaPort)) {
+    # AIC_LOCAL_VLM=off (process or .env) answers Visual Q&A with Gemini only and never
+    # starts the local Ollama model.
+    $LocalVlm = if ($env:AIC_LOCAL_VLM) { $env:AIC_LOCAL_VLM } else { Get-LocalEnvValue -Name "AIC_LOCAL_VLM" }
+    $SkipLocalVlm = $LocalVlm -and $LocalVlm.Trim().ToLowerInvariant() -in @("off", "0", "false", "no")
+    if ($SkipLocalVlm) {
+        Write-Host "Local VLM disabled (AIC_LOCAL_VLM=off); Visual Q&A uses Gemini."
+    }
+    if (-not $SkipLocalVlm -and -not (Test-OllamaEndpoint -RequestedPort $OllamaPort)) {
         try {
-            Assert-PortAvailable -RequestedPort $OllamaPort -Phase "Ollama preflight"
+            Assert-PortAvailable -RequestedPort $OllamaPort -Phase "Ollama preflight" -PortOption "-OllamaPort"
         }
         catch {
             throw "Ollama port $OllamaPort is occupied by a non-Ollama process."
@@ -329,7 +347,8 @@ try {
             "--mode", "app", "--startup-only", "--compact"
         )
     }
-    if ($AllowDegraded -and $StartServices) { $DoctorArguments += "--allow-degraded" }
+    # Gemini-only Q&A is reported as degraded (no local fallback); accept it when chosen.
+    if (($AllowDegraded -or $SkipLocalVlm) -and $StartServices) { $DoctorArguments += "--allow-degraded" }
     & $Python @DoctorArguments
     $DoctorExit = $LASTEXITCODE
     if ($DoctorExit -ne 0) {
@@ -363,17 +382,31 @@ try {
     }
     if (-not $ApiHealthy) { throw "FastAPI did not become healthy on the requested loopback port." }
 
-    Assert-PortAvailable -RequestedPort $Port -Phase "final UI launch"
-    Write-Host "Launching AIC 2026 UI on http://127.0.0.1:$Port and API on http://127.0.0.1:$ApiPort (profile=$RuntimeProfile, batch=$BatchId, launch_id=$($env:AIC_LAUNCH_ID))"
-    & $Python -m streamlit run app/streamlit_app.py `
-        --server.headless true `
-        --server.address 127.0.0.1 `
-        --server.port $Port `
-        --server.fileWatcherType none `
-        --server.runOnSave false `
-        --browser.gatherUsageStats false
-    if ($LASTEXITCODE -ne 0) {
-        throw "Streamlit exited with code $LASTEXITCODE."
+    if ($LegacyStreamlit) {
+        Assert-PortAvailable -RequestedPort $Port -Phase "final UI launch" -PortOption "-Port"
+        Write-Host "Launching legacy Streamlit on http://127.0.0.1:$Port and API on $($env:AIC_API_URL) (profile=$RuntimeProfile, batch=$BatchId, launch_id=$($env:AIC_LAUNCH_ID))"
+        & $Python -m streamlit run app/streamlit_app.py `
+            --server.headless true `
+            --server.address 127.0.0.1 `
+            --server.port $Port `
+            --server.fileWatcherType none `
+            --server.runOnSave false `
+            --browser.gatherUsageStats false
+        if ($LASTEXITCODE -ne 0) {
+            throw "Streamlit exited with code $LASTEXITCODE."
+        }
+    }
+    else {
+        Write-Host "Open EviBind Browser: $($env:AIC_API_URL)/ (profile=$RuntimeProfile, batch=$BatchId, launch_id=$($env:AIC_LAUNCH_ID))"
+        Write-Host "Browser UI and API share one process. Keep this terminal open; press Ctrl+C to stop."
+        # Bounded waits let PowerShell process Ctrl+C and execute the owned-process
+        # cleanup below. No browser process or secondary UI server is required.
+        while (-not $ApiProcess.HasExited) {
+            $ApiProcess.WaitForExit(500) | Out-Null
+        }
+        if ($ApiProcess.ExitCode -ne 0) {
+            throw "FastAPI exited with code $($ApiProcess.ExitCode). See $ApiStderr"
+        }
     }
 }
 finally {

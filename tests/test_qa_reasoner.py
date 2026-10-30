@@ -471,38 +471,24 @@ def test_ollama_resource_exhaustion_is_sanitized() -> None:
     assert "private" not in str(captured.value)
 
 
-def test_gemini_interactions_payload_is_single_image_structured_and_bounded() -> None:
+def test_gemini_payload_is_single_image_structured_and_bounded() -> None:
     calls: list[dict] = []
-    client_options: list[dict] = []
 
-    class Interactions:
-        def create(self, **kwargs):
-            calls.append(kwargs)
-            return SimpleNamespace(
-                output_text=json.dumps(
-                    {"answer": "3", "answerable": True, "evidence_frame_indices": [1]}
-                )
-            )
+    def post(url, headers, body, timeout):
+        calls.append(body)
+        return 200, {"candidates": [{"content": {"parts": [{"text": json.dumps(
+            {"answer": "3", "answerable": True, "evidence_frame_indices": [1]})}]}}]}
 
-    def factory(**kwargs):
-        client_options.append(kwargs)
-        return SimpleNamespace(interactions=Interactions())
-
-    provider = GeminiFlashReasoner(api_key="secret", client_factory=factory)
+    provider = GeminiFlashReasoner(api_key="secret", http_post=post)
     request = _request(
         reasoning_policy="gemini_then_local", allow_external_frame_transfer=True
     )
     result = provider.reason(request, (_image(),), QACompetitionSpec.conservative_general_text())
 
     assert result.provider == "gemini"
-    assert client_options == [
-        {"api_key": "secret", "http_options": {"timeout": 5000, "retry_options": {"attempts": 1}}}
-    ]
-    assert calls[0]["input"][0]["type"] == "text"
-    assert calls[0]["input"][1]["type"] == "image"
-    assert base64.b64decode(calls[0]["input"][1]["data"]) == _image().data
-    assert calls[0]["generation_config"]["thinking_level"] == "minimal"
-    assert calls[0]["store"] is False
+    parts = calls[0]["contents"][0]["parts"]
+    assert parts[0]["text"] and base64.b64decode(parts[1]["inline_data"]["data"]) == _image().data
+    assert calls[0]["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "minimal"}
     with pytest.raises(ValueError):
         provider.reason(request, (_image(1), _image(2)), QACompetitionSpec.conservative_general_text())
 

@@ -34,7 +34,7 @@ Stable ZIPs or loose videos
         |                                      |
         +--------------------------> ranked top-100 hits
                                                |
-                         FastAPI / Streamlit / validated CSV export
+                         FastAPI / EviBind Browser / validated CSV export
 ```
 
 The laptop default uses `google/siglip2-base-patch16-224` for native 768-D visual vectors.
@@ -136,7 +136,7 @@ frame index. Only the competition adapter emits `<video_name>,<frame_idx>`.
 ## Repository layout
 
 ```text
-app/                  Streamlit competition console and UI components
+app/                  Native browser UI and legacy Streamlit console/components
 config/settings.yaml Laptop defaults, model pins, index names, retrieval policy, limits
 scripts/              Bootstrap, catalog, ingest, evaluate, serve, drill, and export CLIs
 src/contracts.py      Canonical records and versioned competition specification
@@ -227,7 +227,8 @@ Runtime selection is deterministic for both `AIC_PROFILE` and `AIC_BATCH_ID`: an
 process environment value wins, then the untracked `.env` value, then `config/settings.yaml`.
 The supported profiles are `laptop` and `accelerated`; the configured default batch is
 `aic25-b1-reference`. The canonical launcher sets both values for its readiness check and the
-Streamlit process, so the banner, searches, and exports use the same batch.
+API process (and optional legacy Streamlit process), so the UI, searches, and exports use the
+same batch.
 
 The default dependency set can run tests, the evaluator, API/UI startup, and lightweight
 adapters. Install the locked competition ML group explicitly before model preparation or native
@@ -546,19 +547,26 @@ Run the API-backed stack with the canonical launcher:
 # One-time, pinned competition runtime (kept separate from the test .venv).
 .\scripts\bootstrap_runtime.ps1 -Profile laptop
 
-# One stack: FastAPI owns RuntimeContext; Streamlit is an HTTP-only client.
-.\scripts\run_app.ps1 -Profile laptop -BatchId aic25-b1-reference -ApiPort 8080 -Port 8504
+# One process: FastAPI owns RuntimeContext and serves the browser UI.
+.\scripts\run_app.ps1 -Profile laptop -BatchId aic25-b1-reference -ApiPort 8080
 ```
 
 The launcher never starts Docker unless requested, kills a port owner, or changes ports. It uses
-a lightweight batch/runtime preflight so Streamlit liveness is available immediately. The exact
+a lightweight batch/runtime preflight so HTTP liveness is available promptly. The exact
 service, index, and canonical-image audit then runs in the single-flight background warm-up;
 all search controls remain locked until that audit and required model warm-up finish.
 `python scripts/runtime_doctor.py --batch-id aic25-b1-reference` still prints the complete
 secret-free readiness report without starting the application. Add `--live-local-vlm` only for
 an explicit Ollama inference check.
 
-The Textual KIS tab exposes editable clauses, evidence/channel ranks, neighboring frames,
+Open `http://127.0.0.1:8080/`. The browser calls same-origin HTTP endpoints and updates its own
+state without a full Python UI rerun. Search, image decoding, readiness checks, and VLM calls
+retain their backend costs; measure warm and cold latency separately before claiming an
+end-to-end speedup. See [EviBind Browser](evibind_browser.md) for the migration scope.
+
+The legacy console is still available with `-LegacyStreamlit -Port 8504`; its API remains on
+`-ApiPort 8080`. Dependencies and legacy checks are retained until feature-parity review.
+In that console, the Textual KIS tab exposes editable clauses, evidence/channel ranks, neighboring frames,
 Rocchio feedback, pinning, and validated export. The isolated Visual Q&A tab retrieves five
 canonical frames by event description, lets the operator choose one frame, and runs one explicit
 single-image answer request. Candidates, answers, selection, pinning, session restore, and
@@ -596,6 +604,9 @@ or indexes surface as errors rather than fabricated matches.
 | `GET` | `/v1/health/status?batch_id=...` | Sanitized KIS/QA/TRAKE, ingest, warm-up, and aggregate channel health |
 | `GET` | `/api/v1/health/status?batch_id=...` | Deprecated compatibility alias for `/v1/health/status` |
 | `GET` | `/v1/runtime/capabilities` | Sanitized runtime, workflow, and Visual Q&A provider capabilities |
+| `POST` | `/v1/assistant/route` | Deterministic intent and editable graph-route suggestion; never an implicit QA answer |
+| `GET` | `/v1/graph/status` | Per-batch topic/object manifest presence; not an artifact validation or readiness check |
+| `POST` | `/v1/graph/search` | Optional two-stage graph retrieval with evidence and explicit conventional-fallback reason |
 | `GET` | `/healthz` | Process health |
 
 Minimal search request:

@@ -8,8 +8,13 @@ from typing import Final
 
 from src import PROJECT_ROOT
 
-RUNTIME_CONTRACT_VERSION: Final[int] = 8
+RUNTIME_CONTRACT_VERSION: Final[int] = 9
 RUNTIME_CONTRACT_FEATURES: Final[tuple[str, ...]] = (
+    "browser.native_ui",
+    "browser.graph_search",
+    "browser.unified_search",
+    "browser.assistant_routing",
+    "browser.dres_submission",
     "entity_constraints.kis",
     "entity_constraints.qa",
     "entity_constraints.trake",
@@ -33,6 +38,14 @@ RUNTIME_CONTRACT_FEATURES: Final[tuple[str, ...]] = (
     "kis.manual_event_inspection",
 )
 RUNTIME_CONTRACT_SURFACE: Final[tuple[str, ...]] = (
+    "app/web/index.html",
+    "app/web/app.js",
+    "app/web/app.css",
+    "src/browser_api.py",
+    "src/graph/topic_graph.py",
+    "src/graph/object_graph.py",
+    "src/graph/fusion.py",
+    "src/submission/dres.py",
     "app/http_backend.py",
     "app/streamlit_app.py",
     "app/components/interactive_search.py",

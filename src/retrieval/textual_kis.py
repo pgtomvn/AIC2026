@@ -148,7 +148,7 @@ class TextualKISPipeline:
         if not 0.0 <= entity_bonus_alpha <= 1.0:
             raise ValueError("entity_bonus_alpha must be between 0 and 1")
         if semantic_view_fusion not in {
-            "global_only", "weighted_rrf", "max_rrf", "rrf_consensus"
+            "global_only", "weighted_rrf", "max_rrf", "rrf_consensus", "mean_vector"
         }:
             raise ValueError("unsupported semantic view fusion policy")
         if not 0.0 <= semantic_consensus_alpha <= 1.0:
@@ -1366,12 +1366,20 @@ class TextualKISPipeline:
                     variants = list(
                         self.query_adapter.dense_variants(channel.name, processing)
                     )
+                    view_mean: np.ndarray | None = None
                     if self.semantic_view_fusion == "global_only" and not force_semantic_views:
                         global_variants = [
                             value for value in variants if value.semantic_role in {None, "global"}
                         ]
                         variants = global_variants[:1]
-                    if channel.name == "visual":
+                    elif self.semantic_view_fusion == "mean_vector" and not force_semantic_views and variants:
+                        # Early fusion: one search with the normalized mean of all view
+                        # embeddings, the query that feedback refinement starts from.
+                        view_mean = self._normalized_vector(np.stack([
+                            encode_query_mean(channel.encoder, value.text) for value in variants
+                        ]).mean(axis=0))
+                        variants = [QueryVariant("view_mean", variants[0].text, variants[0].locale)]
+                    if channel.name == "visual" and view_mean is None:
                         variants = self._with_temporal_variants(variants, plan)
                     if not variants:
                         self.last_channel_statuses[channel.name] = {
@@ -1388,7 +1396,9 @@ class TextualKISPipeline:
                             "encode_text_with_diagnostics",
                             None,
                         )
-                        if callable(diagnostic_encoder):
+                        if view_mean is not None:
+                            encoded = view_mean
+                        elif callable(diagnostic_encoder):
                             encoded, diagnostic_value = diagnostic_encoder(variant.text)
                             to_dict = getattr(diagnostic_value, "to_dict", None)
                             if callable(to_dict):

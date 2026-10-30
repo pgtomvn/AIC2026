@@ -46,11 +46,24 @@ expands recall; it never asserts that “cross a bridge” means “under a brid
 Ordering idioms become positive-only `SequenceConstraint` evidence. Prospective
 `prepare/plan/wait to …` relations never supply a current-frame negative penalty.
 
-Each view is encoded and searched independently. The query embeddings are not
-averaged before search. The supported within-encoder policies are `global_only`,
-`weighted_rrf`, `max_rrf`, and `rrf_consensus`. Production remains `global_only`
-until `outputs/evaluation/kis-semantic-view-tuning.json` has valid locked-qrels,
-model, query-adapter, and ranking-cache fingerprints and a passing activation gate.
+The supported within-encoder policies are `global_only`, `mean_vector`,
+`weighted_rrf`, `max_rrf`, and `rrf_consensus`. `mean_vector` encodes every view,
+averages the normalized embeddings, and searches once per channel; it is the query
+that feedback refinement (`/v1/kis/refine`) starts from. The late-fusion policies
+encode and search each view independently and stay inactive until
+`outputs/evaluation/kis-semantic-view-tuning.json` has valid locked-qrels, model,
+query-adapter, and ranking-cache fingerprints and a passing activation gate.
+
+Production uses `mean_vector` since 2026-10-27. On the 23 user-labelled queries in
+`outputs/evaluation/user-qrels-20260905-v1` (B01 answers, B01+B02 searched, correct =
+same video within 5 s) the deployed search moved from `global_only` to `mean_vector`
+as follows: R@1 0.09 → 0.17, R@5 0.26 → 0.30, R@20 0.30 → 0.35, R@100 0.43 → 0.43,
+MRR 0.155 → 0.236; 7 queries improved and 5 got worse, four answers entered the top 100
+and four left it, and the median latency on the laptop rose from 7.8 s to 8.4 s (four
+view encodings instead of one; 7.1 s to 9.2 s in an earlier pair of runs, so treat the
+difference as noisy). The queries also
+revealed the effect, so these numbers are optimistic; re-measure on new labelled
+queries before tuning further.
 
 Native SigLIP2 participates only when its batch count exactly equals the configured
 canonical count. Until B01 provisioning reaches `176707`, the complete Organizer

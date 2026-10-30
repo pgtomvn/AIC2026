@@ -101,7 +101,7 @@ _QA_FAILURE_CODES = frozenset(
 )
 
 _ENTITY_EXTRACTOR = EntityExtractor()
-_EXPECTED_RUNTIME_CONTRACT_VERSION = 8
+_EXPECTED_RUNTIME_CONTRACT_VERSION = 9
 _EXPECTED_RUNTIME_CONTRACT_FEATURES = frozenset(
     {
         "entity_constraints.kis",

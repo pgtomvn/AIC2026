@@ -2595,7 +2595,8 @@ def create_app(context: RuntimeContext) -> FastAPI:
     async def protect_manual_inference(request, call_next):
         # No queue: manual inference declines while retrieval/QA is already using models.
         guarded = request.method == "POST" and (
-            request.url.path in {"/v1/kis/search", "/v1/kis/refine", "/v1/runtime/warmup/start"}
+            request.url.path in {"/v1/kis/search", "/v1/kis/refine", "/v1/graph/search", "/v1/search",
+                                 "/v1/runtime/warmup/start"}
             or request.url.path.startswith(("/v1/qa/", "/v1/trake/")))
         if guarded and not inspector.enter_retrieval():
             return JSONResponse(status_code=409, content={"detail": "manual_local_inference_busy"})
@@ -4603,6 +4604,10 @@ def create_app(context: RuntimeContext) -> FastAPI:
             "warmup": snapshot,
         }
 
+    from src.browser_api import install_browser_routes
+
+    install_browser_routes(app, context, search=search, refine=refine,
+                           validate_batches=_runtime_batch_filters, public_hits=_public_hits)
     return app
 
 

@@ -1,4 +1,4 @@
-# AIC 2026 — Multimodal Video Retrieval
+# EviBind Browser — AIC 2026 Multimodal Video Retrieval
 
 [![CI](https://github.com/pgtomvn/AIC2026/actions/workflows/ci.yml/badge.svg)](https://github.com/pgtomvn/AIC2026/actions/workflows/ci.yml)
 ![Python 3.11](https://img.shields.io/badge/python-3.11-blue)
@@ -7,6 +7,8 @@
 A multimodal video search system for the **Ho Chi Minh City AI Challenge 2026** (AIC 2026).
 Given a natural-language description (Vietnamese or English), it finds the exact video moment,
 answers questions about a frame, and aligns multi-step events across a video timeline.
+**EviBind Browser: Interactive Multimodal Video Retrieval with Query Refinement and Temporal
+Browsing** provides a local browser interface served by the existing FastAPI runtime.
 
 ## Features
 
@@ -20,6 +22,15 @@ The system supports three competition workflows over a shared runtime:
 
 Other highlights:
 
+- **Local browser UI** — HTML, CSS, and JavaScript served on the API's localhost port, with
+  no frontend build step. Browser interactions update the relevant view without rerunning
+  the Python UI. Retrieval and model inference still take time; instant search is not guaranteed.
+- **One fused search** — conventional multimodal retrieval fused with an ASR topic graph
+  (temporal `NEXT` and semantic edges) and a frame object graph from detections, with two-stage
+  refinement, evidence tags, a relationship-graph view, and an assistant; Visual Q&A answers
+  the selected frame with Gemini.
+- **DRES submission** — submit KIS / Q&A answers to a DRES evaluation server (VBS, HCMC AI
+  Challenge) from the browser, with a confirmation preview and canonical frame times.
 - **Vietnamese-first querying** — offline query translation/routing and accent-folded text search.
 - **Cross-batch search** — query Batch 1, Batch 2, or both at once with rank-level fusion.
 - **Strict frame identity** — every result carries a canonical decoded `source_frame_idx`;
@@ -54,7 +65,7 @@ Other highlights:
   refinement)        local Qwen2.5-VL)        DP alignment)
       └──────────────────┼──────────────────────┘
                          ▼
-          FastAPI runtime ◄── Streamlit UI (Vietnamese)
+          FastAPI runtime ◄── EviBind Browser
                          │
                 validated CSV export
 ```
@@ -64,13 +75,15 @@ canonical data contracts, and the full HTTP API.
 
 ## Tech stack
 
-Python 3.11 · FastAPI · Streamlit · Qdrant · Meilisearch · PyTorch · SigLIP2 / OpenCLIP ·
+Python 3.11 · FastAPI · HTML/CSS/JavaScript · Qdrant · Meilisearch · PyTorch · SigLIP2 / OpenCLIP ·
 PaddleOCR / VietOCR · Faster-Whisper · Ollama (Qwen2.5-VL) · Google Gemini · uv · Docker Compose
+
+Streamlit remains available as an explicit legacy UI during browser feature-parity review.
 
 ## Repository layout
 
 ```text
-app/          Streamlit competition console and UI components
+app/          Browser UI (web/) and legacy Streamlit competition console/components
 config/       settings.yaml (models, indexes, retrieval policy, limits) and organizer baselines
 src/
   contracts.py  Canonical records and versioned competition specifications
@@ -126,9 +139,23 @@ docker compose up -d
 # Install the competition runtime (PyTorch, OCR, ASR, ...) into its own environment
 .\scripts\bootstrap_runtime.ps1 -Profile laptop
 
-# Start FastAPI (8080) and the Streamlit UI (8504)
-.\scripts\run_app.ps1 -Profile laptop -BatchId aic25-b1-reference -ApiPort 8080 -Port 8504
+# Start EviBind Browser and FastAPI together on localhost:8080
+.\scripts\run_app.ps1 -Profile laptop -BatchId aic25-b1-reference -ApiPort 8080
 ```
+
+Open [EviBind Browser](http://127.0.0.1:8080/) and keep the launcher terminal open.
+The existing model/index warm-up still gates searches. `Ctrl+C` stops the API and any Ollama
+process started by this launcher; it does not stop pre-existing services.
+
+Use the legacy console when a specialized control has not yet been migrated:
+
+```powershell
+.\scripts\run_app.ps1 -Profile laptop -BatchId aic25-b1-reference -LegacyStreamlit -ApiPort 8080 -Port 8504
+```
+
+In browser mode, `-ApiPort` selects both UI and API ports. `-Port` is retained for legacy
+Streamlit only. See the [browser migration guide](docs/guides/evibind_browser.md) for current
+scope, graph-evidence limits, and verification steps.
 
 Model preparation, reference-pack import, and native ingestion are explicit steps described in:
 

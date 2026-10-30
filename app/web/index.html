@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="EviBind Browser: Interactive Multimodal Video Retrieval with Query Refinement and Temporal Browsing">
+  <title>EviBind Browser</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='10' fill='%231f7a4d'/%3E%3Cpath d='M12 11h17v5H17v3h10v4H17v3h12v5H12z' fill='white'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/assets/app.css">
+  <script src="/assets/app.js" defer></script>
+</head>
+<body>
+  <div class="app">
+    <aside class="panel left" aria-label="Search">
+      <div class="panel-head"><span>Search</span><span class="num">01</span></div>
+      <form id="search-form" class="stages">
+        <label for="stage1">Describe the moment</label>
+        <textarea id="stage1" rows="3" maxlength="8192" required placeholder="e.g. a chef adds seasoning to a pot of pork ribs"></textarea>
+        <label for="stage2">Narrow it down <span class="optional">optional</span></label>
+        <textarea id="stage2" rows="2" maxlength="8192" placeholder="e.g. then green bananas go into the pot"></textarea>
+        <button id="search-button" class="primary" type="submit">Search</button>
+        <p class="hint center-text">Ctrl + Enter to search</p>
+      </form>
+      <section id="refine" class="refine" hidden aria-label="Search turns">
+        <div class="panel-head"><span>Search turns</span><span id="turn-label" class="hint"></span></div>
+        <div class="refine-buttons">
+          <button id="undo" type="button" class="ghost">↶ Undo</button>
+          <button id="first-turn" type="button" class="ghost">First results</button>
+        </div>
+      </section>
+      <section id="relations" class="relations" hidden>
+        <div class="panel-head"><span>Show links</span></div>
+        <label title="The next part of the same video"><input type="checkbox" value="NEXT" checked> Next in video <code>NEXT</code></label>
+        <label title="A part that mentions a name"><input type="checkbox" value="MENTIONS"> Mentions <code>MENTIONS</code></label>
+        <label title="Two parts that mention the same name"><input type="checkbox" value="SHARES_ENTITY"> Same name <code>SHARES_ENTITY</code></label>
+        <label title="Two parts that talk about similar things"><input type="checkbox" value="GRAPH_RELATION"> Similar topic <code>GRAPH_RELATION</code></label>
+      </section>
+      <section id="query-graph" class="relations" hidden>
+        <div class="panel-head"><span>Looking for</span></div>
+        <div id="query-graph-items"></div>
+      </section>
+      <div class="left-foot">
+        <div class="foot-buttons">
+          <button id="selection-open" type="button" class="ghost">Selected <span id="selection-count">0</span></button>
+          <button id="dres-open" type="button" class="ghost">DRES</button>
+        </div>
+      </div>
+    </aside>
+
+    <div class="gutter" data-gutter="left" role="separator" aria-orientation="vertical" title="Drag to resize · double-click to reset"></div>
+
+    <main class="panel center" aria-label="Results">
+      <div class="center-head">
+        <h1 id="view-title">Results</h1>
+        <div class="center-tools">
+          <span id="view-meta"></span>
+          <div id="view-toggle" class="view-toggle" hidden>
+            <button type="button" data-view="graph" aria-pressed="true">Graph</button>
+            <button type="button" data-view="grid" aria-pressed="false">Frames</button>
+          </div>
+        </div>
+      </div>
+      <div id="stage" class="stage">
+        <div id="progress" class="progress" hidden></div>
+        <div id="empty" class="empty"></div>
+        <svg id="graph" class="graph" hidden role="img" aria-label="Relationship graph"></svg>
+        <div id="grid" class="grid" hidden></div>
+      </div>
+      <div id="legend" class="legend" hidden>
+        <span><i class="dot anchor"></i>First-step match</span>
+        <span><i class="dot match"></i>Final match</span>
+        <span><i class="dot related"></i>Related part</span>
+        <span class="hint">Drag to move · scroll to zoom · double-click to fit</span>
+      </div>
+    </main>
+
+    <div class="gutter" data-gutter="right" role="separator" aria-orientation="vertical" title="Drag to resize · double-click to reset"></div>
+
+    <aside class="panel right" aria-label="Details and assistant">
+      <div class="panel-head"><span>Details</span><span class="num">02</span></div>
+      <article id="inspector" class="inspector" hidden></article>
+      <div class="gutter-h" data-gutter="inspector" role="separator" aria-orientation="horizontal" title="Drag to resize · double-click to reset"></div>
+      <section class="assistant" aria-label="AI Assistant">
+        <header class="assistant-head"><span class="bot" aria-hidden="true">✦</span><span>AI Assistant</span></header>
+        <div id="chat" class="chat" role="log" aria-live="polite"></div>
+        <div id="chat-context" class="chat-context" hidden></div>
+        <form id="chat-form" class="chat-form">
+          <input id="chat-input" maxlength="8192" autocomplete="off" placeholder="Ask about the frame or describe a scene…" aria-label="Message">
+          <button type="submit" aria-label="Send">➤</button>
+        </form>
+      </section>
+    </aside>
+  </div>
+
+  <dialog id="selection-dialog">
+    <div class="dialog-head"><h2>Selected results</h2><button type="button" class="close" data-close aria-label="Close">×</button></div>
+    <p class="hint">The order below is the rank written to the CSV file.</p>
+    <div class="dialog-row">
+      <select id="export-task" aria-label="Task"><option value="kis">Find the moment (KIS)</option><option value="qa">Question answering (Q&amp;A)</option></select>
+      <input id="export-query-id" maxlength="32" placeholder="Query id, e.g. 01" aria-label="Query id">
+    </div>
+    <ol id="selected-items" class="selected-items"></ol>
+    <div class="dialog-row">
+      <button id="export-csv" type="button" class="primary">Download CSV</button>
+      <button id="stage-selection" type="button" class="ghost">Save on server</button>
+    </div>
+    <p id="export-status" class="hint" role="status"></p>
+    <details id="staging-details"><summary>Files saved on the server</summary><div id="staging-entries"></div></details>
+  </dialog>
+
+  <dialog id="dres-dialog">
+    <div class="dialog-head"><h2>DRES submission</h2><button type="button" class="close" data-close aria-label="Close">×</button></div>
+    <form id="dres-login" class="dres-form">
+      <label for="dres-server">Server address</label>
+      <input id="dres-server" placeholder="https://eventretrieval.one" autocomplete="url">
+      <div class="dialog-row">
+        <div class="grow"><label for="dres-user">Username</label><input id="dres-user" autocomplete="username"></div>
+        <div class="grow"><label for="dres-password">Password</label><input id="dres-password" type="password" autocomplete="current-password"></div>
+      </div>
+      <label for="dres-token">…or paste a session ID instead</label>
+      <input id="dres-token" autocomplete="off" spellcheck="false">
+      <button type="submit" class="primary">Connect</button>
+    </form>
+    <div id="dres-session" class="dres-form" hidden>
+      <p id="dres-who"></p>
+      <label for="dres-evaluation">Evaluation</label>
+      <div class="dialog-row">
+        <select id="dres-evaluation"></select>
+        <button id="dres-refresh" type="button" class="ghost">Refresh</button>
+      </div>
+      <p id="dres-task" class="hint"></p>
+      <button id="dres-logout" type="button" class="ghost">Disconnect</button>
+    </div>
+    <p id="dres-status" class="hint" role="status"></p>
+  </dialog>
+
+  <dialog id="submit-dialog">
+    <div class="dialog-head"><h2>Submit to DRES</h2><button type="button" class="close" data-close aria-label="Close">×</button></div>
+    <div id="submit-preview" class="submit-preview"></div>
+    <label for="submit-evaluation">Evaluation</label>
+    <select id="submit-evaluation"></select>
+    <div id="submit-answer-field" hidden>
+      <label for="submit-answer">Answer</label>
+      <input id="submit-answer" maxlength="256">
+    </div>
+    <p id="submit-summary"></p>
+    <details><summary>Request body</summary><pre id="submit-body"></pre></details>
+    <div class="dialog-row">
+      <button id="submit-confirm" type="button" class="primary">Submit</button>
+      <button type="button" class="ghost" data-close>Cancel</button>
+    </div>
+    <p id="submit-status" class="hint" role="status"></p>
+  </dialog>
+  <dialog id="viewer" class="viewer" aria-label="Frame viewer">
+    <img id="viewer-image" alt="">
+    <div class="viewer-bar">
+      <button id="viewer-prev" type="button" class="ghost" aria-label="Previous frame">←</button>
+      <span id="viewer-caption"></span>
+      <button id="viewer-next" type="button" class="ghost" aria-label="Next frame">→</button>
+      <button id="viewer-open" type="button" class="ghost">Open in details</button>
+      <button type="button" class="ghost" data-close aria-label="Close">×</button>
+    </div>
+  </dialog>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>

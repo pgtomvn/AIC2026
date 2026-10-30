@@ -171,6 +171,7 @@ class OllamaQwenReasoner:
         keep_alive: str | int = "15m",
         num_ctx: int = 4096,
         execution_mode: str = "auto",
+        enabled: bool = True,
         max_new_tokens: int = 64,
         max_images: int = 1,
         max_total_image_bytes: int = 20 * 1024 * 1024,
@@ -194,6 +195,9 @@ class OllamaQwenReasoner:
         if execution_mode not in {"auto", "cpu"}:
             raise ValueError("Ollama execution_mode must be auto or cpu")
         self.execution_mode = execution_mode
+        # A disabled local VLM never opens a connection: on Windows a refused loopback
+        # connection costs the full connect timeout on every search and answer.
+        self.enabled = bool(enabled)
         self.num_ctx = int(num_ctx)
         if execution_mode == "cpu":
             self.num_ctx = min(self.num_ctx, 2048)
@@ -310,6 +314,14 @@ class OllamaQwenReasoner:
         )
 
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
+        if not self.enabled:
+            raise QAProviderUnavailableError(
+                "the local VLM is disabled",
+                provider=self.provider_name,
+                model=self.model_name,
+                attempts=1,
+                category="not_configured",
+            )
         try:
             response = self._session().request(
                 method,

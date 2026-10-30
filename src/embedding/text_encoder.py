@@ -79,6 +79,21 @@ class VietnameseTextEncoder:
         hidden_size = getattr(self._model.config, "hidden_size", None)
         self._embedding_dim = int(hidden_size) if hidden_size is not None else None
 
+    def _input_limit(self) -> int:
+        """Longest token sequence the position table accepts.
+
+        PhoBERT's tokenizer allows 512 tokens while the model has 258 positions, and
+        RoBERTa-family position ids start after the padding index.  Truncating to the
+        tokenizer limit therefore indexes past the table and can crash the process.
+        """
+
+        config = self._model.config
+        model_limit = int(getattr(config, "max_position_embeddings", 512))
+        if getattr(config, "model_type", "") in {"roberta", "xlm-roberta", "camembert"}:
+            model_limit -= int(getattr(config, "pad_token_id", 1) or 0) + 1
+        tokenizer_limit = int(getattr(self._tokenizer, "model_max_length", model_limit))
+        return max(1, min(model_limit, tokenizer_limit))
+
     def encode_text(self, text: str | list[str]) -> np.ndarray:
         """Serialize model loading and inference across warm-up and queries."""
 
@@ -92,12 +107,14 @@ class VietnameseTextEncoder:
         if not values:
             return np.empty((0, self.embedding_dim or 0), dtype=np.float32)
         self._load_model()
+        max_length = self._input_limit()
         rows: list[np.ndarray] = []
         for start in range(0, len(values), self.batch_size):
             inputs = self._tokenizer(
                 values[start : start + self.batch_size],
                 padding=True,
                 truncation=True,
+                max_length=max_length,
                 return_tensors="pt",
             )
             inputs = {name: value.to(self.device) for name, value in inputs.items()}

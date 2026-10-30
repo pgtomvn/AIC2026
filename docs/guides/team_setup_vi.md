@@ -4,7 +4,8 @@ Tài liệu này dành cho thành viên cần tự dựng một máy có thể t
 Textual KIS, Visual Q&A và TRAKE.
 
 Sau khi làm xong các bước bên dưới, máy sẽ chạy được đầy đủ ba workflow Textual KIS, Visual
-Q&A và TRAKE trên dữ liệu thật, cùng giao diện Streamlit và chức năng xuất file nộp bài.
+Q&A và TRAKE trên dữ liệu thật, cùng giao diện EviBind Browser và chức năng xuất file nộp bài.
+Giao diện Streamlit cũ vẫn có thể bật riêng trong giai đoạn kiểm tra độ đầy đủ của UI mới.
 
 **Máy mới:** làm lần lượt mục 1–8. **Máy đã cài và import xong:** dùng mục 9 để khởi động
 hằng ngày. **Gặp lỗi:** tra mục 10. Các lệnh dùng PowerShell tại thư mục gốc repo; ví dụ bên
@@ -15,8 +16,8 @@ dưới giả sử clone vào `D:\AIC2026`, hãy thay đường dẫn nếu máy
 | Qdrant | Lưu và tìm vector hình ảnh/văn bản | Docker Compose, service `qdrant` | REST `http://127.0.0.1:6333`, gRPC `6334` |
 | Meilisearch | Tìm theo chữ, objects, metadata, OCR/ASR đã import | Docker Compose, service `meilisearch` | `http://127.0.0.1:7700` |
 | Ollama | Phục vụ model trả lời Visual Q&A local | Ollama Windows, `ollama serve` hoặc launcher | `http://127.0.0.1:11434` |
-| FastAPI | Backend truy vấn và readiness | Do `run_app.ps1` khởi động | `http://127.0.0.1:8080` |
-| Streamlit | Giao diện cho người dùng | Do `run_app.ps1` khởi động | `http://127.0.0.1:8504` |
+| EviBind Browser / FastAPI | Giao diện web, backend truy vấn và readiness chung một cổng | Mặc định của `run_app.ps1` | `http://127.0.0.1:8080` |
+| Streamlit (legacy) | Giao diện cũ khi cần chức năng chưa chuyển sang UI mới | `run_app.ps1 -LegacyStreamlit` | `http://127.0.0.1:8504` |
 
 Luồng cài lần đầu: **tải công cụ và dữ liệu → bootstrap → bật hai database → tải model →
 verify/import reference → kiểm tra readiness → mở UI**. Bật database không tự tải corpus hay
@@ -135,7 +136,8 @@ Lộ trình dưới đây dùng Windows PowerShell, Python 3.11 do `uv` quản l
 - tối thiểu khoảng 30 GiB trống ngoài dữ liệu/model; nên dành riêng một ổ đủ lớn nếu tải cả
   video;
 - kết nối mạng trong lần đầu cài dependency/model;
-- quyền mở các cổng loopback `6333`, `6334`, `7700`, `8080`, `8504`, `11434`.
+- quyền mở các cổng loopback `6333`, `6334`, `7700`, `8080`, `11434`
+  (thêm `8504` nếu dùng Streamlit legacy).
 
 ### Khuyến nghị
 
@@ -293,7 +295,7 @@ docker compose --env-file .env logs -f --tail 100 meilisearch
 
 Dữ liệu được ghi vào `docker_data/meilisearch/data/`. Mở
 [Meilisearch local](http://127.0.0.1:7700) để kiểm tra giao diện development nếu cần; thao tác
-được bảo vệ dùng `MEILISEARCH_MASTER_KEY` trong `.env`. Giao diện tìm kiếm AIC nằm ở cổng `8504`.
+được bảo vệ dùng `MEILISEARCH_MASTER_KEY` trong `.env`. EviBind Browser nằm ở cổng `8080`.
 
 ### 5.3. Ví dụ: chỉ tải và khởi động Qdrant
 
@@ -606,24 +608,36 @@ warm-up trajectory cache trong ứng dụng trước khi tìm kiếm.
 Không dùng `--startup-only` làm bằng chứng hệ thống đã sẵn sàng tìm kiếm: cờ đó chỉ kiểm tra
 hợp đồng launcher/batch, hoãn kiểm tra chi tiết tới warm-up.
 
-### 8.2. Mở FastAPI và Streamlit bằng một launcher
+### 8.2. Mở EviBind Browser và FastAPI bằng một launcher
 
 ```powershell
 .\scripts\run_app.ps1 `
   -Profile laptop `
   -BatchId aic25-b1-reference `
-  -ApiPort 8080 `
-  -Port 8504
+  -ApiPort 8080
 ```
 
-Giữ cửa sổ PowerShell này mở. Launcher dùng `.venv-runtime`, tạo FastAPI ở nền và chạy
-Streamlit ở foreground. Nó tái sử dụng Ollama đang chạy hoặc khởi động Ollama nếu cổng còn
+Giữ cửa sổ PowerShell này mở. Launcher dùng `.venv-runtime`; FastAPI phục vụ cả giao diện
+HTML/CSS/JavaScript và API trong cùng tiến trình. Nó tái sử dụng Ollama đang chạy hoặc khởi động Ollama nếu cổng còn
 trống. Với lệnh trên, bạn phải bật Qdrant/Meilisearch trước ở mục 5.
 
-Mở [giao diện AIC](http://127.0.0.1:8504) trong trình duyệt. Có thể xem
+Mở [EviBind Browser](http://127.0.0.1:8080/) trong trình duyệt. Có thể xem
 [FastAPI docs](http://127.0.0.1:8080/docs) để kiểm tra endpoint. UI có thể mở trước khi warm-up
 xong; đợi trạng thái workflow cho phép tìm kiếm. Lượt khởi động đầu có thể phải đọc index,
 nạp model và tạo cache TRAKE.
+
+UI mới cập nhật các phần giao diện trực tiếp trong trình duyệt, không chạy lại toàn bộ Python
+mỗi lần bấm. Truy vấn mới, giải mã ảnh và suy luận VLM vẫn cần thời gian xử lý; chưa có cam kết
+mọi truy vấn trả kết quả tức thì. Xem [phạm vi chuyển đổi](evibind_browser.md).
+
+Khi cần công cụ chuyên biệt chưa được chuyển sang UI mới, mở giao diện cũ bằng:
+
+```powershell
+.\scripts\run_app.ps1 -Profile laptop -BatchId aic25-b1-reference -LegacyStreamlit -ApiPort 8080 -Port 8504
+```
+
+Khi đó Streamlit ở `http://127.0.0.1:8504`. `-Port` chỉ chọn cổng Streamlit legacy;
+với UI mặc định, `-ApiPort` chọn cổng dùng chung của giao diện và API.
 
 Nếu muốn launcher chạy lệnh bật cả hai database, dùng biến thể sau **thay cho** lệnh trên:
 
@@ -641,14 +655,13 @@ Mở PowerShell thứ hai và chạy:
 
 ```powershell
 Invoke-RestMethod -Uri http://127.0.0.1:8080/healthz -TimeoutSec 10
-Invoke-RestMethod -Uri http://127.0.0.1:8504/_stcore/health -TimeoutSec 10
 Invoke-RestMethod -Uri http://127.0.0.1:8080/v1/runtime/warmup -TimeoutSec 30 |
   ConvertTo-Json -Depth 12
 Invoke-RestMethod -Uri 'http://127.0.0.1:8080/v1/readiness?batch_id=aic25-b1-reference' -TimeoutSec 120 |
   ConvertTo-Json -Depth 12
 ```
 
-Hai health endpoint chỉ cho biết tiến trình đang trả lời. Đánh giá readiness và warm-up theo
+Health endpoint chỉ cho biết tiến trình đang trả lời. Đánh giá readiness và warm-up theo
 từng workflow: `warming` là đang chuẩn bị; `ready` là sẵn sàng trong phạm vi check; `degraded`
 là chỉ một phần kênh hoạt động; `blocked`/`failed` cần xử lý nguyên nhân hiển thị. Không coi
 màn hình UI mở được hoặc HTTP 200 là đã hoàn thành nạp dữ liệu.
@@ -669,7 +682,7 @@ muốn dừng database.
 
 1. Mở Docker Desktop từ Start menu và chờ engine sẵn sàng.
 2. Mở PowerShell tại repo, chạy khối lệnh sau.
-3. Giữ terminal mở, truy cập [http://127.0.0.1:8504](http://127.0.0.1:8504), đợi warm-up.
+3. Giữ terminal mở, truy cập [EviBind Browser](http://127.0.0.1:8080/), đợi warm-up.
 
 ```powershell
 Set-Location D:\AIC2026
@@ -679,7 +692,7 @@ $env:PYTHONUTF8 = "1"
 docker compose --env-file .env up -d --wait --wait-timeout 120 qdrant meilisearch
 if ($LASTEXITCODE -ne 0) { throw "Database chua san sang; kiem tra Docker va logs." }
 
-.\scripts\run_app.ps1 -Profile laptop -BatchId aic25-b1-reference -ApiPort 8080 -Port 8504
+.\scripts\run_app.ps1 -Profile laptop -BatchId aic25-b1-reference -ApiPort 8080
 ```
 
 Launcher tự xử lý Ollama như mục 8.2; model phải đã pull vào đúng storage ở mục 6.2. Không cần
@@ -714,7 +727,7 @@ docker compose --env-file .env stop qdrant meilisearch
 | Database healthy nhưng kết quả rỗng/thiếu collection/index | Kiểm tra đã import mục 7.3, đúng batch và đúng endpoint; database mới khởi động ban đầu chưa có corpus. |
 | QA thiếu canonical images hoặc ảnh lỗi sau khi di chuyển ZIP | Kiểm tra đủ ZIP keyframe và đường dẫn đã import; khôi phục vị trí đã ghi trong URI, giữ nguyên archive được bảo vệ. |
 | UI mở nhưng nút tìm kiếm còn khóa | Kiểm tra `/v1/runtime/warmup` và readiness; nếu trạng thái lỗi, đọc `reason_code`, sửa prerequisite rồi khởi động lại launcher. |
-| Cổng `8080`/`8504` đã có listener | Dừng launcher cũ bằng `Ctrl+C`; nếu chủ động chạy stack riêng, chọn `-ApiPort 8081 -Port 8505` và mở URL mới. |
+| Cổng `8080` đã có listener | Dừng launcher cũ bằng `Ctrl+C`; nếu chủ động chạy stack riêng, chọn `-ApiPort 8081` và mở URL mới. Với legacy Streamlit, chọn thêm `-Port 8505` nếu cổng `8504` bận. |
 
 Kiểm tra tiến trình nào đang nghe trên các cổng, chỉ đọc thông tin:
 

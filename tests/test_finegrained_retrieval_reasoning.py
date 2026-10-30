@@ -718,3 +718,28 @@ def test_semantic_view_tuning_derives_weights_and_searches_every_rrf_k() -> None
     payload = report.to_dict()
     assert payload["activation_gate"]["passed"] is False
     assert payload["qrels_provenance"]["locked_test_sha256"] == "a" * 64
+
+
+def test_semantic_mean_vector_searches_once_with_the_mean_of_all_views() -> None:
+    class _RecordingStore(_ViewStore):
+        def __init__(self) -> None:
+            self.vectors: list[np.ndarray] = []
+
+        def search(self, vector: np.ndarray, **kwargs: Any) -> list[dict[str, Any]]:
+            self.vectors.append(np.asarray(vector))
+            return super().search(vector, **kwargs)
+
+    encoder, store = _ViewEncoder(), _RecordingStore()
+    pipeline = TextualKISPipeline(
+        dense_channels=(DenseChannel("organizer_clip", encoder, store),),
+        semantic_view_fusion="mean_vector",
+        temporal_windows_ms=(),
+        min_separation_ms=0,
+    )
+
+    pipeline.search(CULINARY_QUERY, limit=3)
+
+    # Four one-hot views average to an equal-weight vector; one store search, not four.
+    assert len(encoder.calls) == 4
+    assert len(store.vectors) == 1
+    np.testing.assert_allclose(store.vectors[0], np.full(4, 0.5), rtol=1e-6)

@@ -1,4 +1,4 @@
-"""Serve the automatic Textual KIS API on a loopback interface."""
+"""Serve EviBind Browser and the retrieval API on a loopback interface."""
 
 from __future__ import annotations
 

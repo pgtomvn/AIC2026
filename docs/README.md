@@ -6,9 +6,12 @@
 | [design/](design/) | Design notes for retrieval features |
 | [batches/](batches/) | Per-batch ingestion contracts and release notes (B01, B02) |
 | [audits/](audits/) | Audits of external/organizer material |
+| [development/](development/) | Implementation handoffs and remaining verification |
 
 ## Guides
 
+- [EviBind Browser](guides/evibind_browser.md): native localhost UI, launch options,
+  migration scope, and graph-evidence limitations.
 - [Operations guide](guides/operations.md): full architecture, data operations, model
   preparation, HTTP API, verification gates, and the generated-state policy.
 - [Hướng dẫn cài đặt cho thành viên (Tiếng Việt)](guides/team_setup_vi.md): step-by-step
@@ -36,6 +39,10 @@
 ## Audits
 
 - [Organizer Colab baseline audit](audits/organizer_colab_audit.md)
+
+## Development
+
+- [EviBind Browser handoff](development/evibind-browser-handoff.md)
 
 Batch notes are dated engineering records. When a note and the code disagree, the code and
 `config/settings.yaml` are authoritative.

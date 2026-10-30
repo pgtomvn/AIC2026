@@ -42,6 +42,15 @@ def _configured_value(
     return str(value).strip()
 
 
+def service_enabled(service: Mapping[str, Any] | None) -> bool:
+    """Interpret a service ``enabled`` value, which may come from an environment string."""
+
+    value = (service or {}).get("enabled", True)
+    if isinstance(value, str):
+        return value.strip().casefold() not in {"off", "0", "false", "no", "disabled"}
+    return bool(value)
+
+
 def validate_batch_identifier(value: str) -> str:
     """Return a normalized batch identifier or reject unsafe input."""
 
@@ -224,7 +233,7 @@ def load_config(config_name: str = "settings.yaml") -> dict[str, Any]:
         if not isinstance(service, dict):
             continue
 
-        for setting_name in ("url", "api_key", "execution_mode"):
+        for setting_name in ("url", "api_key", "execution_mode", "enabled"):
             env_name = service.get(f"{setting_name}_env")
             if not isinstance(env_name, str) or not env_name:
                 continue

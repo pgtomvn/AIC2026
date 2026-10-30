@@ -864,7 +864,7 @@ def test_runtime_capabilities_expose_safe_local_and_cloud_states(tmp_path: Path)
     assert response["qa"]["default_policy"] == "gemini_then_local"
     assert response["qa"]["local"]["status"]["state"] == "ready"
     assert response["qa"]["cloud"]["status"]["state"] == "blocked_asset"
-    assert response["runtime_contract"]["version"] == 8
+    assert response["runtime_contract"]["version"] == 9
     assert "kis.interactive_feedback" in response["runtime_contract"]["features"]
     assert "kis.manual_temporal_sequence" in response["runtime_contract"]["features"]
     assert "kis.adaptive_rrf" in response["runtime_contract"]["features"]

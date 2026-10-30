@@ -64,6 +64,10 @@ class QAReasonerRouter:
         if not request.allow_external_frame_transfer:
             raise ValueError("Gemini reasoning requires external frame transfer consent")
         if policy == "gemini_then_local":
+            # A disabled local model is no fallback: Gemini's own error (quota, timeout) is
+            # more useful to the operator than a generic exhausted chain.
+            if getattr(self.local, "enabled", True) is False:
+                return (self.gemini,)
             return (self.gemini, self.local)
         raise ValueError("unknown Visual Q&A reasoning policy")
 

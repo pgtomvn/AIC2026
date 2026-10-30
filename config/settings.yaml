@@ -3,6 +3,29 @@
 
 profile: laptop
 
+# Optional, explicitly built artifacts. Every search fuses conventional retrieval with the
+# ASR topic graph (and the object graph for count/colour/spatial queries) by weighted
+# reciprocal rank; without graph evidence the conventional ranking is returned unchanged.
+# Weights were chosen on the train/validation split of outputs/evaluation/user-qrels-20260905-v1.
+graph:
+  enabled: true
+  root: data/graphs
+  fusion:
+    k: 60
+    conventional: 1.0
+    topic: 0.8
+    object: 0.6
+    topic_padding_ms: 2000
+    topic_matches: 20
+
+# Chat assistant. "rules" answers instantly and never calls a model. "auto" also consults the
+# local Ollama model, only for a question with no frame in view; rules stay the fallback.
+# prewarm_vlm loads the local VLM in the background when the browser opens (local Q&A only).
+assistant:
+  router: rules
+  timeout_seconds: 6
+  prewarm_vlm: false
+
 runtime:
   default_batch_id: aic25-b1-reference
 
@@ -36,7 +59,8 @@ readiness:
         organizer_clip: required
         metadata: required
         canonical_images: required
-        ollama_vlm: required
+        # Q&A needs one usable provider; Gemini or the local model.
+        ollama_vlm: optional
         gemini_vlm: optional
         visual: optional
         semantic_text: optional
@@ -61,7 +85,8 @@ readiness:
       channels:
         organizer_clip: required
         canonical_images: required
-        ollama_vlm: required
+        # Q&A needs one usable provider; Gemini or the local model.
+        ollama_vlm: optional
         gemini_vlm: optional
         visual: optional
         semantic_text: optional
@@ -77,7 +102,7 @@ readiness:
     channels:
       visual: required
       canonical_images: required
-      ollama_vlm: required
+      ollama_vlm: optional
       gemini_vlm: optional
       metadata: optional
       semantic_text: optional
@@ -227,8 +252,8 @@ models:
     local_files_only: true
   florence2:
     # Experimental and operator-selected only; construction is lazy/offline.
-    # Missing assets produce a structured not-provisioned error.
-    enabled: true
+    # Missing assets produce a structured not-provisioned error. Disabled: Gemini answers Q&A.
+    enabled: false
     model_name: microsoft/Florence-2-base
     revision: 5ca5edf5bd017b9919c05d08aebef5e4c7ac3bac
     model_path: models/huggingface/florence-2-base
@@ -302,13 +327,24 @@ models:
     siglip_initial_batch_size: 8
     siglip_max_batch_size: 16
 services:
+  # Primary Visual Q&A model (single frame, minimal thinking, short JSON answer).
   gemini_vlm:
     api_key_env: GEMINI_API_KEY
-    model: gemini-3.6-flash
-    timeout_seconds: 5
+    # One model; fallback_models may list others, tried in order when one is out of quota.
+    # The free tier allows about 20 requests per model per day: enable billing for competitions.
+    model: gemini-3.1-flash-lite
+    fallback_models: []
+    thinking_level: minimal
+    # Measured answers took 2-9 s; a short limit turned slow answers into failures.
+    timeout_seconds: 15
+    # ipv4: this network resolves Google over IPv6 but cannot route it (auto = system default).
+    ip_family: ipv4
     max_images: 1
     max_concurrency: 1
+  # Optional local fallback. AIC_LOCAL_VLM=off disables it: no Ollama process, probe, or unload.
   ollama_vlm:
+    enabled: true
+    enabled_env: AIC_LOCAL_VLM
     url: http://127.0.0.1:11434
     url_env: OLLAMA_URL
     model: qwen2.5vl:3b-q4_K_M
@@ -335,6 +371,25 @@ services:
       accelerated_frames: aic_native_{batch}_openclip_l14_quickgelu_dfn2b_fp5cac988a_768d_v1
       text_segments: aic_text_{batch}_vietnamese_embedding_r4ab46e46_meanpool_normalized_768d_v1
     distance: Cosine
+  # DRES evaluation server (VBS / HCMC AI Challenge). The address may also come from DRES_URL;
+  # credentials are typed in the browser or read from DRES_USERNAME / DRES_PASSWORD in .env.
+  # Answer formats follow the AI Challenge convention; check them against the organizer's
+  # current guide before a round. Placeholders: {answer} {video_id} {time_ms} {frame} {frames}.
+  dres:
+    url: ""
+    url_env: DRES_URL
+    username_env: DRES_USERNAME
+    password_env: DRES_PASSWORD
+    timeout_seconds: 10
+    collection: ""
+    qa_answer_spec: aic-2026-visual-qa-general-text-provisional-v1
+    formats:
+      qa_text: "QA-{answer}-{video_id}-{time_ms}"
+      trake_text: "TR-{video_id}-{frames}"
+      kis_end_offset_ms: 0
+    # VBS asks for result logs; enable to send the ranked list after each search.
+    log_results: false
+    submission_log: logs/dres-submissions.jsonl
   meilisearch:
     url: http://127.0.0.1:7700
     url_env: MEILISEARCH_URL
@@ -367,8 +422,11 @@ retrieval:
   top_k: 100
   rrf_k: 60
   semantic_views:
-    # Late fusion stays global-only until a locked-qrels record passes activation.
-    fusion: global_only
+    # mean_vector searches once with the normalized mean of all view embeddings (the
+    # query that feedback refinement starts from). Enabled 2026-10-27: on the 23
+    # user-labelled queries the deployed MRR rose from 0.155 (global_only) to 0.236.
+    # Late-fusion policies still require a locked-qrels tuning record.
+    fusion: mean_vector
     weights: {}
     consensus_alpha: 0.0
     tuning_record: outputs/evaluation/kis-semantic-view-tuning.json

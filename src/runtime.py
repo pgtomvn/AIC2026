@@ -36,6 +36,7 @@ from src.utils.io_helpers import (
     configured_batch_id,
     load_config,
     load_launch_identity,
+    service_enabled,
     validate_batch_identifier,
 )
 from src.warmup import WarmupService
@@ -866,6 +867,7 @@ def build_runtime(config: dict[str, Any] | None = None) -> RuntimeContext:
             keep_alive=ollama.get("keep_alive", "15m"),
             num_ctx=int(ollama.get("num_ctx", 4096)),
             execution_mode=str(ollama.get("execution_mode", "auto")),
+            enabled=service_enabled(ollama),
             max_new_tokens=int(ollama.get("max_new_tokens", 64)),
             max_images=int(ollama.get("max_images", 1)),
             max_total_image_bytes=int(qa.get("image_max_request_bytes", 20 * 1024 * 1024)),
@@ -874,8 +876,11 @@ def build_runtime(config: dict[str, Any] | None = None) -> RuntimeContext:
         gemini_reasoner = GeminiFlashReasoner(
             api_key=gemini.get("api_key"),
             model_name=str(gemini.get("model", "gemini-3.6-flash")),
+            fallback_models=tuple(str(m) for m in gemini.get("fallback_models", ()) or ()),
+            thinking_level=gemini.get("thinking_level", "minimal"),
             timeout_seconds=float(gemini.get("timeout_seconds", 5)),
             max_total_image_bytes=int(qa.get("image_max_request_bytes", 20 * 1024 * 1024)),
+            ip_family=str(gemini.get("ip_family", "auto")),
         )
         qa_reasoner = QAReasonerRouter(gemini_reasoner, local_reasoner)
         gpu_coordinator = GPUModelCoordinator(
