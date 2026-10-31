@@ -193,8 +193,7 @@ All documentation is indexed in [docs/README.md](docs/README.md).
 
 ## AI assistance
 
-This project was built with the help of AI assistants. **ChatGPT** (OpenAI) and **Claude**
-(Anthropic) were used to discuss ideas and design options, and to help write, review, and debug
+This project was built with the help of AI assistants. **Claude** (Anthropic) were used to discuss ideas and design options, and to help write, review, and debug
 code and documentation. All AI-assisted output was reviewed, tested, and integrated by the
 project team, who remain responsible for the final code.
 
